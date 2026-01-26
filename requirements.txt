@@ -25,6 +25,11 @@ apscheduler>=3.10.0         # Advanced scheduling
 # Logging & Monitoring
 loguru>=0.7.0               # Logging
 
+# Dashboard
+streamlit>=1.29.0           # Web dashboard
+plotly>=5.18.0              # Interactive charts
+scipy>=1.11.0               # Statistical functions
+
 # Testing
 pytest>=7.0.0               # Testing framework
 pytest-asyncio>=0.21.0      # Async test support
