@@ -61,6 +61,14 @@ def load_wallet_from_env() -> Optional[WalletInfo]:
     if not private_key:
         return None
 
+    # Skip placeholder values
+    if "your_" in private_key.lower() or "example" in private_key.lower():
+        return None
+
+    # Skip if too short to be a valid key
+    if len(private_key.replace("0x", "")) < 64:
+        return None
+
     # Ensure proper format
     if not private_key.startswith("0x"):
         private_key = "0x" + private_key
@@ -73,7 +81,8 @@ def load_wallet_from_env() -> Optional[WalletInfo]:
             chain_id=config.polygon.chain_id,
         )
     except Exception as e:
-        raise ValueError(f"Invalid private key in configuration: {e}")
+        # Invalid key - treat as unconfigured for dry-run mode
+        return None
 
 
 class PolymarketAuth:
