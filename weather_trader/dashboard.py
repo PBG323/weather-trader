@@ -12,12 +12,16 @@ from typing import Optional
 import plotly.express as px
 import plotly.graph_objects as go
 
-from .config import get_all_cities, get_city_config, config
-from .apis import OpenMeteoClient
-from .models import EnsembleForecaster, BiasCorrector
-from .models.ensemble import ModelForecast
-from .polymarket import WeatherMarketFinder, PolymarketAuth
-from .strategy import ExpectedValueCalculator
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from weather_trader.config import get_all_cities, get_city_config, config
+from weather_trader.apis import OpenMeteoClient
+from weather_trader.models import EnsembleForecaster, BiasCorrector
+from weather_trader.models.ensemble import ModelForecast
+from weather_trader.polymarket import WeatherMarketFinder, PolymarketAuth
+from weather_trader.strategy import ExpectedValueCalculator
 
 # Page config
 st.set_page_config(
