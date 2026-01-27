@@ -656,9 +656,17 @@ def calculate_signals(forecasts, markets, show_all_outcomes=False):
 def execute_trade(signal, size, is_live=False):
     """Execute a trade using the trading engine."""
     outcome = signal.get("outcome", "")
-    entry_price = signal["market_prob"] if signal["edge"] > 0 else (1 - signal["market_prob"])
     side = "YES" if signal["edge"] > 0 else "NO"
-    shares = size / entry_price
+
+    # IMPORTANT: Always store YES price for consistency
+    # For YES positions: we pay market_prob per share
+    # For NO positions: we pay (1 - market_prob) per share, but store YES price for tracking
+    yes_price = signal["market_prob"]
+    actual_cost_per_share = yes_price if side == "YES" else (1 - yes_price)
+    shares = size / actual_cost_per_share
+
+    # Store YES price as entry_price for consistent price tracking
+    entry_price = yes_price
 
     # Determine settlement date
     target_date = signal.get("target_date", date.today() + timedelta(days=1))
@@ -789,16 +797,25 @@ def close_position_smart(position_id: str, current_price: float, exit_reason: Ex
     """Close an open position with specified exit reason and realize P/L."""
     for i, pos in enumerate(st.session_state.open_positions):
         if pos["id"] == position_id:
-            # Calculate P/L
-            if pos["side"] == "YES":
-                # Bought YES: profit if price went up
-                pnl = pos["size"] * (current_price - pos["entry_price"])
-            else:
-                # Bought NO: profit if YES price went down
-                pnl = pos["size"] * (pos["entry_price"] - current_price)
-
-            # Close in PositionManager if position object exists
+            # Get Position object for accurate P/L calculation
             position = pos.get("position_obj")
+
+            # Calculate P/L using Position object if available (more accurate)
+            if position:
+                # Update position with final price before calculating P/L
+                position.current_price = current_price
+                pnl = position.unrealized_pnl
+            else:
+                # Fallback legacy calculation
+                # Note: entry_price and current_price are both YES prices
+                if pos["side"] == "YES":
+                    pnl = pos["size"] * (current_price - pos["entry_price"])
+                else:
+                    # For NO: profit = (entry_YES - current_YES) * shares
+                    # shares = size / (1 - entry_YES)
+                    no_price_at_entry = 1 - pos["entry_price"]
+                    shares = pos["size"] / no_price_at_entry if no_price_at_entry > 0 else 0
+                    pnl = (pos["entry_price"] - current_price) * shares
             if position:
                 st.session_state.position_manager.close_position(
                     position_id=position.position_id,
@@ -860,17 +877,22 @@ def update_position_prices(markets, forecasts=None):
             new_price = market_prices[cid]
             pos["current_price"] = new_price
 
-            # Calculate unrealized P/L
-            if pos["side"] == "YES":
-                pos["unrealized_pnl"] = pos["size"] * (new_price - pos["entry_price"])
-            else:
-                pos["unrealized_pnl"] = pos["size"] * (pos["entry_price"] - new_price)
-
-            # Update Position object with edge snapshot
+            # Update Position object with edge snapshot and get accurate P/L
             position = pos.get("position_obj")
             if position:
                 forecast_prob = pos.get("forecast_prob", 0.5)
                 position.record_edge_snapshot(new_price, forecast_prob)
+                # Use Position object's P/L calculation (handles YES/NO correctly)
+                pos["unrealized_pnl"] = position.unrealized_pnl
+            else:
+                # Fallback legacy calculation
+                if pos["side"] == "YES":
+                    pos["unrealized_pnl"] = pos["size"] * (new_price - pos["entry_price"])
+                else:
+                    # For NO: use proper shares calculation
+                    no_price_at_entry = 1 - pos["entry_price"]
+                    shares = pos["size"] / no_price_at_entry if no_price_at_entry > 0 else 0
+                    pos["unrealized_pnl"] = (pos["entry_price"] - new_price) * shares
 
     # Update risk manager equity
     st.session_state.risk_manager.update_equity()
@@ -1996,7 +2018,7 @@ def main():
     market_status = "Demo Markets" if use_demo else ("Live Markets" if markets else "No Markets")
     open_pos_count = len(st.session_state.open_positions)
     st.markdown(
-        f"*Weather Trader v0.4.1 (Smart Trading Engine)* | "
+        f"*Weather Trader v0.4.2 (Smart Trading Engine)* | "
         f"*{market_status}* | "
         f"*{len(forecasts)} cities • {len(signals)} signals • {open_pos_count} positions* | "
         f"*Auto-Trade: {'🟢 ON' if auto_trade else 'OFF'}* | "

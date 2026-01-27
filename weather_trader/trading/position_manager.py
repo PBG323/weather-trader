@@ -93,17 +93,40 @@ class Position:
 
     @property
     def cost_basis(self) -> float:
-        """Total cost of position."""
-        return self.entry_price * self.shares
+        """
+        Total cost of position (what we actually paid).
+
+        Note: entry_price stores YES price for both YES and NO positions.
+        - YES: paid entry_price per share
+        - NO: paid (1 - entry_price) per share
+        """
+        if self.side == "YES":
+            return self.entry_price * self.shares
+        else:
+            return (1 - self.entry_price) * self.shares
 
     @property
     def current_value(self) -> float:
-        """Current market value of position."""
-        return self.current_price * self.shares
+        """
+        Current market value of position.
+
+        Note: current_price stores YES price for both YES and NO positions.
+        - YES: worth current_price per share
+        - NO: worth (1 - current_price) per share
+        """
+        if self.side == "YES":
+            return self.current_price * self.shares
+        else:
+            return (1 - self.current_price) * self.shares
 
     @property
     def unrealized_pnl(self) -> float:
-        """Current unrealized profit/loss."""
+        """
+        Current unrealized profit/loss.
+
+        This is simply current_value - cost_basis.
+        The side-specific logic is handled in cost_basis and current_value.
+        """
         return self.current_value - self.cost_basis
 
     @property
@@ -111,15 +134,25 @@ class Position:
         """Unrealized P/L as percentage of cost basis."""
         if self.cost_basis == 0:
             return 0.0
+        # Use absolute value of entry for percentage calculation
         return self.unrealized_pnl / self.cost_basis
 
     @property
     def current_edge(self) -> float:
-        """Current edge (forecast prob - market price for YES, inverse for NO)."""
+        """
+        Current edge (our probability - market price).
+
+        For YES: edge = forecast_prob - YES_price (positive = underpriced)
+        For NO: edge = (1 - forecast_prob) - (1 - YES_price) = YES_price - forecast_prob
+                (positive = YES is overpriced, so NO is underpriced)
+
+        Note: current_price stores YES price for both YES and NO positions.
+        """
         if self.side == "YES":
             return self.current_forecast_prob - self.current_price
         else:
-            return (1 - self.current_forecast_prob) - self.current_price
+            # NO edge: YES_price - forecast_prob (we profit when YES is overpriced)
+            return self.current_price - self.current_forecast_prob
 
     @property
     def edge_captured_pct(self) -> float:
@@ -260,10 +293,13 @@ class PositionManager:
         position_id = f"POS-{self._position_counter:06d}"
 
         # Calculate entry edge
+        # Note: entry_price is always YES price for consistency
         if side == "YES":
+            # YES edge: our_prob - YES_price (positive = YES underpriced)
             entry_edge = forecast_prob - entry_price
         else:
-            entry_edge = (1 - forecast_prob) - entry_price
+            # NO edge: YES_price - forecast_prob (positive = YES overpriced, NO underpriced)
+            entry_edge = entry_price - forecast_prob
 
         position = Position(
             position_id=position_id,
