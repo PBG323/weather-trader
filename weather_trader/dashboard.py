@@ -307,10 +307,13 @@ async def _fetch_model_comparison():
                 except:
                     pass
 
-            if config.api.tomorrow_io_api_key and "your_" not in config.api.tomorrow_io_api_key.lower():
+            if (config.api.tomorrow_io_api_key and
+                "your_" not in config.api.tomorrow_io_api_key.lower() and
+                can_call_tomorrow_io()):
                 try:
                     async with TomorrowIOClient() as tm_client:
                         tm_forecasts = await tm_client.get_daily_forecast(city_config, days=3)
+                        record_tomorrow_io_call()
                         for f in tm_forecasts:
                             if f.timestamp.date() == target_date:
                                 city_data["models"]["tomorrow.io"] = {
@@ -318,8 +321,8 @@ async def _fetch_model_comparison():
                                     "low": f.temperature_low
                                 }
                                 break
-                except:
-                    pass
+                except Exception as e:
+                    add_alert(f"Tomorrow.io error for {city_config.name}: {str(e)[:100]}", "warning")
 
             comparisons[city_key] = city_data
 
