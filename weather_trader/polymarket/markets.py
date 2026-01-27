@@ -373,42 +373,52 @@ class WeatherMarketFinder:
 
     def _parse_temp_range(self, text: str) -> tuple[Optional[float], Optional[float]]:
         """
-        Parse temperature range from text.
+        Parse temperature range from text, including negative Celsius.
 
         Examples:
             "20-21°F" -> (20, 21)
             "≤15°F" or "15°F or below" -> (None, 15)
             "≥26°F" or "26°F or higher" -> (26, None)
+            "-12°C or below" -> (None, -12)
+            "-6°C or higher" -> (-6, None)
+            "-11°C" -> (-11, -11)
         """
-        # Handle "X or below" / "X or lower"
-        below_match = re.search(r"(\d+)\s*°?[FC]?\s+or\s+(?:below|lower)", text, re.IGNORECASE)
+        # Handle "X or below" / "X or lower" (including negative temps like "-12°C or below")
+        below_match = re.search(r"(-?\d+)\s*°?[FC]?\s+or\s+(?:below|lower)", text, re.IGNORECASE)
         if below_match:
             return (None, float(below_match.group(1)))
 
-        # Handle "X or above" / "X or higher"
-        above_match = re.search(r"(\d+)\s*°?[FC]?\s+or\s+(?:above|higher)", text, re.IGNORECASE)
+        # Handle "X or above" / "X or higher" (including negative temps like "-6°C or higher")
+        above_match = re.search(r"(-?\d+)\s*°?[FC]?\s+or\s+(?:above|higher)", text, re.IGNORECASE)
         if above_match:
             return (float(above_match.group(1)), None)
 
-        # Handle "≤X" or "<=X"
-        lte_match = re.search(r"[≤<]=?\s*(\d+)", text)
+        # Handle "≤X" or "<=X" (including negative)
+        lte_match = re.search(r"[≤<]=?\s*(-?\d+)", text)
         if lte_match:
             return (None, float(lte_match.group(1)))
 
-        # Handle "≥X" or ">=X"
-        gte_match = re.search(r"[≥>]=?\s*(\d+)", text)
+        # Handle "≥X" or ">=X" (including negative)
+        gte_match = re.search(r"[≥>]=?\s*(-?\d+)", text)
         if gte_match:
             return (float(gte_match.group(1)), None)
 
-        # Handle "X-Y" range
+        # Handle "X-Y" range (positive numbers only, as negative ranges use different format)
+        # This handles "20-21°F" but not "-12--10°C"
         range_match = re.search(r"(\d+)\s*-\s*(\d+)", text)
         if range_match:
             return (float(range_match.group(1)), float(range_match.group(2)))
 
-        # Handle single temperature (rare)
-        single_match = re.search(r"(\d+)\s*°?[FC]", text)
+        # Handle single temperature including negative (e.g., "-11°C", "25°F")
+        single_match = re.search(r"(-?\d+)\s*°[FC]", text)
         if single_match:
             temp = float(single_match.group(1))
+            return (temp, temp)
+
+        # Fallback: try to find any number
+        any_num = re.search(r"(-?\d+)", text)
+        if any_num:
+            temp = float(any_num.group(1))
             return (temp, temp)
 
         return (None, None)

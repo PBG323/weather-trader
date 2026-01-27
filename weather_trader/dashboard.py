@@ -343,7 +343,7 @@ def fetch_forecasts_with_models():
     return run_async(_fetch_forecasts_with_models())
 
 
-# Track Tomorrow.io API usage to stay under 500/day limit
+# Track Tomorrow.io API usage to maximize 500/day limit
 if 'tomorrow_io_last_call' not in st.session_state:
     st.session_state.tomorrow_io_last_call = None
 if 'tomorrow_io_calls_today' not in st.session_state:
@@ -353,20 +353,27 @@ if 'tomorrow_io_call_date' not in st.session_state:
 
 
 def can_call_tomorrow_io() -> bool:
-    """Check if we can make a Tomorrow.io API call (rate limiting)."""
+    """Check if we can make a Tomorrow.io API call (rate limiting).
+
+    Strategy: 500 calls/day = ~21 calls/hour
+    - Use 480 calls max (20 buffer for manual testing)
+    - Space calls by 2 minutes minimum (30 calls/hour max)
+    - This allows ~16 hours of continuous operation
+    """
     # Reset counter if it's a new day
     if st.session_state.tomorrow_io_call_date != date.today():
         st.session_state.tomorrow_io_calls_today = 0
         st.session_state.tomorrow_io_call_date = date.today()
 
-    # 500 calls/day, but leave buffer - max 400 calls
-    if st.session_state.tomorrow_io_calls_today >= 400:
+    # 500 calls/day, use 480 (leave 20 buffer)
+    if st.session_state.tomorrow_io_calls_today >= 480:
         return False
 
-    # Space out calls - at least 3 minutes between calls (20 calls/hour max)
+    # Space out calls - at least 2 minutes between calls
+    # This gives ~30 calls/hour max, well under the limit
     if st.session_state.tomorrow_io_last_call:
         elapsed = (datetime.now() - st.session_state.tomorrow_io_last_call).seconds
-        if elapsed < 180:  # 3 minutes
+        if elapsed < 120:  # 2 minutes
             return False
 
     return True
