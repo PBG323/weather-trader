@@ -461,19 +461,64 @@ async def _fetch_forecasts_with_models():
 
                     # Add Open-Meteo models
                     for model_name, forecast_list in om_forecasts.items():
+                        matched = False
                         for f in forecast_list:
                             if f.timestamp.date() == target_date:
+                                if f.temperature_high is not None and f.temperature_low is not None:
+                                    model_forecasts.append(ModelForecast(
+                                        model_name=model_name,
+                                        forecast_high=f.temperature_high,
+                                        forecast_low=f.temperature_low,
+                                    ))
+                                    model_details.append({
+                                        "model": model_name,
+                                        "high": f.temperature_high,
+                                        "low": f.temperature_low
+                                    })
+                                    matched = True
+                                break
+                        if not matched and forecast_list:
+                            # Fallback: use closest available date
+                            closest = min(forecast_list,
+                                         key=lambda f: abs((f.timestamp.date() - target_date).days))
+                            if closest.temperature_high is not None and closest.temperature_low is not None:
                                 model_forecasts.append(ModelForecast(
                                     model_name=model_name,
-                                    forecast_high=f.temperature_high,
-                                    forecast_low=f.temperature_low,
+                                    forecast_high=closest.temperature_high,
+                                    forecast_low=closest.temperature_low,
                                 ))
                                 model_details.append({
                                     "model": model_name,
-                                    "high": f.temperature_high,
-                                    "low": f.temperature_low
+                                    "high": closest.temperature_high,
+                                    "low": closest.temperature_low
                                 })
-                                break
+                                print(f"{city_key}/{model_name}: no exact date match for {target_date}, "
+                                      f"used {closest.timestamp.date()}")
+
+                    # Fallback: if ensemble returned nothing, try basic forecast endpoint
+                    if not model_forecasts:
+                        print(f"{city_key}: ensemble empty, trying basic forecast")
+                        try:
+                            from weather_trader.apis.open_meteo import WeatherModel
+                            basic = await om_client.get_daily_forecast(
+                                city_config, WeatherModel.BEST_MATCH, days=3)
+                            for f in basic:
+                                if f.temperature_high is not None and f.temperature_low is not None:
+                                    if f.timestamp.date() == target_date or not model_forecasts:
+                                        model_forecasts = [ModelForecast(
+                                            model_name="best_match",
+                                            forecast_high=f.temperature_high,
+                                            forecast_low=f.temperature_low,
+                                        )]
+                                        model_details = [{
+                                            "model": "best_match",
+                                            "high": f.temperature_high,
+                                            "low": f.temperature_low
+                                        }]
+                                        if f.timestamp.date() == target_date:
+                                            break
+                        except Exception as fallback_err:
+                            print(f"{city_key}: basic forecast fallback also failed: {fallback_err}")
 
                     # Add Tomorrow.io if available
                     if tm_client:
@@ -482,16 +527,17 @@ async def _fetch_forecasts_with_models():
                             tm_call_count += 1
                             for f in tm_forecasts:
                                 if f.timestamp.date() == target_date:
-                                    model_forecasts.append(ModelForecast(
-                                        model_name="tomorrow.io",
-                                        forecast_high=f.temperature_high,
-                                        forecast_low=f.temperature_low,
-                                    ))
-                                    model_details.append({
-                                        "model": "tomorrow.io",
-                                        "high": f.temperature_high,
-                                        "low": f.temperature_low
-                                    })
+                                    if f.temperature_high is not None and f.temperature_low is not None:
+                                        model_forecasts.append(ModelForecast(
+                                            model_name="tomorrow.io",
+                                            forecast_high=f.temperature_high,
+                                            forecast_low=f.temperature_low,
+                                        ))
+                                        model_details.append({
+                                            "model": "tomorrow.io",
+                                            "high": f.temperature_high,
+                                            "low": f.temperature_low
+                                        })
                                     break
                         except Exception as e:
                             print(f"Tomorrow.io error for {city_key}: {e}")
@@ -514,9 +560,11 @@ async def _fetch_forecasts_with_models():
                             "high_ci_lower": ens.high_ci_lower,
                             "high_ci_upper": ens.high_ci_upper,
                         }
+                    else:
+                        print(f"WARNING: No forecast data for {city_key} on {target_date}")
 
                 except Exception as e:
-                    pass
+                    print(f"ERROR fetching forecast for {city_key}: {e}")
         finally:
             if tm_client:
                 await tm_client.__aexit__(None, None, None)
