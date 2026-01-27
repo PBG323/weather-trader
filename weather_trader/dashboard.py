@@ -343,67 +343,147 @@ def fetch_forecasts_with_models():
     return run_async(_fetch_forecasts_with_models())
 
 
+# Track Tomorrow.io API usage to stay under 500/day limit
+if 'tomorrow_io_last_call' not in st.session_state:
+    st.session_state.tomorrow_io_last_call = None
+if 'tomorrow_io_calls_today' not in st.session_state:
+    st.session_state.tomorrow_io_calls_today = 0
+if 'tomorrow_io_call_date' not in st.session_state:
+    st.session_state.tomorrow_io_call_date = date.today()
+
+
+def can_call_tomorrow_io() -> bool:
+    """Check if we can make a Tomorrow.io API call (rate limiting)."""
+    # Reset counter if it's a new day
+    if st.session_state.tomorrow_io_call_date != date.today():
+        st.session_state.tomorrow_io_calls_today = 0
+        st.session_state.tomorrow_io_call_date = date.today()
+
+    # 500 calls/day, but leave buffer - max 400 calls
+    if st.session_state.tomorrow_io_calls_today >= 400:
+        return False
+
+    # Space out calls - at least 3 minutes between calls (20 calls/hour max)
+    if st.session_state.tomorrow_io_last_call:
+        elapsed = (datetime.now() - st.session_state.tomorrow_io_last_call).seconds
+        if elapsed < 180:  # 3 minutes
+            return False
+
+    return True
+
+
+def record_tomorrow_io_call():
+    """Record that we made a Tomorrow.io API call."""
+    st.session_state.tomorrow_io_last_call = datetime.now()
+    st.session_state.tomorrow_io_calls_today += 1
+
+
 async def _fetch_forecasts_with_models():
-    """Fetch forecasts for all cities with model breakdown."""
+    """Fetch forecasts for all cities with model breakdown, including Tomorrow.io."""
     forecasts = {}
     target_date = date.today() + timedelta(days=1)
 
-    async with OpenMeteoClient() as client:
+    # Check if Tomorrow.io is available
+    use_tomorrow_io = (
+        config.api.tomorrow_io_api_key and
+        "your_" not in config.api.tomorrow_io_api_key.lower() and
+        can_call_tomorrow_io()
+    )
+
+    async with OpenMeteoClient() as om_client:
         bias_corrector = BiasCorrector()
         ensemble = EnsembleForecaster(bias_corrector)
 
-        for city_key in get_all_cities():
-            city_config = get_city_config(city_key)
-            try:
-                om_forecasts = await client.get_ensemble_forecast(city_config, days=3)
+        # Optionally create Tomorrow.io client
+        tm_client = None
+        if use_tomorrow_io:
+            tm_client = TomorrowIOClient()
+            await tm_client.__aenter__()
+            record_tomorrow_io_call()
+            add_alert(f"📡 Tomorrow.io API called (#{st.session_state.tomorrow_io_calls_today} today)", "info")
 
-                model_forecasts = []
-                model_details = []
+        try:
+            for city_key in get_all_cities():
+                city_config = get_city_config(city_key)
+                try:
+                    om_forecasts = await om_client.get_ensemble_forecast(city_config, days=3)
 
-                for model_name, forecast_list in om_forecasts.items():
-                    for f in forecast_list:
-                        if f.timestamp.date() == target_date:
-                            model_forecasts.append(ModelForecast(
-                                model_name=model_name,
-                                forecast_high=f.temperature_high,
-                                forecast_low=f.temperature_low,
-                            ))
-                            model_details.append({
-                                "model": model_name,
-                                "high": f.temperature_high,
-                                "low": f.temperature_low
-                            })
-                            break
+                    model_forecasts = []
+                    model_details = []
 
-                if model_forecasts:
-                    ens = ensemble.create_ensemble(
-                        city_config, model_forecasts, target_date,
-                        apply_bias_correction=False
-                    )
-                    forecasts[city_key] = {
-                        "city": city_config.name,
-                        "high_mean": ens.high_mean,
-                        "high_std": ens.high_std,
-                        "low_mean": ens.low_mean,
-                        "low_std": ens.low_std,
-                        "confidence": ens.confidence,
-                        "model_count": ens.model_count,
-                        "date": target_date,
-                        "models": model_details,
-                        "high_ci_lower": ens.high_ci_lower,
-                        "high_ci_upper": ens.high_ci_upper,
-                    }
+                    # Add Open-Meteo models
+                    for model_name, forecast_list in om_forecasts.items():
+                        for f in forecast_list:
+                            if f.timestamp.date() == target_date:
+                                model_forecasts.append(ModelForecast(
+                                    model_name=model_name,
+                                    forecast_high=f.temperature_high,
+                                    forecast_low=f.temperature_low,
+                                ))
+                                model_details.append({
+                                    "model": model_name,
+                                    "high": f.temperature_high,
+                                    "low": f.temperature_low
+                                })
+                                break
 
-            except Exception as e:
-                pass
+                    # Add Tomorrow.io if available
+                    if tm_client:
+                        try:
+                            tm_forecasts = await tm_client.get_daily_forecast(city_config, days=3)
+                            for f in tm_forecasts:
+                                if f.timestamp.date() == target_date:
+                                    model_forecasts.append(ModelForecast(
+                                        model_name="tomorrow.io",
+                                        forecast_high=f.temperature_high,
+                                        forecast_low=f.temperature_low,
+                                    ))
+                                    model_details.append({
+                                        "model": "tomorrow.io",
+                                        "high": f.temperature_high,
+                                        "low": f.temperature_low
+                                    })
+                                    break
+                        except Exception as e:
+                            add_alert(f"Tomorrow.io error for {city_key}: {str(e)[:50]}", "warning")
+
+                    if model_forecasts:
+                        ens = ensemble.create_ensemble(
+                            city_config, model_forecasts, target_date,
+                            apply_bias_correction=False
+                        )
+                        forecasts[city_key] = {
+                            "city": city_config.name,
+                            "high_mean": ens.high_mean,
+                            "high_std": ens.high_std,
+                            "low_mean": ens.low_mean,
+                            "low_std": ens.low_std,
+                            "confidence": ens.confidence,
+                            "model_count": ens.model_count,
+                            "date": target_date,
+                            "models": model_details,
+                            "high_ci_lower": ens.high_ci_lower,
+                            "high_ci_upper": ens.high_ci_upper,
+                        }
+
+                except Exception as e:
+                    pass
+        finally:
+            if tm_client:
+                await tm_client.__aexit__(None, None, None)
 
     return forecasts
 
 
-def calculate_signals(forecasts, markets):
-    """Calculate trading signals for multi-outcome markets."""
+def calculate_signals(forecasts, markets, show_all_outcomes=False):
+    """Calculate trading signals for multi-outcome markets.
+
+    Args:
+        forecasts: Weather forecast data
+        markets: Market data from Polymarket
+        show_all_outcomes: If True, return signals for ALL outcomes, not just the best
+    """
     signals = []
-    seen_markets = set()  # Track which city/date combos we've processed
 
     # Group markets by city and date
     market_groups = {}
@@ -431,15 +511,12 @@ def calculate_signals(forecasts, markets):
 
         # Convert forecast to market's unit (Celsius for London/Toronto)
         if market_temp_unit == "C":
-            # Market uses Celsius - convert our Fahrenheit forecast to Celsius
             forecast_temp_market = (forecast_temp_f - 32) * 5 / 9
             forecast_std_market = forecast_std_f * 5 / 9
         else:
-            # Market uses Fahrenheit - no conversion needed
             forecast_temp_market = forecast_temp_f
             forecast_std_market = forecast_std_f
 
-        # Find the best opportunity across all outcomes
         best_signal = None
         best_edge = 0
 
@@ -450,73 +527,81 @@ def calculate_signals(forecasts, markets):
 
             # Calculate our probability for this outcome
             if temp_low is None and temp_high is not None:
-                # "≤X" outcome: P(temp <= X)
+                # "≤X" outcome (e.g., "23°F or below"): P(temp <= X)
                 our_prob = stats.norm.cdf(temp_high, loc=forecast_temp_market, scale=forecast_std_market)
+                range_type = "or_below"
             elif temp_high is None and temp_low is not None:
-                # "≥X" outcome: P(temp >= X)
+                # "≥X" outcome (e.g., "26°F or higher"): P(temp >= X)
                 our_prob = 1 - stats.norm.cdf(temp_low, loc=forecast_temp_market, scale=forecast_std_market)
+                range_type = "or_higher"
             elif temp_low is not None and temp_high is not None:
                 # "X-Y" range: P(X <= temp <= Y)
                 prob_high = stats.norm.cdf(temp_high, loc=forecast_temp_market, scale=forecast_std_market)
                 prob_low = stats.norm.cdf(temp_low, loc=forecast_temp_market, scale=forecast_std_market)
                 our_prob = prob_high - prob_low
+                range_type = "range"
             else:
                 continue
 
             edge = our_prob - market_prob
 
-            # Keep track of best opportunity
-            if abs(edge) > abs(best_edge):
-                best_edge = edge
-                best_signal = {
-                    "city": fc["city"],
-                    "city_key": city_key,
-                    "outcome": market.get("outcome_desc", f"{temp_low}-{temp_high}"),
-                    "temp_low": temp_low,
-                    "temp_high": temp_high,
-                    "temp_unit": market_temp_unit,
-                    "our_prob": our_prob,
-                    "market_prob": market_prob,
-                    "edge": edge,
-                    "confidence": fc["confidence"],
-                    "forecast_high_f": forecast_temp_f,  # Original Fahrenheit
-                    "forecast_high_market": forecast_temp_market,  # In market's unit
-                    "forecast_std": forecast_std_market,  # In market's unit
-                    "condition_id": market["condition_id"],
-                    "yes_token_id": market.get("yes_token_id", ""),
-                    "is_demo": market.get("is_demo", False),
-                    "target_date": market.get("target_date"),
-                    "resolution_source": market.get("resolution_source", ""),
-                    "volume": market.get("volume", 0),
-                }
-
-        if best_signal:
             # Determine signal type
-            edge = best_signal["edge"]
             if edge > 0.10:
-                signal = "STRONG BUY YES"
+                signal_type = "STRONG BUY YES"
                 signal_color = "#00c853"
             elif edge > 0.05:
-                signal = "BUY YES"
+                signal_type = "BUY YES"
                 signal_color = "#4caf50"
             elif edge < -0.10:
-                signal = "STRONG BUY NO"
+                signal_type = "STRONG BUY NO"
                 signal_color = "#f44336"
             elif edge < -0.05:
-                signal = "BUY NO"
+                signal_type = "BUY NO"
                 signal_color = "#ff5722"
             else:
-                signal = "PASS"
+                signal_type = "PASS"
                 signal_color = "#9e9e9e"
 
-            best_signal["signal"] = signal
-            best_signal["signal_color"] = signal_color
-            best_signal["signal_strength"] = abs(edge)
+            signal_data = {
+                "city": fc["city"],
+                "city_key": city_key,
+                "outcome": market.get("outcome_desc", f"{temp_low}-{temp_high}"),
+                "temp_low": temp_low,
+                "temp_high": temp_high,
+                "temp_unit": market_temp_unit,
+                "range_type": range_type,
+                "our_prob": our_prob,
+                "market_prob": market_prob,
+                "edge": edge,
+                "confidence": fc["confidence"],
+                "forecast_high_f": forecast_temp_f,
+                "forecast_high_market": forecast_temp_market,
+                "forecast_std": forecast_std_market,
+                "condition_id": market["condition_id"],
+                "yes_token_id": market.get("yes_token_id", ""),
+                "is_demo": market.get("is_demo", False),
+                "target_date": market.get("target_date"),
+                "resolution_source": market.get("resolution_source", ""),
+                "volume": market.get("volume", 0),
+                "signal": signal_type,
+                "signal_color": signal_color,
+                "signal_strength": abs(edge),
+            }
 
+            if show_all_outcomes:
+                # Add all outcomes
+                signals.append(signal_data)
+            else:
+                # Track best opportunity
+                if abs(edge) > abs(best_edge):
+                    best_edge = edge
+                    best_signal = signal_data
+
+        # If not showing all, add only the best signal
+        if not show_all_outcomes and best_signal:
             signals.append(best_signal)
-
-            if abs(edge) > 0.10 and best_signal["confidence"] > 0.7:
-                add_alert(f"🎯 Strong signal: {best_signal['city']} {best_signal['outcome']} - {signal} ({edge:+.1%} edge)", "success")
+            if abs(best_signal["edge"]) > 0.10 and best_signal["confidence"] > 0.7:
+                add_alert(f"🎯 Strong signal: {best_signal['city']} {best_signal['outcome']} - {best_signal['signal']} ({best_signal['edge']:+.1%} edge)", "success")
 
     return signals
 
@@ -789,9 +874,11 @@ def main():
         else:
             markets = fetch_real_markets()
 
-    signals = calculate_signals(forecasts, markets) if markets and forecasts else []
+    # Calculate signals (best only for trading, all for analysis)
+    signals = calculate_signals(forecasts, markets, show_all_outcomes=False) if markets and forecasts else []
+    all_signals = calculate_signals(forecasts, markets, show_all_outcomes=True) if markets and forecasts else []
 
-    # Auto-trade check
+    # Auto-trade check (only use best signals)
     if auto_trade and signals:
         auto_trade_check(signals, bankroll, kelly_fraction, max_position, min_edge, is_live)
 
@@ -809,6 +896,10 @@ def main():
                 st.success(f"✅ **Live Markets Found** - {len(markets)} active weather markets on Polymarket")
             else:
                 st.warning("⚠️ **No Live Markets** - No weather markets currently active on Polymarket. Enable 'Demo Mode' to test the system.")
+
+        # Tomorrow.io status
+        if config.api.tomorrow_io_api_key and "your_" not in config.api.tomorrow_io_api_key.lower():
+            st.caption(f"📡 Tomorrow.io: {st.session_state.tomorrow_io_calls_today}/400 calls today")
 
         # Auto-trade status
         if auto_trade:
@@ -1094,60 +1185,98 @@ def main():
                     st.markdown(f"**Resolution:** {group['resolution_source']}")
                     st.markdown("---")
 
-                    # Show all outcomes as a table
+                    # Show all outcomes as a table with calculation details
                     outcome_data = []
                     city_key = group["city_key"].lower()
                     fc = forecasts.get(city_key, {})
+
+                    # Get forecast in market's unit
+                    market_unit = group["outcomes"][0].get("temp_unit", "F") if group["outcomes"] else "F"
+                    forecast_high_f = fc.get("high_mean", 70) if fc else 70
+                    forecast_std_f = max(fc.get("high_std", 3), 2) if fc else 3
+
+                    if market_unit == "C":
+                        forecast_high = (forecast_high_f - 32) * 5 / 9
+                        forecast_std = forecast_std_f * 5 / 9
+                    else:
+                        forecast_high = forecast_high_f
+                        forecast_std = forecast_std_f
 
                     for o in sorted(group["outcomes"], key=lambda x: x.get("temp_midpoint", 0)):
                         outcome_desc = o.get("outcome_desc", "")
                         yes_price = o.get("yes_price", 0)
                         volume = o.get("volume", 0)
+                        temp_low = o.get("temp_low")
+                        temp_high = o.get("temp_high")
 
-                        # Calculate our probability
+                        # Calculate our probability with formula explanation
                         our_prob = None
+                        formula = ""
+                        calc_type = ""
+
                         if fc:
-                            temp_low = o.get("temp_low")
-                            temp_high = o.get("temp_high")
-                            forecast_high = fc.get("high_mean", 70)
-                            forecast_std = max(fc.get("high_std", 3), 2)
-
-                            # Convert if needed (F to C for Toronto/London)
-                            temp_unit = o.get("temp_unit", "F")
-                            if temp_unit == "C":
-                                forecast_high = (forecast_high - 32) * 5/9
-                                forecast_std = forecast_std * 5/9
-
                             if temp_low is None and temp_high is not None:
+                                # "X or below" - P(temp <= X)
                                 our_prob = stats.norm.cdf(temp_high, loc=forecast_high, scale=forecast_std)
+                                calc_type = "≤ (or below)"
+                                formula = f"P(T≤{temp_high:.0f}) = CDF({temp_high:.0f})"
                             elif temp_high is None and temp_low is not None:
+                                # "X or higher" - P(temp >= X)
                                 our_prob = 1 - stats.norm.cdf(temp_low, loc=forecast_high, scale=forecast_std)
+                                calc_type = "≥ (or higher)"
+                                formula = f"P(T≥{temp_low:.0f}) = 1-CDF({temp_low:.0f})"
                             elif temp_low is not None and temp_high is not None:
+                                # "X-Y" range
                                 our_prob = stats.norm.cdf(temp_high, loc=forecast_high, scale=forecast_std) - \
                                           stats.norm.cdf(temp_low, loc=forecast_high, scale=forecast_std)
+                                calc_type = "range"
+                                formula = f"P({temp_low:.0f}≤T≤{temp_high:.0f})"
 
                         edge = (our_prob - yes_price) if our_prob else None
 
+                        # Determine if this is likely correct or problematic
+                        status = ""
+                        if edge is not None:
+                            if abs(edge) > 0.30:
+                                status = "⚠️"  # Very large edge might indicate issue
+                            elif edge > 0.05:
+                                status = "📈"  # Buy YES opportunity
+                            elif edge < -0.05:
+                                status = "📉"  # Buy NO opportunity
+
                         outcome_data.append({
                             "Outcome": outcome_desc,
+                            "Type": calc_type,
                             "Market": f"{yes_price:.1%}",
                             "Ours": f"{our_prob:.1%}" if our_prob else "N/A",
                             "Edge": f"{edge:+.1%}" if edge else "N/A",
+                            "Signal": status,
                             "Volume": f"${volume:,.0f}"
                         })
 
                     df_outcomes = pd.DataFrame(outcome_data)
                     st.dataframe(df_outcomes, use_container_width=True, hide_index=True)
 
-                    # Show forecast context in market's unit
+                    # Show forecast context
                     if fc:
-                        market_unit = group["outcomes"][0].get("temp_unit", "F") if group["outcomes"] else "F"
-                        fc_high = fc.get('high_mean', 0)
-                        fc_std = fc.get('high_std', 0)
-                        if market_unit == "C":
-                            fc_high = (fc_high - 32) * 5 / 9
-                            fc_std = fc_std * 5 / 9
-                        st.caption(f"📊 Our forecast: {fc_high:.1f}°{market_unit} (±{fc_std:.1f}°)")
+                        st.caption(f"📊 Forecast: {forecast_high:.1f}°{market_unit} (±{forecast_std:.1f}°) | Mean={forecast_high:.1f}, StdDev={forecast_std:.1f}")
+
+                    # Calculation verification
+                    with st.expander("🔍 Verify Calculations"):
+                        st.markdown(f"""
+                        **Forecast (in market unit):** {forecast_high:.2f}°{market_unit}
+                        **Standard Deviation:** {forecast_std:.2f}°
+
+                        **How probabilities are calculated:**
+                        - **"X or below"**: `P(temp ≤ X) = CDF(X)` where CDF is the cumulative normal distribution
+                        - **"X or higher"**: `P(temp ≥ X) = 1 - CDF(X)`
+                        - **"X-Y range"**: `P(X ≤ temp ≤ Y) = CDF(Y) - CDF(X)`
+
+                        **Example for this market:**
+                        - If forecast = {forecast_high:.1f}°{market_unit} with std = {forecast_std:.1f}°
+                        - "≤{forecast_high-2:.0f}" outcome: P(T≤{forecast_high-2:.0f}) = {stats.norm.cdf(forecast_high-2, loc=forecast_high, scale=forecast_std):.1%}
+                        - "≥{forecast_high+2:.0f}" outcome: P(T≥{forecast_high+2:.0f}) = {1-stats.norm.cdf(forecast_high+2, loc=forecast_high, scale=forecast_std):.1%}
+                        """)
         else:
             st.warning("No markets found")
             st.info("Enable Demo Mode in the sidebar to test with simulated markets, or check if Polymarket has active weather markets.")
