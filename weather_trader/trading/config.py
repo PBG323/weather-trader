@@ -109,9 +109,9 @@ class TradingConfig:
         default_factory=lambda: float(os.getenv("MAX_CITY_CONCENTRATION", "0.20"))
     )
 
-    # Maximum trades per day
+    # Maximum trades per day (unlimited by default)
     max_daily_trades: int = field(
-        default_factory=lambda: int(os.getenv("MAX_DAILY_TRADES", "50"))
+        default_factory=lambda: int(os.getenv("MAX_DAILY_TRADES", "999999"))
     )
 
     # Stop trading if daily loss exceeds this % of bankroll

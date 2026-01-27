@@ -8,7 +8,7 @@ import streamlit as st
 import asyncio
 import pandas as pd
 import numpy as np
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from typing import Optional
 import plotly.express as px
 import plotly.graph_objects as go
@@ -18,6 +18,22 @@ from pathlib import Path
 import scipy.stats as stats
 import time
 import random
+from zoneinfo import ZoneInfo
+
+# EST timezone
+EST = ZoneInfo("America/New_York")
+
+def get_est_now() -> datetime:
+    """Get current time in EST."""
+    return datetime.now(EST)
+
+def format_est_time(dt: datetime = None) -> str:
+    """Format datetime in EST."""
+    if dt is None:
+        dt = get_est_now()
+    elif dt.tzinfo is None:
+        dt = dt.replace(tzinfo=EST)
+    return dt.astimezone(EST).strftime('%H:%M:%S EST')
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -143,7 +159,7 @@ def run_async(coro):
 def add_alert(message: str, level: str = "info"):
     """Add an alert to the alerts panel."""
     st.session_state.alerts.insert(0, {
-        "time": datetime.now(),
+        "time": get_est_now(),
         "message": message,
         "level": level
     })
@@ -155,7 +171,7 @@ def record_price(market_id: str, price: float):
     if market_id not in st.session_state.price_history:
         st.session_state.price_history[market_id] = []
     st.session_state.price_history[market_id].append({
-        "time": datetime.now(),
+        "time": get_est_now(),
         "price": price
     })
 
@@ -873,7 +889,7 @@ def auto_trade_check(signals, bankroll, kelly_fraction, max_position, min_edge, 
     if not st.session_state.risk_manager.is_trading_allowed():
         risk_summary = st.session_state.risk_manager.get_risk_summary()
         add_alert(f"⛔ Trading halted: {risk_summary.get('halt_reason', 'risk limit')}", "danger")
-        st.session_state.last_auto_trade_check = datetime.now()
+        st.session_state.last_auto_trade_check = get_est_now()
         return
 
     # PHASE 3: Execute new trades on signals
@@ -929,7 +945,7 @@ def auto_trade_check(signals, bankroll, kelly_fraction, max_position, min_edge, 
     if trades_made > 0:
         add_alert(f"🤖 Auto-trader executed {trades_made} new trade(s)", "success")
 
-    st.session_state.last_auto_trade_check = datetime.now()
+    st.session_state.last_auto_trade_check = get_est_now()
 
 
 def main():
@@ -979,7 +995,7 @@ def main():
         st.sidebar.markdown('<div class="auto-trade-active">', unsafe_allow_html=True)
         st.sidebar.markdown("🟢 **AUTO-TRADE ACTIVE**")
         if st.session_state.last_auto_trade_check:
-            st.sidebar.caption(f"Last check: {st.session_state.last_auto_trade_check.strftime('%H:%M:%S')}")
+            st.sidebar.caption(f"Last check: {format_est_time(st.session_state.last_auto_trade_check)}")
         st.sidebar.markdown('</div>', unsafe_allow_html=True)
 
     # Auto-refresh for auto-trading
@@ -1012,11 +1028,21 @@ def main():
 
     st.sidebar.markdown("---")
 
-    # Quick stats
+    # Quick stats - sync with actual position data
     st.sidebar.markdown("### 📊 Session Stats")
-    st.sidebar.metric("P&L", f"${st.session_state.pnl:+.2f}")
+
+    # Calculate actual P/L from positions
+    total_unrealized = sum(p.get("unrealized_pnl", 0) for p in st.session_state.open_positions)
+    total_pnl = st.session_state.realized_pnl + total_unrealized
+
+    # Update the session state pnl to stay in sync
+    st.session_state.pnl = total_pnl
+
+    st.sidebar.metric("Realized P/L", f"${st.session_state.realized_pnl:+.2f}")
+    st.sidebar.metric("Unrealized P/L", f"${total_unrealized:+.2f}")
+    st.sidebar.metric("Total P/L", f"${total_pnl:+.2f}")
     win_rate = (st.session_state.winning_trades / st.session_state.total_trades * 100) if st.session_state.total_trades > 0 else 0
-    st.sidebar.metric("Win Rate", f"{win_rate:.0f}%")
+    st.sidebar.metric("Win Rate", f"{win_rate:.1f}%")
     st.sidebar.metric("Total Trades", st.session_state.total_trades)
 
     st.sidebar.markdown("---")
@@ -1045,7 +1071,7 @@ def main():
     with col4:
         st.markdown(f"**Data:** {'Demo' if use_demo else 'Live'}")
     with col5:
-        st.markdown(f"**Updated:** {datetime.now().strftime('%H:%M:%S')}")
+        st.markdown(f"**Updated:** {format_est_time()}")
 
     st.markdown("---")
 
@@ -1127,24 +1153,35 @@ def main():
             </div>
             """, unsafe_allow_html=True)
 
-            # Show risk summary
+            # Show risk summary - sync equity with actual P/L
             risk_summary = st.session_state.risk_manager.get_risk_summary()
+
+            # Calculate actual equity from bankroll + P/L to ensure it ties out
+            actual_unrealized = sum(p.get("unrealized_pnl", 0) for p in st.session_state.open_positions)
+            actual_equity = bankroll + st.session_state.realized_pnl + actual_unrealized
+            actual_total_pnl = st.session_state.realized_pnl + actual_unrealized
+
             st.markdown("---")
             st.subheader("📊 Risk Dashboard")
 
             risk_cols = st.columns(5)
             with risk_cols[0]:
-                st.metric("Bankroll", f"${risk_summary['bankroll']:,.2f}")
+                st.metric("Bankroll", f"${bankroll:,.2f}")
             with risk_cols[1]:
-                st.metric("Equity", f"${risk_summary['current_equity']:,.2f}",
-                         f"{risk_summary['daily_pnl_pct']:+.1f}% today")
+                pnl_pct = (actual_total_pnl / bankroll * 100) if bankroll > 0 else 0
+                st.metric("Equity", f"${actual_equity:,.2f}",
+                         f"{pnl_pct:+.1f}% P/L")
             with risk_cols[2]:
-                dd_color = "🔴" if risk_summary['drawdown_pct'] > 10 else "🟡" if risk_summary['drawdown_pct'] > 5 else "🟢"
-                st.metric("Drawdown", f"{dd_color} {risk_summary['drawdown_pct']:.1f}%")
+                # Drawdown from peak equity
+                peak = max(bankroll, actual_equity)
+                drawdown_pct = ((peak - actual_equity) / peak * 100) if peak > 0 else 0
+                dd_color = "🔴" if drawdown_pct > 10 else "🟡" if drawdown_pct > 5 else "🟢"
+                st.metric("Drawdown", f"{dd_color} {drawdown_pct:.1f}%")
             with risk_cols[3]:
-                st.metric("Open Positions", f"{risk_summary['open_positions']}/{risk_summary['max_positions']}")
+                st.metric("Open Positions", f"{len(st.session_state.open_positions)}/{risk_summary['max_positions']}")
             with risk_cols[4]:
-                st.metric("Daily Trades", f"{risk_summary['daily_trades']}/{risk_summary['max_daily_trades']}")
+                daily_trades_display = "Unlimited" if risk_summary['max_daily_trades'] >= 999999 else f"{risk_summary['daily_trades']}/{risk_summary['max_daily_trades']}"
+                st.metric("Daily Trades", f"{risk_summary['daily_trades']} ({daily_trades_display})")
 
             if risk_summary['trading_halted']:
                 st.error(f"⛔ **TRADING HALTED**: {risk_summary['halt_reason']}")
@@ -1318,23 +1355,23 @@ def main():
 
                     with col2:
                         if uses_celsius:
-                            st.metric("High", f"{high_c:.0f}°C", f"({high_f:.0f}°F)")
+                            st.metric("High", f"{high_c:.1f}°C", f"({high_f:.1f}°F)")
                         else:
-                            st.metric("High", f"{high_f:.0f}°F", f"±{fc['high_std']:.1f}°")
+                            st.metric("High", f"{high_f:.1f}°F", f"±{fc['high_std']:.1f}°")
 
                     with col3:
                         if uses_celsius:
-                            st.metric("Low", f"{low_c:.0f}°C", f"({low_f:.0f}°F)")
+                            st.metric("Low", f"{low_c:.1f}°C", f"({low_f:.1f}°F)")
                         else:
-                            st.metric("Low", f"{low_f:.0f}°F", f"±{fc['low_std']:.1f}°")
+                            st.metric("Low", f"{low_f:.1f}°F", f"±{fc['low_std']:.1f}°")
 
                     with col4:
                         if uses_celsius:
                             ci_low_c = (fc['high_ci_lower'] - 32) * 5 / 9
                             ci_high_c = (fc['high_ci_upper'] - 32) * 5 / 9
-                            st.metric("90% Range", f"{ci_low_c:.0f}-{ci_high_c:.0f}°C")
+                            st.metric("90% Range", f"{ci_low_c:.1f}-{ci_high_c:.1f}°C")
                         else:
-                            st.metric("90% Range", f"{fc['high_ci_lower']:.0f}-{fc['high_ci_upper']:.0f}°F")
+                            st.metric("90% Range", f"{fc['high_ci_lower']:.1f}-{fc['high_ci_upper']:.1f}°F")
 
                     with col5:
                         conf_pct = fc['confidence'] * 100
@@ -1387,7 +1424,7 @@ def main():
                 y=df_temps['High'],
                 error_y=dict(type='data', array=df_temps['High_err'], color='rgba(255,87,34,0.5)'),
                 marker_color='#ff5722',
-                text=[f"{h:.0f}" for h in df_temps['High']],
+                text=[f"{h:.1f}" for h in df_temps['High']],
                 textposition='outside'
             ))
             fig.add_trace(go.Bar(
@@ -1396,7 +1433,7 @@ def main():
                 y=df_temps['Low'],
                 error_y=dict(type='data', array=df_temps['Low_err'], color='rgba(33,150,243,0.5)'),
                 marker_color='#2196f3',
-                text=[f"{l:.0f}" for l in df_temps['Low']],
+                text=[f"{l:.1f}" for l in df_temps['Low']],
                 textposition='outside'
             ))
             fig.update_layout(
@@ -1574,9 +1611,9 @@ def main():
 
                     fig = go.Figure()
                     fig.add_trace(go.Bar(name='High', x=models, y=highs, marker_color='#ff5722',
-                                        text=[f"{h:.0f}{unit_label}" for h in highs], textposition='outside'))
+                                        text=[f"{h:.1f}{unit_label}" for h in highs], textposition='outside'))
                     fig.add_trace(go.Bar(name='Low', x=models, y=lows, marker_color='#2196f3',
-                                        text=[f"{l:.0f}{unit_label}" for l in lows], textposition='outside'))
+                                        text=[f"{l:.1f}{unit_label}" for l in lows], textposition='outside'))
 
                     if city_key in forecasts:
                         ensemble_high = forecasts[city_key]["high_mean"]
@@ -1899,7 +1936,7 @@ def main():
             st.info("Price history accumulates with each refresh")
 
             # Demo
-            demo_times = pd.date_range(end=datetime.now(), periods=20, freq='30min')
+            demo_times = pd.date_range(end=get_est_now(), periods=20, freq='30min')
             demo_prices = 0.5 + np.cumsum(np.random.randn(20) * 0.02)
             demo_prices = np.clip(demo_prices, 0.1, 0.9)
 
@@ -1933,6 +1970,12 @@ def main():
 
                 style = level_styles.get(alert['level'], {"bg": "#374151", "border": "#6b7280", "text": "#f3f4f6"})
 
+                # Format time in EST
+                alert_time = alert['time']
+                if alert_time.tzinfo is None:
+                    alert_time = alert_time.replace(tzinfo=EST)
+                time_str = alert_time.strftime('%H:%M:%S EST')
+
                 st.markdown(f"""
                 <div style="background-color: {style['bg']};
                             border-left: 4px solid {style['border']};
@@ -1942,7 +1985,7 @@ def main():
                             margin: 8px 0;
                             font-size: 14px;">
                     {level_icons.get(alert['level'], '📢')}
-                    <strong>{alert['time'].strftime('%H:%M:%S')}</strong> — {alert['message']}
+                    <strong>{time_str}</strong> — {alert['message']}
                 </div>
                 """, unsafe_allow_html=True)
         else:
@@ -1953,10 +1996,11 @@ def main():
     market_status = "Demo Markets" if use_demo else ("Live Markets" if markets else "No Markets")
     open_pos_count = len(st.session_state.open_positions)
     st.markdown(
-        f"*Weather Trader v0.4.0 (Smart Trading Engine)* | "
+        f"*Weather Trader v0.4.1 (Smart Trading Engine)* | "
         f"*{market_status}* | "
         f"*{len(forecasts)} cities • {len(signals)} signals • {open_pos_count} positions* | "
-        f"*Auto-Trade: {'🟢 ON' if auto_trade else 'OFF'}*"
+        f"*Auto-Trade: {'🟢 ON' if auto_trade else 'OFF'}* | "
+        f"*{format_est_time()}*"
     )
 
     # Auto-refresh
