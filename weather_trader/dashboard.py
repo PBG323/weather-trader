@@ -283,37 +283,49 @@ def fetch_model_comparison():
 
 
 async def _fetch_model_comparison():
-    """Fetch from multiple models."""
+    """Fetch from multiple models including Tomorrow.io."""
     from weather_trader.apis.open_meteo import WeatherModel
 
     comparisons = {}
     target_date = date.today() + timedelta(days=1)
 
+    # Check Tomorrow.io availability once before the loop
+    use_tomorrow_io = (
+        config.api.tomorrow_io_api_key and
+        "your_" not in config.api.tomorrow_io_api_key.lower() and
+        can_call_tomorrow_io()
+    )
+
     async with OpenMeteoClient() as om_client:
-        for city_key in get_all_cities():
-            city_config = get_city_config(city_key)
-            city_data = {"city": city_config.name, "models": {}}
+        # Create Tomorrow.io client once outside the loop (if available)
+        tm_client = None
+        if use_tomorrow_io:
+            tm_client = TomorrowIOClient()
+            await tm_client.__aenter__()
+            record_tomorrow_io_call()
 
-            for model in [WeatherModel.ECMWF, WeatherModel.GFS, WeatherModel.BEST_MATCH]:
-                try:
-                    forecasts = await om_client.get_daily_forecast(city_config, model, days=3)
-                    for f in forecasts:
-                        if f.timestamp.date() == target_date:
-                            city_data["models"][model.value] = {
-                                "high": f.temperature_high,
-                                "low": f.temperature_low
-                            }
-                            break
-                except:
-                    pass
+        try:
+            for city_key in get_all_cities():
+                city_config = get_city_config(city_key)
+                city_data = {"city": city_config.name, "models": {}}
 
-            if (config.api.tomorrow_io_api_key and
-                "your_" not in config.api.tomorrow_io_api_key.lower() and
-                can_call_tomorrow_io()):
-                try:
-                    async with TomorrowIOClient() as tm_client:
+                for model in [WeatherModel.ECMWF, WeatherModel.GFS, WeatherModel.BEST_MATCH]:
+                    try:
+                        forecasts = await om_client.get_daily_forecast(city_config, model, days=3)
+                        for f in forecasts:
+                            if f.timestamp.date() == target_date:
+                                city_data["models"][model.value] = {
+                                    "high": f.temperature_high,
+                                    "low": f.temperature_low
+                                }
+                                break
+                    except Exception:
+                        pass
+
+                # Fetch Tomorrow.io for each city using the shared client
+                if tm_client:
+                    try:
                         tm_forecasts = await tm_client.get_daily_forecast(city_config, days=3)
-                        record_tomorrow_io_call()
                         for f in tm_forecasts:
                             if f.timestamp.date() == target_date:
                                 city_data["models"]["tomorrow.io"] = {
@@ -321,10 +333,13 @@ async def _fetch_model_comparison():
                                     "low": f.temperature_low
                                 }
                                 break
-                except Exception as e:
-                    add_alert(f"Tomorrow.io error for {city_config.name}: {str(e)[:100]}", "warning")
+                    except Exception as e:
+                        print(f"Tomorrow.io error for {city_config.name}: {e}")
 
-            comparisons[city_key] = city_data
+                comparisons[city_key] = city_data
+        finally:
+            if tm_client:
+                await tm_client.__aexit__(None, None, None)
 
     return comparisons
 
@@ -386,13 +401,11 @@ def fetch_forecasts_with_models():
     return run_async(_fetch_forecasts_with_models())
 
 
-# Track Tomorrow.io API usage to maximize 500/day limit
-if 'tomorrow_io_last_call' not in st.session_state:
-    st.session_state.tomorrow_io_last_call = None
-if 'tomorrow_io_calls_today' not in st.session_state:
-    st.session_state.tomorrow_io_calls_today = 0
-if 'tomorrow_io_call_date' not in st.session_state:
-    st.session_state.tomorrow_io_call_date = date.today()
+# Tomorrow.io API rate limiting - Module-level variables
+# (Must be module-level, NOT session state, to work inside @st.cache_data functions)
+_tomorrow_io_last_call: Optional[datetime] = None
+_tomorrow_io_calls_today: int = 0
+_tomorrow_io_call_date: date = date.today()
 
 
 def can_call_tomorrow_io() -> bool:
@@ -402,20 +415,24 @@ def can_call_tomorrow_io() -> bool:
     - Use 480 calls max (20 buffer for manual testing)
     - Space calls by 2 minutes minimum (30 calls/hour max)
     - This allows ~16 hours of continuous operation
+
+    Uses module-level variables (not session state) so it works inside
+    @st.cache_data decorated functions.
     """
+    global _tomorrow_io_calls_today, _tomorrow_io_call_date
+
     # Reset counter if it's a new day
-    if st.session_state.tomorrow_io_call_date != date.today():
-        st.session_state.tomorrow_io_calls_today = 0
-        st.session_state.tomorrow_io_call_date = date.today()
+    if _tomorrow_io_call_date != date.today():
+        _tomorrow_io_calls_today = 0
+        _tomorrow_io_call_date = date.today()
 
     # 500 calls/day, use 480 (leave 20 buffer)
-    if st.session_state.tomorrow_io_calls_today >= 480:
+    if _tomorrow_io_calls_today >= 480:
         return False
 
     # Space out calls - at least 2 minutes between calls
-    # This gives ~30 calls/hour max, well under the limit
-    if st.session_state.tomorrow_io_last_call:
-        elapsed = (datetime.now() - st.session_state.tomorrow_io_last_call).seconds
+    if _tomorrow_io_last_call:
+        elapsed = (datetime.now() - _tomorrow_io_last_call).seconds
         if elapsed < 120:  # 2 minutes
             return False
 
@@ -424,8 +441,24 @@ def can_call_tomorrow_io() -> bool:
 
 def record_tomorrow_io_call():
     """Record that we made a Tomorrow.io API call."""
-    st.session_state.tomorrow_io_last_call = datetime.now()
-    st.session_state.tomorrow_io_calls_today += 1
+    global _tomorrow_io_last_call, _tomorrow_io_calls_today
+    _tomorrow_io_last_call = datetime.now()
+    _tomorrow_io_calls_today += 1
+
+
+def get_tomorrow_io_usage() -> dict:
+    """Get Tomorrow.io API usage stats for display."""
+    global _tomorrow_io_calls_today, _tomorrow_io_call_date
+    if _tomorrow_io_call_date != date.today():
+        _tomorrow_io_calls_today = 0
+        _tomorrow_io_call_date = date.today()
+    return {
+        "calls_today": _tomorrow_io_calls_today,
+        "daily_limit": 500,
+        "budget": 480,
+        "last_call": _tomorrow_io_last_call,
+        "can_call": can_call_tomorrow_io(),
+    }
 
 
 async def _fetch_forecasts_with_models():
@@ -450,7 +483,7 @@ async def _fetch_forecasts_with_models():
             tm_client = TomorrowIOClient()
             await tm_client.__aenter__()
             record_tomorrow_io_call()
-            add_alert(f"📡 Tomorrow.io API called (#{st.session_state.tomorrow_io_calls_today} today)", "info")
+            print(f"Tomorrow.io API called (#{_tomorrow_io_calls_today} today)")
 
         try:
             for city_key in get_all_cities():
@@ -495,7 +528,7 @@ async def _fetch_forecasts_with_models():
                                     })
                                     break
                         except Exception as e:
-                            add_alert(f"Tomorrow.io error for {city_key}: {str(e)[:50]}", "warning")
+                            print(f"Tomorrow.io error for {city_key}: {e}")
 
                     if model_forecasts:
                         ens = ensemble.create_ensemble(
@@ -1153,7 +1186,8 @@ def main():
 
         # Tomorrow.io status
         if config.api.tomorrow_io_api_key and "your_" not in config.api.tomorrow_io_api_key.lower():
-            st.caption(f"📡 Tomorrow.io: {st.session_state.tomorrow_io_calls_today}/400 calls today")
+            usage = get_tomorrow_io_usage()
+            st.caption(f"📡 Tomorrow.io: {usage['calls_today']}/{usage['daily_limit']} calls today")
 
         # Auto-trade status with smart exit info
         if auto_trade:
@@ -1661,6 +1695,49 @@ def main():
                         st.metric("Model Agreement", agreement, f"Spread: {spread:.1f}{unit_label}")
 
                 st.markdown("---")
+
+        # Tomorrow.io API Usage Counter
+        st.markdown("---")
+        if config.api.tomorrow_io_api_key and "your_" not in config.api.tomorrow_io_api_key.lower():
+            usage = get_tomorrow_io_usage()
+            calls = usage["calls_today"]
+            limit = usage["daily_limit"]
+            budget = usage["budget"]
+            pct_used = (calls / limit * 100) if limit > 0 else 0
+
+            col_a, col_b, col_c, col_d = st.columns(4)
+            with col_a:
+                st.metric("API Calls Today", f"{calls} / {limit}")
+            with col_b:
+                status_color = "🟢" if calls < budget * 0.5 else "🟡" if calls < budget else "🔴"
+                st.metric("Status", f"{status_color} {pct_used:.0f}% used")
+            with col_c:
+                remaining = max(0, budget - calls)
+                st.metric("Remaining (Budget)", f"{remaining}")
+            with col_d:
+                if usage["last_call"]:
+                    last_str = usage["last_call"].strftime("%H:%M:%S")
+                    st.metric("Last Call", last_str)
+                else:
+                    st.metric("Last Call", "None yet")
+
+            # Show whether Tomorrow.io data is present in the comparison
+            has_tomorrow = any(
+                "tomorrow.io" in data.get("models", {})
+                for data in model_comparison.values()
+            ) if model_comparison else False
+            if has_tomorrow:
+                st.success("Tomorrow.io data is included in the model comparison above.")
+            else:
+                if not usage["can_call"]:
+                    if calls >= budget:
+                        st.warning(f"Tomorrow.io daily budget reached ({calls}/{budget}). Resets at midnight.")
+                    else:
+                        st.info("Tomorrow.io on cooldown (2-min spacing). Data will appear on next refresh.")
+                else:
+                    st.warning("Tomorrow.io data not available. Check API key or see Alerts tab for errors.")
+        else:
+            st.caption("Tomorrow.io API key not configured. Add TOMORROW_IO_API_KEY to .env for additional model data.")
 
     # =====================
     # TAB 5: Multi-Day
