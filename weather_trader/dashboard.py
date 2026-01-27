@@ -835,42 +835,58 @@ def main():
     # =====================
     with tab2:
         st.header("🌡️ Weather Forecasts")
-        st.markdown(f"**Forecast Date:** {date.today() + timedelta(days=1)}")
+        target_date = date.today() + timedelta(days=1)
+        st.caption(f"Tomorrow: {target_date.strftime('%A, %B %d, %Y')}")
 
         if forecasts:
-            cols = st.columns(min(len(forecasts), 3))
+            # Clean card-based layout
+            for city_key, fc in forecasts.items():
+                city_config = get_city_config(city_key)
+                temp_unit = city_config.temp_unit
 
-            for i, (city_key, fc) in enumerate(forecasts.items()):
-                with cols[i % 3]:
-                    st.markdown(f"### {fc['city']}")
+                with st.container():
+                    col1, col2, col3, col4, col5 = st.columns([2, 1.5, 1.5, 1.5, 1.5])
 
-                    fig = go.Figure(go.Indicator(
-                        mode="gauge+number",
-                        value=fc['high_mean'],
-                        domain={'x': [0, 1], 'y': [0, 1]},
-                        title={'text': "High °F"},
-                        gauge={
-                            'axis': {'range': [0, 100]},
-                            'bar': {'color': "#ff5722"},
-                            'steps': [
-                                {'range': [0, 32], 'color': "#e3f2fd"},
-                                {'range': [32, 50], 'color': "#bbdefb"},
-                                {'range': [50, 70], 'color': "#fff9c4"},
-                                {'range': [70, 85], 'color': "#ffcc80"},
-                                {'range': [85, 100], 'color': "#ffab91"},
-                            ],
-                        }
-                    ))
-                    fig.update_layout(height=200, margin=dict(l=20, r=20, t=40, b=20))
-                    st.plotly_chart(fig, use_container_width=True)
+                    with col1:
+                        st.markdown(f"### {fc['city']}")
+                        st.caption(f"📍 {city_config.station_name}")
 
-                    st.metric("Low", f"{fc['low_mean']:.1f}°F", f"±{fc['low_std']:.1f}°F", delta_color="off")
-                    st.progress(fc['confidence'], text=f"Confidence: {fc['confidence']:.0%}")
-                    st.caption(f"{fc['model_count']} models • 90% CI: {fc['high_ci_lower']:.0f}-{fc['high_ci_upper']:.0f}°F")
-                    st.markdown("---")
+                    with col2:
+                        high_display = fc['high_mean']
+                        if temp_unit == "C":
+                            high_display = (fc['high_mean'] - 32) * 5/9
+                        st.metric(
+                            "High",
+                            f"{fc['high_mean']:.0f}°F",
+                            f"±{fc['high_std']:.1f}°"
+                        )
 
-            # Temperature comparison
-            st.subheader("Temperature Comparison")
+                    with col3:
+                        st.metric(
+                            "Low",
+                            f"{fc['low_mean']:.0f}°F",
+                            f"±{fc['low_std']:.1f}°"
+                        )
+
+                    with col4:
+                        st.metric(
+                            "90% Range",
+                            f"{fc['high_ci_lower']:.0f}-{fc['high_ci_upper']:.0f}°F"
+                        )
+
+                    with col5:
+                        conf_pct = fc['confidence'] * 100
+                        conf_color = "🟢" if conf_pct >= 80 else "🟡" if conf_pct >= 60 else "🔴"
+                        st.metric(
+                            "Confidence",
+                            f"{conf_color} {conf_pct:.0f}%",
+                            f"{fc['model_count']} models"
+                        )
+
+                    st.divider()
+
+            # Temperature comparison chart
+            st.subheader("📊 Temperature Comparison")
             df_temps = pd.DataFrame([
                 {"City": fc["city"], "High": fc["high_mean"], "Low": fc["low_mean"],
                  "High_err": fc["high_std"], "Low_err": fc["low_std"]}
@@ -878,14 +894,31 @@ def main():
             ])
 
             fig = go.Figure()
-            fig.add_trace(go.Bar(name='High', x=df_temps['City'], y=df_temps['High'],
-                                error_y=dict(type='data', array=df_temps['High_err']),
-                                marker_color='#ff5722'))
-            fig.add_trace(go.Bar(name='Low', x=df_temps['City'], y=df_temps['Low'],
-                                error_y=dict(type='data', array=df_temps['Low_err']),
-                                marker_color='#2196f3'))
-            fig.update_layout(barmode='group', title="Forecasted Temperatures with Uncertainty",
-                            yaxis_title="Temperature (°F)", height=400)
+            fig.add_trace(go.Bar(
+                name='High',
+                x=df_temps['City'],
+                y=df_temps['High'],
+                error_y=dict(type='data', array=df_temps['High_err'], color='rgba(255,87,34,0.5)'),
+                marker_color='#ff5722',
+                text=[f"{h:.0f}°" for h in df_temps['High']],
+                textposition='outside'
+            ))
+            fig.add_trace(go.Bar(
+                name='Low',
+                x=df_temps['City'],
+                y=df_temps['Low'],
+                error_y=dict(type='data', array=df_temps['Low_err'], color='rgba(33,150,243,0.5)'),
+                marker_color='#2196f3',
+                text=[f"{l:.0f}°" for l in df_temps['Low']],
+                textposition='outside'
+            ))
+            fig.update_layout(
+                barmode='group',
+                yaxis_title="Temperature (°F)",
+                height=350,
+                margin=dict(t=20, b=40),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+            )
             st.plotly_chart(fig, use_container_width=True)
 
     # =====================

@@ -298,10 +298,16 @@ class WeatherMarketFinder:
 
     def _parse_outcome(self, market: dict, temp_unit: str) -> Optional[TemperatureOutcome]:
         """Parse a single outcome market."""
-        question = market.get("question", "") or market.get("groupItemTitle", "")
+        # Try groupItemTitle first (more reliable for range), then question
+        question = market.get("groupItemTitle", "") or market.get("question", "")
 
-        # Parse temperature range from question
+        # Parse temperature range from question/title
         temp_low, temp_high = self._parse_temp_range(question)
+
+        if temp_low is None and temp_high is None:
+            # Try parsing from the full question if groupItemTitle didn't work
+            full_question = market.get("question", "")
+            temp_low, temp_high = self._parse_temp_range(full_question)
 
         if temp_low is None and temp_high is None:
             return None
@@ -315,8 +321,8 @@ class WeatherMarketFinder:
         no_token_id = ""
 
         if clob_token_ids and len(clob_token_ids) >= 2:
-            yes_token_id = clob_token_ids[0]
-            no_token_id = clob_token_ids[1]
+            yes_token_id = str(clob_token_ids[0])
+            no_token_id = str(clob_token_ids[1])
         elif tokens:
             for t in tokens:
                 if t.get("outcome") == "Yes":
@@ -324,24 +330,41 @@ class WeatherMarketFinder:
                 elif t.get("outcome") == "No":
                     no_token_id = t.get("token_id", "")
 
-        # Get price (probability)
-        yes_price = float(market.get("outcomePrices", "0.5").split(",")[0] if isinstance(market.get("outcomePrices"), str) else market.get("outcomePrices", [0.5])[0] if isinstance(market.get("outcomePrices"), list) else 0.5)
+        # Get price (probability) - outcomePrices is array of strings like ["0.725", "0.275"]
+        yes_price = 0.5
+        outcome_prices = market.get("outcomePrices", [])
+        if isinstance(outcome_prices, list) and len(outcome_prices) > 0:
+            try:
+                yes_price = float(outcome_prices[0])
+            except (ValueError, TypeError):
+                pass
+        elif isinstance(outcome_prices, str):
+            try:
+                yes_price = float(outcome_prices.split(",")[0])
+            except (ValueError, TypeError):
+                pass
 
-        # Also try direct price field
+        # Fallback to other price fields
         if yes_price == 0.5:
-            yes_price = float(market.get("bestAsk", market.get("lastTradePrice", 0.5)))
+            try:
+                yes_price = float(market.get("bestAsk") or market.get("lastTradePrice") or 0.5)
+            except (ValueError, TypeError):
+                pass
+
+        # Use groupItemTitle as description if available
+        description = market.get("groupItemTitle", "") or question
 
         return TemperatureOutcome(
             outcome_id=str(market.get("id", "")),
             condition_id=market.get("conditionId", ""),
-            description=question,
+            description=description,
             temp_low=temp_low,
             temp_high=temp_high,
             yes_token_id=yes_token_id,
             no_token_id=no_token_id,
             yes_price=yes_price,
-            volume=float(market.get("volume", 0)),
-            liquidity=float(market.get("liquidity", 0)),
+            volume=float(market.get("volume") or 0),
+            liquidity=float(market.get("liquidity") or 0),
         )
 
     def _parse_temp_range(self, text: str) -> tuple[Optional[float], Optional[float]]:
