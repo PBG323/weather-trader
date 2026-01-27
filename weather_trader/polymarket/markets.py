@@ -3,105 +3,121 @@ Weather Market Discovery
 
 Finds and parses Polymarket weather temperature markets.
 
-Weather markets are typically structured as:
-- "Will [City] high temperature be over/under X°F on [Date]?"
-- Binary YES/NO contracts
-- Settlement based on official NWS/NOAA readings
+Polymarket weather markets structure:
+- URL: highest-temperature-in-{city}-on-{month}-{day}
+- Multi-outcome markets with temperature ranges (e.g., "20-21°F", "≤15°F", "≥26°F")
+- Resolution via Weather Underground station data
 """
 
 import re
 import httpx
-from dataclasses import dataclass
-from datetime import datetime, date
+from dataclasses import dataclass, field
+from datetime import datetime, date, timedelta
 from typing import Optional
 from enum import Enum
 
 from ..config import config, CITY_CONFIGS, CityConfig
 
 
-class MarketType(Enum):
-    """Type of temperature market."""
-    HIGH_OVER = "high_over"      # High temp over threshold
-    HIGH_UNDER = "high_under"    # High temp under threshold
-    LOW_OVER = "low_over"        # Low temp over threshold
-    LOW_UNDER = "low_under"      # Low temp under threshold
-    RANGE = "range"              # Temp in a range
+@dataclass
+class TemperatureOutcome:
+    """A single temperature outcome in a multi-outcome market."""
+    outcome_id: str  # Market ID for this outcome
+    condition_id: str
+    description: str  # e.g., "20-21°F" or "≤15°F"
+    temp_low: Optional[float]  # Lower bound (None if "≤X")
+    temp_high: Optional[float]  # Upper bound (None if "≥X")
+    yes_token_id: str
+    no_token_id: str
+    yes_price: float  # 0-1, probability
+    volume: float
+    liquidity: float
+
+    @property
+    def midpoint(self) -> float:
+        """Get midpoint temperature for this range."""
+        if self.temp_low is None:
+            return self.temp_high - 1  # For "≤X" ranges
+        if self.temp_high is None:
+            return self.temp_low + 1  # For "≥X" ranges
+        return (self.temp_low + self.temp_high) / 2
 
 
 @dataclass
 class WeatherMarket:
-    """A weather temperature market on Polymarket."""
-    # Market identifiers
-    condition_id: str
-    question_id: str
-    market_slug: str
+    """A weather temperature market on Polymarket with multiple outcomes."""
+    # Event identifiers
+    event_id: str
+    event_slug: str
 
     # Market details
     city: str
     city_config: Optional[CityConfig]
     target_date: date
-    threshold: float  # Temperature threshold in Fahrenheit
-    market_type: MarketType
+    temp_unit: str  # "F" or "C"
 
-    # Token info
-    yes_token_id: str
-    no_token_id: str
+    # All temperature outcome options
+    outcomes: list[TemperatureOutcome] = field(default_factory=list)
 
-    # Current prices
-    yes_price: float  # 0-1
-    no_price: float   # 0-1
-
-    # Liquidity info
-    volume: float
-    liquidity: float
+    # Aggregate info
+    total_volume: float = 0.0
+    total_liquidity: float = 0.0
 
     # Market state
-    is_active: bool
-    end_date: datetime
+    is_active: bool = True
+    end_date: Optional[datetime] = None
 
     # Raw question text
-    question: str
+    question: str = ""
 
-    def implied_probability(self, for_yes: bool = True) -> float:
-        """Get market-implied probability."""
-        return self.yes_price if for_yes else self.no_price
+    # Resolution source
+    resolution_source: str = ""
 
-    @property
-    def is_over_market(self) -> bool:
-        """Check if this is an 'over' market."""
-        return self.market_type in [MarketType.HIGH_OVER, MarketType.LOW_OVER]
+    def get_probability_distribution(self) -> dict[float, float]:
+        """
+        Get probability distribution over temperature midpoints.
 
-    @property
-    def is_high_temp_market(self) -> bool:
-        """Check if this is a high temperature market."""
-        return self.market_type in [MarketType.HIGH_OVER, MarketType.HIGH_UNDER]
+        Returns:
+            Dict mapping temperature midpoint to probability
+        """
+        return {o.midpoint: o.yes_price for o in self.outcomes}
+
+    def get_expected_temperature(self) -> float:
+        """Calculate expected temperature from market prices."""
+        total_prob = sum(o.yes_price for o in self.outcomes)
+        if total_prob == 0:
+            return 0
+        return sum(o.midpoint * o.yes_price for o in self.outcomes) / total_prob
+
+    def find_best_outcome(self, forecast_temp: float) -> Optional[TemperatureOutcome]:
+        """Find the outcome that contains the forecasted temperature."""
+        for o in self.outcomes:
+            if o.temp_low is None:  # "≤X" range
+                if forecast_temp <= o.temp_high:
+                    return o
+            elif o.temp_high is None:  # "≥X" range
+                if forecast_temp >= o.temp_low:
+                    return o
+            else:  # Normal range
+                if o.temp_low <= forecast_temp <= o.temp_high:
+                    return o
+        return None
 
 
 class WeatherMarketFinder:
     """
     Discovers weather temperature markets on Polymarket.
+
+    Uses the Gamma API with slug-based queries for reliable market discovery.
     """
 
     def __init__(self):
         self.gamma_url = config.api.polymarket_gamma_url
         self.client = httpx.AsyncClient(timeout=30.0)
 
-        # Regex patterns for parsing weather questions
-        self.city_patterns = {
-            "nyc": r"(?:NYC|New York|New York City)",
-            "atlanta": r"Atlanta",
-            "seattle": r"Seattle",
-            "toronto": r"Toronto",
-            "london": r"London",
-        }
-
-        self.temp_pattern = re.compile(
-            r"(?:high|low)?\s*(?:temperature|temp)?\s*(?:be\s+)?(?:over|under|above|below)\s+(\d+(?:\.\d+)?)\s*(?:°?F|degrees?)?",
-            re.IGNORECASE
-        )
-
-        self.date_pattern = re.compile(
-            r"(?:on|for)\s+(\w+\s+\d{1,2}(?:,?\s*\d{4})?|\d{1,2}/\d{1,2}(?:/\d{2,4})?)",
+        # Regex for parsing temperature ranges like "20-21°F", "≤15°F", "≥26°F"
+        self.range_pattern = re.compile(
+            r"(?:(\d+)-(\d+)|[≤<]=?(\d+)|[≥>]=?(\d+))\s*°?([FC])?",
             re.IGNORECASE
         )
 
@@ -115,9 +131,16 @@ class WeatherMarketFinder:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.close()
 
+    def _build_market_slug(self, city_slug: str, target_date: date) -> str:
+        """Build the Polymarket slug for a weather market."""
+        month_name = target_date.strftime("%B").lower()
+        day = target_date.day
+        return f"highest-temperature-in-{city_slug}-on-{month_name}-{day}"
+
     async def find_weather_markets(
         self,
         city_filter: Optional[str] = None,
+        days_ahead: int = 3,
         active_only: bool = True
     ) -> list[WeatherMarket]:
         """
@@ -125,103 +148,291 @@ class WeatherMarketFinder:
 
         Args:
             city_filter: Optional city key to filter by
+            days_ahead: Number of days to look ahead for markets
             active_only: Only return active markets
 
         Returns:
             List of WeatherMarket objects
         """
-        # Search for weather-related markets
-        search_terms = ["temperature", "weather", "degrees"]
-        all_markets = []
-
-        for term in search_terms:
-            try:
-                markets = await self._search_markets(term)
-                all_markets.extend(markets)
-            except Exception as e:
-                print(f"Warning: Failed to search for '{term}': {e}")
-
-        # Deduplicate by condition_id
-        seen = set()
-        unique_markets = []
-        for m in all_markets:
-            if m.condition_id not in seen:
-                seen.add(m.condition_id)
-                unique_markets.append(m)
-
-        # Filter by city if specified
-        if city_filter:
-            city_filter = city_filter.lower()
-            unique_markets = [
-                m for m in unique_markets
-                if m.city.lower() == city_filter
-            ]
-
-        # Filter active only
-        if active_only:
-            unique_markets = [m for m in unique_markets if m.is_active]
-
-        return unique_markets
-
-    async def _search_markets(self, search_term: str) -> list[WeatherMarket]:
-        """Search Polymarket for markets matching a term."""
-        endpoint = f"{self.gamma_url}/markets"
-
-        params = {
-            "search": search_term,
-            "active": "true",
-            "closed": "false",
-        }
-
-        response = await self.client.get(endpoint, params=params)
-        response.raise_for_status()
-        data = response.json()
-
         markets = []
-        for market_data in data:
-            parsed = self._parse_market(market_data)
-            if parsed:
-                markets.append(parsed)
+        cities = [city_filter] if city_filter else list(CITY_CONFIGS.keys())
+
+        for city_key in cities:
+            city_config = CITY_CONFIGS.get(city_key)
+            if not city_config:
+                continue
+
+            # Check markets for today and upcoming days
+            for days in range(days_ahead + 1):
+                target_date = date.today() + timedelta(days=days)
+                slug = self._build_market_slug(city_config.polymarket_slug, target_date)
+
+                try:
+                    market = await self._fetch_market_by_slug(slug, city_key, city_config)
+                    if market:
+                        if not active_only or market.is_active:
+                            markets.append(market)
+                except Exception as e:
+                    # Market may not exist for this date - that's okay
+                    pass
 
         return markets
 
-    async def get_market_by_id(self, condition_id: str) -> Optional[WeatherMarket]:
+    async def get_market_for_city_date(
+        self,
+        city_key: str,
+        target_date: date
+    ) -> Optional[WeatherMarket]:
         """
-        Get a specific market by condition ID.
+        Get the weather market for a specific city and date.
 
         Args:
-            condition_id: The market condition ID
+            city_key: City key (e.g., "nyc", "london")
+            target_date: The date to get the market for
 
         Returns:
             WeatherMarket or None if not found
         """
-        endpoint = f"{self.gamma_url}/markets/{condition_id}"
-
-        try:
-            response = await self.client.get(endpoint)
-            response.raise_for_status()
-            data = response.json()
-            return self._parse_market(data)
-        except httpx.HTTPStatusError:
+        city_config = CITY_CONFIGS.get(city_key.lower())
+        if not city_config:
             return None
 
-    async def get_market_prices(self, market: WeatherMarket) -> dict:
+        slug = self._build_market_slug(city_config.polymarket_slug, target_date)
+        return await self._fetch_market_by_slug(slug, city_key, city_config)
+
+    async def _fetch_market_by_slug(
+        self,
+        slug: str,
+        city_key: str,
+        city_config: CityConfig
+    ) -> Optional[WeatherMarket]:
+        """Fetch a market from Polymarket by its slug."""
+        endpoint = f"{self.gamma_url}/events"
+        params = {"slug": slug}
+
+        response = await self.client.get(endpoint, params=params)
+        response.raise_for_status()
+
+        data = response.json()
+
+        # The API returns a list; we want the first match
+        if not data or len(data) == 0:
+            return None
+
+        event = data[0] if isinstance(data, list) else data
+        return self._parse_event(event, city_key, city_config)
+
+    def _parse_event(
+        self,
+        event: dict,
+        city_key: str,
+        city_config: CityConfig
+    ) -> Optional[WeatherMarket]:
+        """Parse a Polymarket event into a WeatherMarket."""
+        # Extract target date from slug
+        slug = event.get("slug", "")
+        target_date = self._extract_date_from_slug(slug)
+
+        if not target_date:
+            # Try from end date
+            end_str = event.get("endDate") or event.get("end_date_iso")
+            if end_str:
+                try:
+                    target_date = datetime.fromisoformat(
+                        end_str.replace("Z", "+00:00")
+                    ).date()
+                except ValueError:
+                    return None
+            else:
+                return None
+
+        # Parse end datetime
+        end_date = None
+        end_str = event.get("endDate") or event.get("end_date_iso")
+        if end_str:
+            try:
+                end_date = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
+            except ValueError:
+                pass
+
+        # Parse all outcome markets
+        outcomes = []
+        sub_markets = event.get("markets", [])
+
+        for market in sub_markets:
+            outcome = self._parse_outcome(market, city_config.temp_unit)
+            if outcome:
+                outcomes.append(outcome)
+
+        # Sort outcomes by temperature
+        outcomes.sort(key=lambda o: o.midpoint)
+
+        # Calculate totals
+        total_volume = sum(o.volume for o in outcomes)
+        total_liquidity = sum(o.liquidity for o in outcomes)
+
+        # Check if active
+        is_active = event.get("active", True) and not event.get("closed", False)
+
+        # Get resolution source from description
+        description = event.get("description", "")
+        resolution_source = "Weather Underground"
+        if city_config.station_name:
+            resolution_source = f"Weather Underground - {city_config.station_name}"
+
+        return WeatherMarket(
+            event_id=str(event.get("id", "")),
+            event_slug=slug,
+            city=city_key,
+            city_config=city_config,
+            target_date=target_date,
+            temp_unit=city_config.temp_unit,
+            outcomes=outcomes,
+            total_volume=total_volume,
+            total_liquidity=total_liquidity,
+            is_active=is_active,
+            end_date=end_date,
+            question=event.get("title", ""),
+            resolution_source=resolution_source,
+        )
+
+    def _parse_outcome(self, market: dict, temp_unit: str) -> Optional[TemperatureOutcome]:
+        """Parse a single outcome market."""
+        question = market.get("question", "") or market.get("groupItemTitle", "")
+
+        # Parse temperature range from question
+        temp_low, temp_high = self._parse_temp_range(question)
+
+        if temp_low is None and temp_high is None:
+            return None
+
+        # Get token IDs
+        tokens = market.get("tokens", [])
+        clob_token_ids = market.get("clobTokenIds", [])
+
+        # Try to get Yes/No token IDs
+        yes_token_id = ""
+        no_token_id = ""
+
+        if clob_token_ids and len(clob_token_ids) >= 2:
+            yes_token_id = clob_token_ids[0]
+            no_token_id = clob_token_ids[1]
+        elif tokens:
+            for t in tokens:
+                if t.get("outcome") == "Yes":
+                    yes_token_id = t.get("token_id", "")
+                elif t.get("outcome") == "No":
+                    no_token_id = t.get("token_id", "")
+
+        # Get price (probability)
+        yes_price = float(market.get("outcomePrices", "0.5").split(",")[0] if isinstance(market.get("outcomePrices"), str) else market.get("outcomePrices", [0.5])[0] if isinstance(market.get("outcomePrices"), list) else 0.5)
+
+        # Also try direct price field
+        if yes_price == 0.5:
+            yes_price = float(market.get("bestAsk", market.get("lastTradePrice", 0.5)))
+
+        return TemperatureOutcome(
+            outcome_id=str(market.get("id", "")),
+            condition_id=market.get("conditionId", ""),
+            description=question,
+            temp_low=temp_low,
+            temp_high=temp_high,
+            yes_token_id=yes_token_id,
+            no_token_id=no_token_id,
+            yes_price=yes_price,
+            volume=float(market.get("volume", 0)),
+            liquidity=float(market.get("liquidity", 0)),
+        )
+
+    def _parse_temp_range(self, text: str) -> tuple[Optional[float], Optional[float]]:
         """
-        Get current orderbook prices for a market.
+        Parse temperature range from text.
+
+        Examples:
+            "20-21°F" -> (20, 21)
+            "≤15°F" or "15°F or below" -> (None, 15)
+            "≥26°F" or "26°F or higher" -> (26, None)
+        """
+        # Handle "X or below" / "X or lower"
+        below_match = re.search(r"(\d+)\s*°?[FC]?\s+or\s+(?:below|lower)", text, re.IGNORECASE)
+        if below_match:
+            return (None, float(below_match.group(1)))
+
+        # Handle "X or above" / "X or higher"
+        above_match = re.search(r"(\d+)\s*°?[FC]?\s+or\s+(?:above|higher)", text, re.IGNORECASE)
+        if above_match:
+            return (float(above_match.group(1)), None)
+
+        # Handle "≤X" or "<=X"
+        lte_match = re.search(r"[≤<]=?\s*(\d+)", text)
+        if lte_match:
+            return (None, float(lte_match.group(1)))
+
+        # Handle "≥X" or ">=X"
+        gte_match = re.search(r"[≥>]=?\s*(\d+)", text)
+        if gte_match:
+            return (float(gte_match.group(1)), None)
+
+        # Handle "X-Y" range
+        range_match = re.search(r"(\d+)\s*-\s*(\d+)", text)
+        if range_match:
+            return (float(range_match.group(1)), float(range_match.group(2)))
+
+        # Handle single temperature (rare)
+        single_match = re.search(r"(\d+)\s*°?[FC]", text)
+        if single_match:
+            temp = float(single_match.group(1))
+            return (temp, temp)
+
+        return (None, None)
+
+    def _extract_date_from_slug(self, slug: str) -> Optional[date]:
+        """Extract the target date from a market slug."""
+        # Pattern: highest-temperature-in-city-on-month-day
+        match = re.search(r"on-(\w+)-(\d+)$", slug)
+        if not match:
+            return None
+
+        month_name = match.group(1)
+        day = int(match.group(2))
+
+        # Map month name to number
+        months = {
+            "january": 1, "february": 2, "march": 3, "april": 4,
+            "may": 5, "june": 6, "july": 7, "august": 8,
+            "september": 9, "october": 10, "november": 11, "december": 12
+        }
+
+        month = months.get(month_name.lower())
+        if not month:
+            return None
+
+        # Assume current year, but handle year boundary
+        year = date.today().year
+        try:
+            target = date(year, month, day)
+            # If date is more than 6 months in the past, assume next year
+            if (date.today() - target).days > 180:
+                target = date(year + 1, month, day)
+            return target
+        except ValueError:
+            return None
+
+    async def get_orderbook(self, token_id: str) -> dict:
+        """
+        Get the orderbook for a specific token.
 
         Args:
-            market: WeatherMarket to get prices for
+            token_id: The CLOB token ID
 
         Returns:
-            Dictionary with bid/ask prices and depth
+            Orderbook with bids, asks, best prices
         """
         clob_url = config.api.polymarket_clob_url
         endpoint = f"{clob_url}/book"
 
-        params = {"token_id": market.yes_token_id}
-
         try:
-            response = await self.client.get(endpoint, params=params)
+            response = await self.client.get(endpoint, params={"token_id": token_id})
             response.raise_for_status()
             data = response.json()
 
@@ -236,160 +447,16 @@ class WeatherMarketFinder:
                 "best_ask": best_ask,
                 "mid_price": (best_bid + best_ask) / 2,
                 "spread": best_ask - best_bid,
-                "bid_depth": sum(float(b["size"]) for b in bids[:5]),
-                "ask_depth": sum(float(a["size"]) for a in asks[:5]),
+                "bid_depth": sum(float(b.get("size", 0)) for b in bids[:5]),
+                "ask_depth": sum(float(a.get("size", 0)) for a in asks[:5]),
             }
         except Exception as e:
-            print(f"Error fetching orderbook: {e}")
             return {
-                "best_bid": market.yes_price * 0.98,
-                "best_ask": market.yes_price * 1.02,
-                "mid_price": market.yes_price,
-                "spread": 0.04,
+                "best_bid": 0,
+                "best_ask": 1,
+                "mid_price": 0.5,
+                "spread": 1.0,
                 "bid_depth": 0,
                 "ask_depth": 0,
+                "error": str(e),
             }
-
-    def _parse_market(self, data: dict) -> Optional[WeatherMarket]:
-        """
-        Parse market data into a WeatherMarket object.
-
-        Returns None if the market is not a temperature market.
-        """
-        question = data.get("question", "")
-
-        # Check if this is a temperature market
-        if not self._is_temperature_market(question):
-            return None
-
-        # Extract city
-        city = self._extract_city(question)
-        if not city:
-            return None
-
-        city_config = CITY_CONFIGS.get(city)
-
-        # Extract threshold temperature
-        threshold = self._extract_threshold(question)
-        if threshold is None:
-            return None
-
-        # Extract target date
-        target_date = self._extract_date(question, data)
-        if target_date is None:
-            return None
-
-        # Determine market type
-        market_type = self._extract_market_type(question)
-
-        # Extract token IDs
-        tokens = data.get("tokens", [])
-        yes_token = next((t for t in tokens if t.get("outcome") == "Yes"), None)
-        no_token = next((t for t in tokens if t.get("outcome") == "No"), None)
-
-        if not yes_token or not no_token:
-            return None
-
-        # Parse end date
-        end_date_str = data.get("endDate") or data.get("end_date_iso")
-        try:
-            if end_date_str:
-                end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
-            else:
-                end_date = datetime.now()
-        except ValueError:
-            end_date = datetime.now()
-
-        return WeatherMarket(
-            condition_id=data.get("conditionId", data.get("condition_id", "")),
-            question_id=data.get("questionId", data.get("question_id", "")),
-            market_slug=data.get("slug", ""),
-            city=city,
-            city_config=city_config,
-            target_date=target_date,
-            threshold=threshold,
-            market_type=market_type,
-            yes_token_id=yes_token.get("token_id", ""),
-            no_token_id=no_token.get("token_id", ""),
-            yes_price=float(yes_token.get("price", 0.5)),
-            no_price=float(no_token.get("price", 0.5)),
-            volume=float(data.get("volume", 0)),
-            liquidity=float(data.get("liquidity", 0)),
-            is_active=data.get("active", True) and not data.get("closed", False),
-            end_date=end_date,
-            question=question,
-        )
-
-    def _is_temperature_market(self, question: str) -> bool:
-        """Check if question is about temperature."""
-        temp_keywords = [
-            "temperature", "degrees", "°F", "°C",
-            "high temp", "low temp", "thermometer"
-        ]
-        question_lower = question.lower()
-        return any(kw in question_lower for kw in temp_keywords)
-
-    def _extract_city(self, question: str) -> Optional[str]:
-        """Extract city from question text."""
-        for city_key, pattern in self.city_patterns.items():
-            if re.search(pattern, question, re.IGNORECASE):
-                return city_key
-        return None
-
-    def _extract_threshold(self, question: str) -> Optional[float]:
-        """Extract temperature threshold from question."""
-        match = self.temp_pattern.search(question)
-        if match:
-            try:
-                return float(match.group(1))
-            except ValueError:
-                pass
-
-        # Try to find any number followed by degree indicators
-        number_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:°|degrees?|F)", question)
-        if number_match:
-            try:
-                return float(number_match.group(1))
-            except ValueError:
-                pass
-
-        return None
-
-    def _extract_date(self, question: str, data: dict) -> Optional[date]:
-        """Extract target date from question or market data."""
-        # Try to find date in question
-        match = self.date_pattern.search(question)
-        if match:
-            date_str = match.group(1)
-            # Try various date formats
-            for fmt in ["%B %d, %Y", "%B %d %Y", "%b %d, %Y", "%b %d %Y", "%m/%d/%Y", "%m/%d/%y"]:
-                try:
-                    return datetime.strptime(date_str, fmt).date()
-                except ValueError:
-                    continue
-
-        # Fall back to market end date
-        end_date_str = data.get("endDate") or data.get("end_date_iso")
-        if end_date_str:
-            try:
-                return datetime.fromisoformat(end_date_str.replace("Z", "+00:00")).date()
-            except ValueError:
-                pass
-
-        return None
-
-    def _extract_market_type(self, question: str) -> MarketType:
-        """Determine market type from question."""
-        question_lower = question.lower()
-
-        is_high = "high" in question_lower or "maximum" in question_lower
-        is_low = "low" in question_lower or "minimum" in question_lower
-        is_over = any(w in question_lower for w in ["over", "above", "exceed", "more than"])
-
-        if is_high:
-            return MarketType.HIGH_OVER if is_over else MarketType.HIGH_UNDER
-        elif is_low:
-            return MarketType.LOW_OVER if is_over else MarketType.LOW_UNDER
-        else:
-            # Default to high temp over
-            return MarketType.HIGH_OVER if is_over else MarketType.HIGH_UNDER

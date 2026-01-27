@@ -16,60 +16,78 @@ load_dotenv()
 class CityConfig:
     """Configuration for a tradeable city."""
     name: str
-    nws_station_id: str  # ICAO code for NWS/METAR station
+    station_id: str  # ICAO code for Weather Underground station
     station_name: str
     latitude: float
     longitude: float
     timezone: str
     country: str  # For API routing (US cities use NWS, international use different sources)
+    temp_unit: str = "F"  # F for Fahrenheit, C for Celsius
+    polymarket_slug: str = ""  # City name as used in Polymarket slugs
+
+    @property
+    def nws_station_id(self) -> str:
+        """Backward compatibility alias for station_id."""
+        return self.station_id
 
 
-# NWS Station Mappings - Critical for settlement accuracy
+# Weather Underground Station Mappings - Critical for settlement accuracy
+# Polymarket uses Weather Underground data for resolution
 CITY_CONFIGS: dict[str, CityConfig] = {
     "nyc": CityConfig(
         name="New York City",
-        nws_station_id="KNYC",
-        station_name="Central Park",
-        latitude=40.7789,
-        longitude=-73.9692,
+        station_id="KLGA",
+        station_name="LaGuardia Airport",
+        latitude=40.7769,
+        longitude=-73.8740,
         timezone="America/New_York",
-        country="US"
+        country="US",
+        temp_unit="F",
+        polymarket_slug="nyc"
     ),
     "atlanta": CityConfig(
         name="Atlanta",
-        nws_station_id="KATL",
+        station_id="KATL",
         station_name="Hartsfield-Jackson Airport",
         latitude=33.6407,
         longitude=-84.4277,
         timezone="America/New_York",
-        country="US"
+        country="US",
+        temp_unit="F",
+        polymarket_slug="atlanta"
     ),
     "seattle": CityConfig(
         name="Seattle",
-        nws_station_id="KSEA",
+        station_id="KSEA",
         station_name="Seattle-Tacoma Airport",
         latitude=47.4502,
         longitude=-122.3088,
         timezone="America/Los_Angeles",
-        country="US"
+        country="US",
+        temp_unit="F",
+        polymarket_slug="seattle"
     ),
     "toronto": CityConfig(
         name="Toronto",
-        nws_station_id="CYYZ",
+        station_id="CYYZ",
         station_name="Pearson International Airport",
         latitude=43.6777,
         longitude=-79.6248,
         timezone="America/Toronto",
-        country="CA"
+        country="CA",
+        temp_unit="C",
+        polymarket_slug="toronto"
     ),
     "london": CityConfig(
         name="London",
-        nws_station_id="EGLL",
-        station_name="Heathrow Airport",
-        latitude=51.4700,
-        longitude=-0.4543,
+        station_id="EGLC",
+        station_name="London City Airport",
+        latitude=51.5048,
+        longitude=0.0495,
         timezone="Europe/London",
-        country="UK"
+        country="UK",
+        temp_unit="C",
+        polymarket_slug="london"
     ),
 }
 

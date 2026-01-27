@@ -136,31 +136,63 @@ def generate_demo_markets(forecasts):
     target_date = date.today() + timedelta(days=1)
 
     for city_key, fc in forecasts.items():
-        # Create a realistic threshold near the forecast
-        threshold = round(fc["high_mean"] / 5) * 5  # Round to nearest 5
+        city_config = get_city_config(city_key)
+        forecast_high = fc["high_mean"]
+        forecast_std = max(fc["high_std"], 2.0)
 
-        # Calculate what the "fair" price would be
-        fair_prob = 1 - stats.norm.cdf(threshold, loc=fc["high_mean"], scale=max(fc["high_std"], 2.0))
+        # Create temperature ranges around the forecast
+        base_temp = round(forecast_high / 2) * 2  # Round to nearest 2
+        ranges = [
+            (None, base_temp - 4),           # "≤X" (low end)
+            (base_temp - 4, base_temp - 2),  # Range below
+            (base_temp - 2, base_temp),      # Range around
+            (base_temp, base_temp + 2),      # Range around
+            (base_temp + 2, base_temp + 4),  # Range above
+            (base_temp + 4, None),           # "≥X" (high end)
+        ]
 
-        # Add some market inefficiency (random noise) for demo
-        market_noise = random.uniform(-0.15, 0.15)
-        market_prob = max(0.05, min(0.95, fair_prob + market_noise))
+        for temp_low, temp_high in ranges:
+            # Calculate fair probability for this range
+            if temp_low is None:
+                fair_prob = stats.norm.cdf(temp_high, loc=forecast_high, scale=forecast_std)
+                outcome_desc = f"{temp_high}°F or below"
+            elif temp_high is None:
+                fair_prob = 1 - stats.norm.cdf(temp_low, loc=forecast_high, scale=forecast_std)
+                outcome_desc = f"{temp_low}°F or higher"
+            else:
+                prob_high = stats.norm.cdf(temp_high, loc=forecast_high, scale=forecast_std)
+                prob_low = stats.norm.cdf(temp_low, loc=forecast_high, scale=forecast_std)
+                fair_prob = prob_high - prob_low
+                outcome_desc = f"{temp_low}-{temp_high}°F"
 
-        markets.append({
-            "city": city_key,
-            "question": f"Will {fc['city']} high temperature be over {threshold}°F on {target_date}?",
-            "threshold": threshold,
-            "yes_price": market_prob,
-            "no_price": 1 - market_prob,
-            "volume": random.randint(5000, 50000),
-            "target_date": target_date,
-            "market_type": "high_over",
-            "condition_id": f"demo_{city_key}_{threshold}",
-            "is_demo": True,
-        })
+            # Add market inefficiency
+            market_noise = random.uniform(-0.10, 0.10)
+            market_prob = max(0.01, min(0.99, fair_prob + market_noise))
 
-        # Record demo price for history
-        record_price(f"demo_{city_key}_{threshold}", market_prob)
+            condition_id = f"demo_{city_key}_{temp_low}_{temp_high}"
+
+            markets.append({
+                "city": city_key,
+                "city_name": fc["city"],
+                "question": f"Highest temperature in {fc['city']} on {target_date}?",
+                "outcome_desc": outcome_desc,
+                "temp_low": temp_low,
+                "temp_high": temp_high,
+                "temp_midpoint": (temp_low if temp_low else temp_high - 1) if temp_high is None else
+                                 (temp_high if temp_high else temp_low + 1) if temp_low is None else
+                                 (temp_low + temp_high) / 2,
+                "yes_price": market_prob,
+                "no_price": 1 - market_prob,
+                "volume": random.randint(1000, 20000),
+                "liquidity": random.randint(100, 2000),
+                "target_date": target_date,
+                "temp_unit": city_config.temp_unit,
+                "condition_id": condition_id,
+                "resolution_source": f"Demo - {city_config.station_name}",
+                "is_demo": True,
+            })
+
+            record_price(condition_id, market_prob)
 
     return markets
 
@@ -260,23 +292,35 @@ async def _fetch_real_markets():
 
     async with WeatherMarketFinder() as finder:
         try:
-            found = await finder.find_weather_markets(active_only=True)
-            for m in found:
-                markets.append({
-                    "city": m.city,
-                    "question": m.question,
-                    "threshold": m.threshold,
-                    "yes_price": m.yes_price,
-                    "no_price": m.no_price,
-                    "volume": m.volume,
-                    "target_date": m.target_date,
-                    "market_type": m.market_type.value,
-                    "condition_id": m.condition_id,
-                    "is_demo": False,
-                })
-                record_price(m.condition_id, m.yes_price)
-        except:
-            pass
+            found = await finder.find_weather_markets(active_only=True, days_ahead=3)
+            for market in found:
+                # Each market has multiple temperature outcomes
+                for outcome in market.outcomes:
+                    markets.append({
+                        "city": market.city,
+                        "city_name": market.city_config.name if market.city_config else market.city,
+                        "question": market.question,
+                        "outcome_desc": outcome.description,
+                        "temp_low": outcome.temp_low,
+                        "temp_high": outcome.temp_high,
+                        "temp_midpoint": outcome.midpoint,
+                        "yes_price": outcome.yes_price,
+                        "no_price": 1 - outcome.yes_price,
+                        "volume": outcome.volume,
+                        "liquidity": outcome.liquidity,
+                        "target_date": market.target_date,
+                        "temp_unit": market.temp_unit,
+                        "condition_id": outcome.condition_id,
+                        "outcome_id": outcome.outcome_id,
+                        "yes_token_id": outcome.yes_token_id,
+                        "resolution_source": market.resolution_source,
+                        "is_demo": False,
+                        "event_slug": market.event_slug,
+                        "total_market_volume": market.total_volume,
+                    })
+                    record_price(outcome.condition_id, outcome.yes_price)
+        except Exception as e:
+            add_alert(f"Error fetching markets: {str(e)}", "warning")
 
     return markets
 
@@ -345,65 +389,131 @@ async def _fetch_forecasts_with_models():
 
 
 def calculate_signals(forecasts, markets):
-    """Calculate trading signals."""
+    """Calculate trading signals for multi-outcome markets."""
     signals = []
+    seen_markets = set()  # Track which city/date combos we've processed
 
+    # Group markets by city and date
+    market_groups = {}
     for market in markets:
         city_key = market["city"].lower()
+        target_date = market.get("target_date", date.today())
+        group_key = f"{city_key}_{target_date}"
+        if group_key not in market_groups:
+            market_groups[group_key] = []
+        market_groups[group_key].append(market)
+
+    for group_key, group_markets in market_groups.items():
+        if not group_markets:
+            continue
+
+        city_key = group_markets[0]["city"].lower()
         if city_key not in forecasts:
             continue
 
         fc = forecasts[city_key]
-        threshold = market["threshold"]
-        market_prob = market["yes_price"]
+        forecast_temp = fc["high_mean"]
+        forecast_std = max(fc["high_std"], 2.0)
+        temp_unit = group_markets[0].get("temp_unit", "F")
+        city_config = get_city_config(city_key)
 
-        our_prob = 1 - stats.norm.cdf(threshold, loc=fc["high_mean"], scale=max(fc["high_std"], 2.0))
-        edge = our_prob - market_prob
-
-        if edge > 0.10:
-            signal = "STRONG BUY YES"
-            signal_color = "#00c853"
-        elif edge > 0.05:
-            signal = "BUY YES"
-            signal_color = "#4caf50"
-        elif edge < -0.10:
-            signal = "STRONG BUY NO"
-            signal_color = "#f44336"
-        elif edge < -0.05:
-            signal = "BUY NO"
-            signal_color = "#ff5722"
+        # Convert forecast to Celsius if needed
+        if temp_unit == "C" and city_config.temp_unit == "C":
+            # Forecast is in F, market is in C - convert forecast
+            forecast_temp_market = (forecast_temp - 32) * 5/9
+            forecast_std_market = forecast_std * 5/9
         else:
-            signal = "PASS"
-            signal_color = "#9e9e9e"
+            forecast_temp_market = forecast_temp
+            forecast_std_market = forecast_std
 
-        signals.append({
-            "city": fc["city"],
-            "city_key": city_key,
-            "threshold": threshold,
-            "our_prob": our_prob,
-            "market_prob": market_prob,
-            "edge": edge,
-            "confidence": fc["confidence"],
-            "forecast_high": fc["high_mean"],
-            "forecast_std": fc["high_std"],
-            "signal": signal,
-            "signal_color": signal_color,
-            "signal_strength": abs(edge),
-            "condition_id": market["condition_id"],
-            "is_demo": market.get("is_demo", False),
-        })
+        # Find the best opportunity across all outcomes
+        best_signal = None
+        best_edge = 0
 
-        if abs(edge) > 0.10 and fc["confidence"] > 0.7:
-            add_alert(f"🎯 Strong signal: {fc['city']} - {signal} ({edge:+.1%} edge)", "success")
+        for market in group_markets:
+            temp_low = market.get("temp_low")
+            temp_high = market.get("temp_high")
+            market_prob = market["yes_price"]
+
+            # Calculate our probability for this outcome
+            if temp_low is None and temp_high is not None:
+                # "≤X" outcome: P(temp <= X)
+                our_prob = stats.norm.cdf(temp_high, loc=forecast_temp_market, scale=forecast_std_market)
+            elif temp_high is None and temp_low is not None:
+                # "≥X" outcome: P(temp >= X)
+                our_prob = 1 - stats.norm.cdf(temp_low, loc=forecast_temp_market, scale=forecast_std_market)
+            elif temp_low is not None and temp_high is not None:
+                # "X-Y" range: P(X <= temp <= Y)
+                prob_high = stats.norm.cdf(temp_high, loc=forecast_temp_market, scale=forecast_std_market)
+                prob_low = stats.norm.cdf(temp_low, loc=forecast_temp_market, scale=forecast_std_market)
+                our_prob = prob_high - prob_low
+            else:
+                continue
+
+            edge = our_prob - market_prob
+
+            # Keep track of best opportunity
+            if abs(edge) > abs(best_edge):
+                best_edge = edge
+                best_signal = {
+                    "city": fc["city"],
+                    "city_key": city_key,
+                    "outcome": market.get("outcome_desc", f"{temp_low}-{temp_high}"),
+                    "temp_low": temp_low,
+                    "temp_high": temp_high,
+                    "temp_unit": temp_unit,
+                    "our_prob": our_prob,
+                    "market_prob": market_prob,
+                    "edge": edge,
+                    "confidence": fc["confidence"],
+                    "forecast_high": forecast_temp,
+                    "forecast_std": fc["high_std"],
+                    "condition_id": market["condition_id"],
+                    "yes_token_id": market.get("yes_token_id", ""),
+                    "is_demo": market.get("is_demo", False),
+                    "target_date": market.get("target_date"),
+                    "resolution_source": market.get("resolution_source", ""),
+                    "volume": market.get("volume", 0),
+                }
+
+        if best_signal:
+            # Determine signal type
+            edge = best_signal["edge"]
+            if edge > 0.10:
+                signal = "STRONG BUY YES"
+                signal_color = "#00c853"
+            elif edge > 0.05:
+                signal = "BUY YES"
+                signal_color = "#4caf50"
+            elif edge < -0.10:
+                signal = "STRONG BUY NO"
+                signal_color = "#f44336"
+            elif edge < -0.05:
+                signal = "BUY NO"
+                signal_color = "#ff5722"
+            else:
+                signal = "PASS"
+                signal_color = "#9e9e9e"
+
+            best_signal["signal"] = signal
+            best_signal["signal_color"] = signal_color
+            best_signal["signal_strength"] = abs(edge)
+
+            signals.append(best_signal)
+
+            if abs(edge) > 0.10 and best_signal["confidence"] > 0.7:
+                add_alert(f"🎯 Strong signal: {best_signal['city']} {best_signal['outcome']} - {signal} ({edge:+.1%} edge)", "success")
 
     return signals
 
 
 def execute_trade(signal, size, is_live=False):
     """Execute a trade (simulated or real)."""
+    outcome = signal.get("outcome", "")
     trade = {
         "time": datetime.now(),
         "city": signal["city"],
+        "outcome": outcome,
         "side": "YES" if signal["edge"] > 0 else "NO",
         "size": size,
         "price": signal["market_prob"] if signal["edge"] > 0 else (1 - signal["market_prob"]),
@@ -412,13 +522,15 @@ def execute_trade(signal, size, is_live=False):
         "market_prob": signal["market_prob"],
         "status": "SIMULATED" if not is_live else "LIVE",
         "is_demo": signal.get("is_demo", False),
+        "condition_id": signal.get("condition_id", ""),
+        "target_date": signal.get("target_date"),
         "pnl": 0,
     }
     st.session_state.trade_history.insert(0, trade)
     st.session_state.total_trades += 1
 
     mode = "LIVE" if is_live else "SIMULATED"
-    add_alert(f"📈 [{mode}] Trade: {signal['city']} {trade['side']} ${size:.2f} @ {trade['price']:.2f}",
+    add_alert(f"📈 [{mode}] Trade: {signal['city']} {outcome} {trade['side']} ${size:.2f} @ {trade['price']:.2f}",
               "success" if is_live else "info")
     return trade
 
@@ -662,23 +774,26 @@ def main():
 
             for _, row in df_signals.iterrows():
                 with st.container():
-                    cols = st.columns([2, 1, 1, 1, 1, 1, 2])
+                    cols = st.columns([2, 1.5, 1, 1, 1, 1, 2])
 
                     city_label = f"**{row['city']}**"
                     if row.get('is_demo'):
                         city_label += " 🎮"
                     cols[0].markdown(city_label)
-                    cols[1].markdown(f"Threshold: {row['threshold']:.0f}°F")
-                    cols[2].markdown(f"Forecast: {row['forecast_high']:.1f}°F")
+                    temp_unit = row.get('temp_unit', 'F')
+                    outcome = row.get('outcome', f"{row.get('temp_low', '?')}-{row.get('temp_high', '?')}")
+                    cols[1].markdown(f"Range: {outcome}")
+                    cols[2].markdown(f"Fcst: {row['forecast_high']:.1f}°F")
                     cols[3].markdown(f"Our: {row['our_prob']:.0%}")
-                    cols[4].markdown(f"Market: {row['market_prob']:.0%}")
+                    cols[4].markdown(f"Mkt: {row['market_prob']:.0%}")
 
                     edge_color = "green" if row['edge'] > 0 else "red"
                     cols[5].markdown(f"Edge: **:{edge_color}[{row['edge']:+.1%}]**")
 
                     if row['signal'] != "PASS":
                         button_label = f"{'🤖 ' if auto_trade else ''}{row['signal']}"
-                        if cols[6].button(button_label, key=f"trade_{row['city']}_{row['threshold']}"):
+                        button_key = f"trade_{row['city']}_{row.get('condition_id', '')}"
+                        if cols[6].button(button_label, key=button_key):
                             kelly = max(0, abs(row['edge']) / (1 - row['market_prob'])) if row['market_prob'] < 1 else 0
                             position = min(bankroll * kelly * kelly_fraction, bankroll * max_position / 100)
                             if position > 1:
@@ -781,34 +896,88 @@ def main():
 
         if use_demo:
             st.info("🎮 **Demo Markets** - These are simulated markets based on real forecasts. Disable 'Demo Mode' in sidebar to search for real Polymarket markets.")
+        else:
+            st.info("🔍 **Live Markets** - Fetching from Polymarket API. Markets are grouped by city/date.")
 
         if markets:
-            st.success(f"Found {len(markets)} {'demo' if use_demo else 'active'} markets")
-
+            # Group markets by city and date for display
+            market_groups = {}
             for market in markets:
-                with st.expander(f"**{market['city'].upper()}** - Over {market['threshold']}°F {'🎮' if market.get('is_demo') else ''}", expanded=True):
-                    col1, col2, col3, col4 = st.columns(4)
+                city = market.get("city_name", market["city"])
+                target_date = market.get("target_date", date.today())
+                group_key = f"{city} - {target_date}"
+                if group_key not in market_groups:
+                    market_groups[group_key] = {
+                        "city_key": market["city"],
+                        "city_name": city,
+                        "target_date": target_date,
+                        "question": market.get("question", ""),
+                        "resolution_source": market.get("resolution_source", ""),
+                        "is_demo": market.get("is_demo", False),
+                        "outcomes": []
+                    }
+                market_groups[group_key]["outcomes"].append(market)
 
-                    with col1:
-                        st.metric("YES Price", f"${market['yes_price']:.2f}")
-                    with col2:
-                        st.metric("NO Price", f"${market['no_price']:.2f}")
-                    with col3:
-                        st.metric("Volume", f"${market['volume']:,.0f}")
-                    with col4:
-                        city_key = market["city"].lower()
-                        if city_key in forecasts:
-                            our_prob = 1 - stats.norm.cdf(market["threshold"],
-                                                          loc=forecasts[city_key]["high_mean"],
-                                                          scale=max(forecasts[city_key]["high_std"], 2))
-                            edge = our_prob - market["yes_price"]
-                            st.metric("Our Edge", f"{edge:+.1%}", delta=f"We say {our_prob:.0%}")
+            st.success(f"Found {len(market_groups)} markets with {len(markets)} total outcomes")
 
-                    st.markdown(f"**Question:** {market['question']}")
-                    st.markdown(f"**Target Date:** {market['target_date']} | **Type:** {market['market_type']}")
+            for group_key, group in market_groups.items():
+                demo_badge = " 🎮" if group["is_demo"] else ""
+                with st.expander(f"**{group_key}**{demo_badge}", expanded=True):
+                    st.markdown(f"**Question:** {group['question']}")
+                    st.markdown(f"**Resolution:** {group['resolution_source']}")
+                    st.markdown("---")
+
+                    # Show all outcomes as a table
+                    outcome_data = []
+                    city_key = group["city_key"].lower()
+                    fc = forecasts.get(city_key, {})
+
+                    for o in sorted(group["outcomes"], key=lambda x: x.get("temp_midpoint", 0)):
+                        outcome_desc = o.get("outcome_desc", "")
+                        yes_price = o.get("yes_price", 0)
+                        volume = o.get("volume", 0)
+
+                        # Calculate our probability
+                        our_prob = None
+                        if fc:
+                            temp_low = o.get("temp_low")
+                            temp_high = o.get("temp_high")
+                            forecast_high = fc.get("high_mean", 70)
+                            forecast_std = max(fc.get("high_std", 3), 2)
+
+                            # Convert if needed (F to C for Toronto/London)
+                            temp_unit = o.get("temp_unit", "F")
+                            if temp_unit == "C":
+                                forecast_high = (forecast_high - 32) * 5/9
+                                forecast_std = forecast_std * 5/9
+
+                            if temp_low is None and temp_high is not None:
+                                our_prob = stats.norm.cdf(temp_high, loc=forecast_high, scale=forecast_std)
+                            elif temp_high is None and temp_low is not None:
+                                our_prob = 1 - stats.norm.cdf(temp_low, loc=forecast_high, scale=forecast_std)
+                            elif temp_low is not None and temp_high is not None:
+                                our_prob = stats.norm.cdf(temp_high, loc=forecast_high, scale=forecast_std) - \
+                                          stats.norm.cdf(temp_low, loc=forecast_high, scale=forecast_std)
+
+                        edge = (our_prob - yes_price) if our_prob else None
+
+                        outcome_data.append({
+                            "Outcome": outcome_desc,
+                            "Market": f"{yes_price:.1%}",
+                            "Ours": f"{our_prob:.1%}" if our_prob else "N/A",
+                            "Edge": f"{edge:+.1%}" if edge else "N/A",
+                            "Volume": f"${volume:,.0f}"
+                        })
+
+                    df_outcomes = pd.DataFrame(outcome_data)
+                    st.dataframe(df_outcomes, use_container_width=True, hide_index=True)
+
+                    # Show forecast context
+                    if fc:
+                        st.caption(f"📊 Our forecast: {fc.get('high_mean', 0):.1f}°F (±{fc.get('high_std', 0):.1f}°F)")
         else:
             st.warning("No markets found")
-            st.info("Enable Demo Mode in the sidebar to test with simulated markets.")
+            st.info("Enable Demo Mode in the sidebar to test with simulated markets, or check if Polymarket has active weather markets.")
 
     # =====================
     # TAB 4: Model Comparison
