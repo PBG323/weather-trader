@@ -48,7 +48,7 @@ class TradingConfig:
 
     # Minimum edge to continue holding (below this, consider exit)
     min_edge_to_hold: float = field(
-        default_factory=lambda: float(os.getenv("MIN_EDGE_TO_HOLD", "0.02"))
+        default_factory=lambda: float(os.getenv("MIN_EDGE_TO_HOLD", "0.05"))
     )
 
     # Number of price points to track for edge trend
