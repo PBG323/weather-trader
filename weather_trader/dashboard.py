@@ -459,9 +459,8 @@ async def _fetch_forecasts_with_models():
                     model_forecasts = []
                     model_details = []
 
-                    # Add Open-Meteo models
+                    # Add Open-Meteo models (exact date match only)
                     for model_name, forecast_list in om_forecasts.items():
-                        matched = False
                         for f in forecast_list:
                             if f.timestamp.date() == target_date:
                                 if f.temperature_high is not None and f.temperature_low is not None:
@@ -475,25 +474,14 @@ async def _fetch_forecasts_with_models():
                                         "high": f.temperature_high,
                                         "low": f.temperature_low
                                     })
-                                    matched = True
+                                else:
+                                    print(f"{city_key}/{model_name}: date matched but temps are None")
                                 break
-                        if not matched and forecast_list:
-                            # Fallback: use closest available date
-                            closest = min(forecast_list,
-                                         key=lambda f: abs((f.timestamp.date() - target_date).days))
-                            if closest.temperature_high is not None and closest.temperature_low is not None:
-                                model_forecasts.append(ModelForecast(
-                                    model_name=model_name,
-                                    forecast_high=closest.temperature_high,
-                                    forecast_low=closest.temperature_low,
-                                ))
-                                model_details.append({
-                                    "model": model_name,
-                                    "high": closest.temperature_high,
-                                    "low": closest.temperature_low
-                                })
-                                print(f"{city_key}/{model_name}: no exact date match for {target_date}, "
-                                      f"used {closest.timestamp.date()}")
+                        else:
+                            # No date match found - log available dates for debugging
+                            available = [f.timestamp.date().isoformat() for f in forecast_list]
+                            print(f"{city_key}/{model_name}: no match for {target_date}, "
+                                  f"available dates: {available}")
 
                     # Fallback: if ensemble returned nothing, try basic forecast endpoint
                     if not model_forecasts:
