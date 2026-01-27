@@ -847,29 +847,79 @@ def main():
         if signals:
             st.subheader("🎯 Trading Signals")
 
+            # Explanation of columns
+            with st.expander("📖 How to Read Trading Signals", expanded=False):
+                st.markdown("""
+                | Column | What It Means | How It's Calculated |
+                |--------|---------------|---------------------|
+                | **City** | The city/market being analyzed | From Polymarket market data |
+                | **Outcome** | Temperature range we're betting on | The specific bucket (e.g., "20-21°F") |
+                | **Forecast** | Our predicted high temperature | Ensemble average from ECMWF, GFS, etc. |
+                | **Our Prob** | Our probability this outcome wins | `P(temp falls in this range)` using normal distribution |
+                | **Market** | Polymarket's implied probability | Current YES price (e.g., $0.42 = 42%) |
+                | **Edge** | Our advantage over the market | `Our Prob - Market Prob` |
+                | **Action** | Trade recommendation | Based on edge size and confidence |
+
+                ### Edge Interpretation:
+                - **+10% or more**: STRONG BUY YES (market significantly undervalues)
+                - **+5% to +10%**: BUY YES (market undervalues)
+                - **-5% to +5%**: PASS (no meaningful edge)
+                - **-5% to -10%**: BUY NO (market overvalues YES)
+                - **-10% or less**: STRONG BUY NO (market significantly overvalues)
+
+                ### Example:
+                - Forecast: 21°F for NYC tomorrow
+                - Outcome: "20-21°F" range
+                - Our Prob: 35% (our model says 35% chance temp is 20-21°F)
+                - Market: 25% (Polymarket prices YES at $0.25)
+                - Edge: +10% (we think it's worth 35¢, market sells for 25¢)
+                - Action: BUY YES at $0.25, expecting to win 35% of the time
+                """)
+
             df_signals = pd.DataFrame(signals)
             df_signals = df_signals.sort_values("signal_strength", ascending=False)
 
+            # Column headers
+            header_cols = st.columns([2, 1.5, 1.2, 1, 1, 1, 2])
+            header_cols[0].markdown("**City**")
+            header_cols[1].markdown("**Outcome**")
+            header_cols[2].markdown("**Forecast**")
+            header_cols[3].markdown("**Our Prob**")
+            header_cols[4].markdown("**Market**")
+            header_cols[5].markdown("**Edge**")
+            header_cols[6].markdown("**Action**")
+            st.divider()
+
             for _, row in df_signals.iterrows():
                 with st.container():
-                    cols = st.columns([2, 1.5, 1, 1, 1, 1, 2])
+                    cols = st.columns([2, 1.5, 1.2, 1, 1, 1, 2])
 
+                    # City
                     city_label = f"**{row['city']}**"
                     if row.get('is_demo'):
                         city_label += " 🎮"
                     cols[0].markdown(city_label)
-                    temp_unit = row.get('temp_unit', 'F')
+
+                    # Outcome (temperature range)
                     outcome = row.get('outcome', f"{row.get('temp_low', '?')}-{row.get('temp_high', '?')}")
-                    cols[1].markdown(f"Range: {outcome}")
+                    cols[1].markdown(outcome)
+
+                    # Forecast (our predicted temp in market's unit)
                     unit = row.get('temp_unit', 'F')
                     fcst = row.get('forecast_high_market', row.get('forecast_high_f', 0))
-                    cols[2].markdown(f"Fcst: {fcst:.1f}°{unit}")
-                    cols[3].markdown(f"Our: {row['our_prob']:.0%}")
-                    cols[4].markdown(f"Mkt: {row['market_prob']:.0%}")
+                    cols[2].markdown(f"{fcst:.1f}°{unit}")
 
+                    # Our Probability
+                    cols[3].markdown(f"{row['our_prob']:.0%}")
+
+                    # Market Probability
+                    cols[4].markdown(f"{row['market_prob']:.0%}")
+
+                    # Edge (with color)
                     edge_color = "green" if row['edge'] > 0 else "red"
-                    cols[5].markdown(f"Edge: **:{edge_color}[{row['edge']:+.1%}]**")
+                    cols[5].markdown(f"**:{edge_color}[{row['edge']:+.1%}]**")
 
+                    # Action button
                     if row['signal'] != "PASS":
                         button_label = f"{'🤖 ' if auto_trade else ''}{row['signal']}"
                         button_key = f"trade_{row['city']}_{row.get('condition_id', '')}"
