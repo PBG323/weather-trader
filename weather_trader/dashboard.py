@@ -28,6 +28,10 @@ from weather_trader.models import EnsembleForecaster, BiasCorrector
 from weather_trader.models.ensemble import ModelForecast
 from weather_trader.polymarket import WeatherMarketFinder, PolymarketAuth
 from weather_trader.strategy import ExpectedValueCalculator
+from weather_trader.trading import (
+    TradingConfig, PositionManager, RiskManager, ExecutionEngine,
+    AutoTrader, PnLTracker, Position, ExitReason, PositionStatus
+)
 
 # Page config
 st.set_page_config(
@@ -104,6 +108,26 @@ if 'last_auto_trade_check' not in st.session_state:
     st.session_state.last_auto_trade_check = None
 if 'demo_mode' not in st.session_state:
     st.session_state.demo_mode = True
+
+# Trading Engine Components
+if 'trading_config' not in st.session_state:
+    st.session_state.trading_config = TradingConfig()
+if 'position_manager' not in st.session_state:
+    st.session_state.position_manager = PositionManager(st.session_state.trading_config)
+if 'pnl_tracker' not in st.session_state:
+    st.session_state.pnl_tracker = PnLTracker()
+if 'risk_manager' not in st.session_state:
+    st.session_state.risk_manager = RiskManager(
+        config=st.session_state.trading_config,
+        position_manager=st.session_state.position_manager,
+        initial_bankroll=1000.0
+    )
+if 'auto_trader' not in st.session_state:
+    st.session_state.auto_trader = AutoTrader(
+        config=st.session_state.trading_config,
+        position_manager=st.session_state.position_manager,
+        risk_manager=st.session_state.risk_manager
+    )
 
 
 def run_async(coro):
@@ -614,19 +638,42 @@ def calculate_signals(forecasts, markets, show_all_outcomes=False):
 
 
 def execute_trade(signal, size, is_live=False):
-    """Execute a trade (simulated or real)."""
+    """Execute a trade using the trading engine."""
     outcome = signal.get("outcome", "")
     entry_price = signal["market_prob"] if signal["edge"] > 0 else (1 - signal["market_prob"])
+    side = "YES" if signal["edge"] > 0 else "NO"
+    shares = size / entry_price
 
-    position = {
-        "id": f"{signal['city']}_{signal.get('condition_id', '')}_{datetime.now().timestamp()}",
-        "open_time": datetime.now(),
+    # Determine settlement date
+    target_date = signal.get("target_date", date.today() + timedelta(days=1))
+    if isinstance(target_date, date) and not isinstance(target_date, datetime):
+        settlement_date = datetime.combine(target_date, datetime.max.time())
+    else:
+        settlement_date = target_date
+
+    # Create position using the PositionManager
+    position = st.session_state.position_manager.create_position(
+        market_id=signal.get("condition_id", f"demo_{signal['city']}"),
+        condition_id=signal.get("condition_id", ""),
+        city=signal["city"],
+        outcome_description=outcome,
+        settlement_date=settlement_date,
+        side=side,
+        entry_price=entry_price,
+        shares=shares,
+        forecast_prob=signal["our_prob"]
+    )
+
+    # Also add to legacy open_positions for UI compatibility
+    legacy_position = {
+        "id": position.position_id,
+        "open_time": position.entry_time,
         "city": signal["city"],
         "outcome": outcome,
-        "side": "YES" if signal["edge"] > 0 else "NO",
+        "side": side,
         "size": size,
         "entry_price": entry_price,
-        "current_price": entry_price,  # Will be updated on refresh
+        "current_price": entry_price,
         "edge_at_entry": signal["edge"],
         "forecast_prob": signal["our_prob"],
         "market_prob_at_entry": signal["market_prob"],
@@ -634,26 +681,96 @@ def execute_trade(signal, size, is_live=False):
         "mode": "LIVE" if is_live else "SIMULATED",
         "is_demo": signal.get("is_demo", False),
         "condition_id": signal.get("condition_id", ""),
-        "target_date": signal.get("target_date"),
+        "target_date": target_date,
         "unrealized_pnl": 0.0,
+        "position_obj": position,  # Link to actual Position object
     }
 
-    # Add to open positions
-    st.session_state.open_positions.insert(0, position)
+    st.session_state.open_positions.insert(0, legacy_position)
 
     # Also add to trade history for record keeping
-    trade = {**position, "time": position["open_time"], "price": entry_price}
+    trade = {**legacy_position, "time": position.entry_time, "price": entry_price}
     st.session_state.trade_history.insert(0, trade)
     st.session_state.total_trades += 1
 
+    # Record trade in risk manager
+    st.session_state.risk_manager.record_trade(signal.get("condition_id", ""), 0.0)
+
     mode = "LIVE" if is_live else "SIMULATED"
-    add_alert(f"📈 [{mode}] Opened: {signal['city']} {outcome} {position['side']} ${size:.2f} @ {entry_price:.2f}",
+    add_alert(f"📈 [{mode}] Opened: {signal['city']} {outcome} {side} ${size:.2f} @ {entry_price:.2f} (Edge: {signal['edge']:+.1%})",
               "success" if is_live else "info")
-    return position
+    return legacy_position
+
+
+def check_smart_exits(forecasts, markets):
+    """
+    Check all open positions for smart exit signals.
+
+    Uses the trading engine's edge-based exit logic:
+    - Edge exhausted (captured 75%+ of entry edge)
+    - Edge reversed (turned negative)
+    - Momentum shift (edge trending down while profitable)
+    - Stop loss / trailing stop
+    - Time decay (approaching settlement)
+    """
+    if not st.session_state.open_positions:
+        return
+
+    # Build market price lookup
+    market_prices = {}
+    for m in markets:
+        key = m.get("condition_id", "")
+        if key:
+            market_prices[key] = m.get("yes_price", 0.5)
+
+    # Get forecast probabilities
+    positions_to_close = []
+
+    for legacy_pos in st.session_state.open_positions:
+        position = legacy_pos.get("position_obj")
+        if not position or position.status != PositionStatus.OPEN:
+            continue
+
+        cid = legacy_pos.get("condition_id", "")
+        city_key = legacy_pos.get("city", "").lower()
+
+        # Get current market price
+        current_price = market_prices.get(cid, legacy_pos["current_price"])
+
+        # Get current forecast probability
+        fc = forecasts.get(city_key, {})
+        forecast_prob = legacy_pos.get("forecast_prob", 0.5)
+
+        if fc:
+            # Recalculate probability based on current forecast
+            # (simplified - using stored probability for now)
+            forecast_prob = legacy_pos.get("forecast_prob", 0.5)
+
+        # Update position with current data
+        st.session_state.position_manager.update_position(
+            position.position_id,
+            market_price=current_price,
+            forecast_prob=forecast_prob
+        )
+
+        # Check for exit signals
+        should_exit, exit_reason = st.session_state.position_manager.should_exit_position(position)
+
+        if should_exit:
+            positions_to_close.append((legacy_pos, position, exit_reason, current_price))
+
+    # Close positions that triggered exit signals
+    for legacy_pos, position, exit_reason, exit_price in positions_to_close:
+        close_position_smart(legacy_pos["id"], exit_price, exit_reason)
 
 
 def close_position(position_id: str, current_price: float):
-    """Close an open position and realize P/L."""
+    """Close an open position manually and realize P/L."""
+    return close_position_smart(position_id, current_price, ExitReason.MANUAL)
+
+
+def close_position_smart(position_id: str, current_price: float, exit_reason: ExitReason):
+    """Close an open position with specified exit reason and realize P/L."""
     for i, pos in enumerate(st.session_state.open_positions):
         if pos["id"] == position_id:
             # Calculate P/L
@@ -664,27 +781,56 @@ def close_position(position_id: str, current_price: float):
                 # Bought NO: profit if YES price went down
                 pnl = pos["size"] * (pos["entry_price"] - current_price)
 
+            # Close in PositionManager if position object exists
+            position = pos.get("position_obj")
+            if position:
+                st.session_state.position_manager.close_position(
+                    position_id=position.position_id,
+                    exit_price=current_price,
+                    reason=exit_reason
+                )
+                # Record in P&L tracker
+                st.session_state.pnl_tracker.record_trade(position)
+
             # Move to closed positions
             closed = {**pos}
             closed["close_time"] = datetime.now()
             closed["exit_price"] = current_price
             closed["realized_pnl"] = pnl
             closed["status"] = "CLOSED"
+            closed["exit_reason"] = exit_reason.value
 
             st.session_state.closed_positions.insert(0, closed)
             st.session_state.open_positions.pop(i)
             st.session_state.realized_pnl += pnl
 
+            # Update risk manager
+            st.session_state.risk_manager.record_trade(pos.get("condition_id", ""), pnl)
+
             if pnl > 0:
                 st.session_state.winning_trades += 1
 
-            add_alert(f"💰 Closed: {pos['city']} {pos['outcome']} @ {current_price:.2f} | P/L: ${pnl:+.2f}",
-                     "success" if pnl > 0 else "warning")
+            # Format alert message based on exit reason
+            reason_emoji = {
+                ExitReason.EDGE_EXHAUSTED: "📊",
+                ExitReason.EDGE_REVERSED: "↩️",
+                ExitReason.MOMENTUM_SHIFT: "📉",
+                ExitReason.TIME_DECAY: "⏰",
+                ExitReason.STOP_LOSS: "🛑",
+                ExitReason.TRAILING_STOP: "📍",
+                ExitReason.MANUAL: "👤",
+                ExitReason.SETTLEMENT: "🏁",
+            }.get(exit_reason, "💰")
+
+            add_alert(
+                f"{reason_emoji} Closed ({exit_reason.value}): {pos['city']} {pos['outcome']} @ {current_price:.2f} | P/L: ${pnl:+.2f}",
+                "success" if pnl > 0 else "warning"
+            )
             return pnl
     return 0
 
 
-def update_position_prices(markets):
+def update_position_prices(markets, forecasts=None):
     """Update current prices for all open positions based on market data."""
     market_prices = {}
     for m in markets:
@@ -704,12 +850,33 @@ def update_position_prices(markets):
             else:
                 pos["unrealized_pnl"] = pos["size"] * (pos["entry_price"] - new_price)
 
+            # Update Position object with edge snapshot
+            position = pos.get("position_obj")
+            if position:
+                forecast_prob = pos.get("forecast_prob", 0.5)
+                position.record_edge_snapshot(new_price, forecast_prob)
 
-def auto_trade_check(signals, bankroll, kelly_fraction, max_position, min_edge, is_live):
-    """Check signals and execute trades automatically."""
+    # Update risk manager equity
+    st.session_state.risk_manager.update_equity()
+
+
+def auto_trade_check(signals, bankroll, kelly_fraction, max_position, min_edge, is_live, forecasts=None, markets=None):
+    """Check signals and execute trades automatically, including smart exits."""
     if not st.session_state.auto_trade_enabled:
         return
 
+    # PHASE 1: Check for smart exits on existing positions
+    if forecasts and markets:
+        check_smart_exits(forecasts, markets)
+
+    # PHASE 2: Check risk limits before new trades
+    if not st.session_state.risk_manager.is_trading_allowed():
+        risk_summary = st.session_state.risk_manager.get_risk_summary()
+        add_alert(f"⛔ Trading halted: {risk_summary.get('halt_reason', 'risk limit')}", "danger")
+        st.session_state.last_auto_trade_check = datetime.now()
+        return
+
+    # PHASE 3: Execute new trades on signals
     trades_made = 0
     for signal in signals:
         if signal["signal"] == "PASS":
@@ -718,28 +885,49 @@ def auto_trade_check(signals, bankroll, kelly_fraction, max_position, min_edge, 
         if abs(signal["edge"]) < min_edge:
             continue
 
-        if signal["confidence"] < 0.65:
+        if signal["confidence"] < st.session_state.trading_config.min_confidence_to_enter:
             continue
 
-        # Calculate position size
-        kelly = max(0, abs(signal["edge"]) / (1 - signal["market_prob"])) if signal["market_prob"] < 1 else 0
-        position = min(bankroll * kelly * kelly_fraction, bankroll * max_position / 100)
+        # Use risk manager to calculate position size
+        position_size = st.session_state.risk_manager.calculate_position_size(
+            edge=abs(signal["edge"]),
+            win_probability=signal["our_prob"] if signal["edge"] > 0 else (1 - signal["our_prob"]),
+            price=signal["market_prob"] if signal["edge"] > 0 else (1 - signal["market_prob"])
+        )
 
-        if position < 1:
+        # Apply user's max position override
+        max_size = bankroll * max_position / 100
+        position_size = min(position_size, max_size)
+
+        if position_size < st.session_state.trading_config.min_position_size:
             continue
 
-        # Check if we already traded this market recently
-        recent_trades = [t for t in st.session_state.trade_history
-                        if t["city"] == signal["city"]
-                        and (datetime.now() - t["time"]).seconds < 3600]
-        if recent_trades:
+        # Check if we already have a position in this market
+        market_id = signal.get("condition_id", f"demo_{signal['city']}")
+        existing_positions = st.session_state.position_manager.get_positions_by_market(market_id)
+        if existing_positions:
             continue
 
-        execute_trade(signal, position, is_live)
+        # Risk check before trade
+        can_trade, violations = st.session_state.risk_manager.check_can_trade(
+            market_id=market_id,
+            city=signal["city"],
+            position_size=position_size,
+            edge=abs(signal["edge"]),
+            confidence=signal["confidence"]
+        )
+
+        if not can_trade:
+            critical = [v for v in violations if v.severity == "critical"]
+            if critical:
+                add_alert(f"⚠️ Trade blocked: {critical[0].message}", "warning")
+            continue
+
+        execute_trade(signal, position_size, is_live)
         trades_made += 1
 
     if trades_made > 0:
-        add_alert(f"🤖 Auto-trader executed {trades_made} trade(s)", "success")
+        add_alert(f"🤖 Auto-trader executed {trades_made} new trade(s)", "success")
 
     st.session_state.last_auto_trade_check = datetime.now()
 
@@ -811,6 +999,10 @@ def main():
         value=1000.0,
         step=100.0
     )
+    # Sync bankroll with risk manager
+    if st.session_state.risk_manager.bankroll != bankroll:
+        st.session_state.risk_manager.bankroll = bankroll
+        st.session_state.risk_manager.peak_equity = max(st.session_state.risk_manager.peak_equity, bankroll)
 
     # Risk settings
     st.sidebar.markdown("### ⚙️ Risk Settings")
@@ -885,9 +1077,13 @@ def main():
     signals = calculate_signals(forecasts, markets, show_all_outcomes=False) if markets and forecasts else []
     all_signals = calculate_signals(forecasts, markets, show_all_outcomes=True) if markets and forecasts else []
 
+    # Update position prices and check for smart exits
+    if markets:
+        update_position_prices(markets, forecasts)
+
     # Auto-trade check (only use best signals)
     if auto_trade and signals:
-        auto_trade_check(signals, bankroll, kelly_fraction, max_position, min_edge, is_live)
+        auto_trade_check(signals, bankroll, kelly_fraction, max_position, min_edge, is_live, forecasts, markets)
 
     # =====================
     # TAB 1: Overview
@@ -908,19 +1104,53 @@ def main():
         if config.api.tomorrow_io_api_key and "your_" not in config.api.tomorrow_io_api_key.lower():
             st.caption(f"📡 Tomorrow.io: {st.session_state.tomorrow_io_calls_today}/400 calls today")
 
-        # Auto-trade status
+        # Auto-trade status with smart exit info
         if auto_trade:
             st.markdown("""
             <div class="auto-trade-active">
-                <strong>🤖 Auto-Trading Enabled</strong><br>
-                The bot will automatically execute trades when:
+                <strong>🤖 Smart Auto-Trading Enabled</strong><br>
+                <strong>Entry Criteria:</strong>
                 <ul>
                     <li>Edge exceeds minimum threshold</li>
-                    <li>Confidence is above 65%</li>
-                    <li>Position size meets minimum requirements</li>
+                    <li>Confidence above minimum (configurable)</li>
+                    <li>Risk limits not exceeded</li>
+                </ul>
+                <strong>Smart Exit Triggers:</strong>
+                <ul>
+                    <li>📊 <strong>Edge Exhausted</strong>: Captured 75%+ of entry edge</li>
+                    <li>↩️ <strong>Edge Reversed</strong>: Edge turned negative</li>
+                    <li>📉 <strong>Momentum Shift</strong>: Edge trending down while profitable</li>
+                    <li>🛑 <strong>Stop Loss</strong>: Loss exceeds 30% of position</li>
+                    <li>📍 <strong>Trailing Stop</strong>: Gave back 50%+ of peak profit</li>
+                    <li>⏰ <strong>Time Decay</strong>: Approaching market settlement</li>
                 </ul>
             </div>
             """, unsafe_allow_html=True)
+
+            # Show risk summary
+            risk_summary = st.session_state.risk_manager.get_risk_summary()
+            st.markdown("---")
+            st.subheader("📊 Risk Dashboard")
+
+            risk_cols = st.columns(5)
+            with risk_cols[0]:
+                st.metric("Bankroll", f"${risk_summary['bankroll']:,.2f}")
+            with risk_cols[1]:
+                st.metric("Equity", f"${risk_summary['current_equity']:,.2f}",
+                         f"{risk_summary['daily_pnl_pct']:+.1f}% today")
+            with risk_cols[2]:
+                dd_color = "🔴" if risk_summary['drawdown_pct'] > 10 else "🟡" if risk_summary['drawdown_pct'] > 5 else "🟢"
+                st.metric("Drawdown", f"{dd_color} {risk_summary['drawdown_pct']:.1f}%")
+            with risk_cols[3]:
+                st.metric("Open Positions", f"{risk_summary['open_positions']}/{risk_summary['max_positions']}")
+            with risk_cols[4]:
+                st.metric("Daily Trades", f"{risk_summary['daily_trades']}/{risk_summary['max_daily_trades']}")
+
+            if risk_summary['trading_halted']:
+                st.error(f"⛔ **TRADING HALTED**: {risk_summary['halt_reason']}")
+                if st.button("🔓 Reset Trading Halt"):
+                    st.session_state.risk_manager.reset_halt()
+                    st.rerun()
 
         # Key metrics
         col1, col2, col3, col4, col5 = st.columns(5)
@@ -1117,13 +1347,38 @@ def main():
 
                     st.divider()
 
-            # Temperature comparison chart
+            # Temperature comparison chart - show each city in its market unit
             st.subheader("📊 Temperature Comparison")
-            df_temps = pd.DataFrame([
-                {"City": fc["city"], "High": fc["high_mean"], "Low": fc["low_mean"],
-                 "High_err": fc["high_std"], "Low_err": fc["low_std"]}
-                for fc in forecasts.values()
-            ])
+
+            # Build data with correct units per city
+            temp_data = []
+            for city_key, fc in forecasts.items():
+                city_config = get_city_config(city_key)
+                uses_celsius = city_config.temp_unit == "C"
+
+                if uses_celsius:
+                    high = (fc["high_mean"] - 32) * 5 / 9
+                    low = (fc["low_mean"] - 32) * 5 / 9
+                    high_err = fc["high_std"] * 5 / 9
+                    low_err = fc["low_std"] * 5 / 9
+                    unit = "°C"
+                else:
+                    high = fc["high_mean"]
+                    low = fc["low_mean"]
+                    high_err = fc["high_std"]
+                    low_err = fc["low_std"]
+                    unit = "°F"
+
+                temp_data.append({
+                    "City": f"{fc['city']} ({unit})",
+                    "High": high,
+                    "Low": low,
+                    "High_err": high_err,
+                    "Low_err": low_err,
+                    "Unit": unit
+                })
+
+            df_temps = pd.DataFrame(temp_data)
 
             fig = go.Figure()
             fig.add_trace(go.Bar(
@@ -1132,7 +1387,7 @@ def main():
                 y=df_temps['High'],
                 error_y=dict(type='data', array=df_temps['High_err'], color='rgba(255,87,34,0.5)'),
                 marker_color='#ff5722',
-                text=[f"{h:.0f}°" for h in df_temps['High']],
+                text=[f"{h:.0f}" for h in df_temps['High']],
                 textposition='outside'
             ))
             fig.add_trace(go.Bar(
@@ -1141,17 +1396,18 @@ def main():
                 y=df_temps['Low'],
                 error_y=dict(type='data', array=df_temps['Low_err'], color='rgba(33,150,243,0.5)'),
                 marker_color='#2196f3',
-                text=[f"{l:.0f}°" for l in df_temps['Low']],
+                text=[f"{l:.0f}" for l in df_temps['Low']],
                 textposition='outside'
             ))
             fig.update_layout(
                 barmode='group',
-                yaxis_title="Temperature (°F)",
+                yaxis_title="Temperature",
                 height=350,
                 margin=dict(t=20, b=40),
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
             )
             st.plotly_chart(fig, use_container_width=True)
+            st.caption("*NYC, Atlanta, Seattle shown in °F; Toronto, London shown in °C (matching Polymarket)*")
 
     # =====================
     # TAB 3: Markets
@@ -1296,29 +1552,51 @@ def main():
 
         if model_comparison:
             for city_key, data in model_comparison.items():
-                st.subheader(data["city"])
+                city_config = get_city_config(city_key)
+                uses_celsius = city_config.temp_unit == "C"
+                unit_label = "°C" if uses_celsius else "°F"
+
+                st.subheader(f"{data['city']} ({unit_label})")
 
                 if data["models"]:
                     models = list(data["models"].keys())
-                    highs = [data["models"][m]["high"] for m in models]
-                    lows = [data["models"][m]["low"] for m in models]
+                    # Get temps in F first
+                    highs_f = [data["models"][m]["high"] for m in models]
+                    lows_f = [data["models"][m]["low"] for m in models]
+
+                    # Convert to Celsius for London/Toronto
+                    if uses_celsius:
+                        highs = [(h - 32) * 5 / 9 for h in highs_f]
+                        lows = [(l - 32) * 5 / 9 for l in lows_f]
+                    else:
+                        highs = highs_f
+                        lows = lows_f
 
                     fig = go.Figure()
-                    fig.add_trace(go.Bar(name='High', x=models, y=highs, marker_color='#ff5722'))
-                    fig.add_trace(go.Bar(name='Low', x=models, y=lows, marker_color='#2196f3'))
+                    fig.add_trace(go.Bar(name='High', x=models, y=highs, marker_color='#ff5722',
+                                        text=[f"{h:.0f}{unit_label}" for h in highs], textposition='outside'))
+                    fig.add_trace(go.Bar(name='Low', x=models, y=lows, marker_color='#2196f3',
+                                        text=[f"{l:.0f}{unit_label}" for l in lows], textposition='outside'))
 
                     if city_key in forecasts:
-                        fig.add_hline(y=forecasts[city_key]["high_mean"], line_dash="dash",
+                        ensemble_high = forecasts[city_key]["high_mean"]
+                        if uses_celsius:
+                            ensemble_high = (ensemble_high - 32) * 5 / 9
+                        fig.add_hline(y=ensemble_high, line_dash="dash",
                                     line_color="red", annotation_text="Ensemble High")
 
                     fig.update_layout(barmode='group', height=300,
-                                    yaxis_title="Temperature (°F)", xaxis_title="Model")
+                                    yaxis_title=f"Temperature ({unit_label})", xaxis_title="Model")
                     st.plotly_chart(fig, use_container_width=True)
 
                     if len(highs) > 1:
                         spread = max(highs) - min(highs)
-                        agreement = "High" if spread < 3 else ("Medium" if spread < 6 else "Low")
-                        st.metric("Model Agreement", agreement, f"Spread: {spread:.1f}°F")
+                        # Adjust thresholds for Celsius (smaller numbers)
+                        if uses_celsius:
+                            agreement = "High" if spread < 1.7 else ("Medium" if spread < 3.3 else "Low")
+                        else:
+                            agreement = "High" if spread < 3 else ("Medium" if spread < 6 else "Low")
+                        st.metric("Model Agreement", agreement, f"Spread: {spread:.1f}{unit_label}")
 
                 st.markdown("---")
 
@@ -1333,27 +1611,44 @@ def main():
                                       format_func=lambda x: multi_day[x]["city"])
 
             if city_select:
+                city_config = get_city_config(city_select)
+                uses_celsius = city_config.temp_unit == "C"
+                unit_label = "°C" if uses_celsius else "°F"
+
                 data = multi_day[city_select]
                 df = pd.DataFrame(data["daily"])
 
+                # Convert to Celsius for London/Toronto
+                if uses_celsius:
+                    df['high_display'] = (df['high'] - 32) * 5 / 9
+                    df['low_display'] = (df['low'] - 32) * 5 / 9
+                else:
+                    df['high_display'] = df['high']
+                    df['low_display'] = df['low']
+
                 fig = go.Figure()
-                fig.add_trace(go.Scatter(x=df['date'], y=df['high'], name='High',
+                fig.add_trace(go.Scatter(x=df['date'], y=df['high_display'], name='High',
                                         line=dict(color='#ff5722', width=3), mode='lines+markers'))
-                fig.add_trace(go.Scatter(x=df['date'], y=df['low'], name='Low',
+                fig.add_trace(go.Scatter(x=df['date'], y=df['low_display'], name='Low',
                                         line=dict(color='#2196f3', width=3), mode='lines+markers'))
                 fig.add_trace(go.Scatter(
                     x=list(df['date']) + list(df['date'])[::-1],
-                    y=list(df['high']) + list(df['low'])[::-1],
+                    y=list(df['high_display']) + list(df['low_display'])[::-1],
                     fill='toself', fillcolor='rgba(255, 87, 34, 0.1)',
                     line=dict(color='rgba(255,255,255,0)'), showlegend=False
                 ))
                 fig.update_layout(title=f"{data['city']} - 7 Day Forecast",
-                                xaxis_title="Date", yaxis_title="Temperature (°F)",
+                                xaxis_title="Date", yaxis_title=f"Temperature ({unit_label})",
                                 height=400, hovermode='x unified')
                 st.plotly_chart(fig, use_container_width=True)
 
-                st.dataframe(df.style.format({"high": "{:.1f}°F", "low": "{:.1f}°F"}),
-                           use_container_width=True)
+                # Display table with correct units
+                display_df = df[['date', 'high_display', 'low_display', 'model']].copy()
+                display_df.columns = ['Date', f'High ({unit_label})', f'Low ({unit_label})', 'Model']
+                st.dataframe(display_df.style.format({
+                    f'High ({unit_label})': "{:.1f}",
+                    f'Low ({unit_label})': "{:.1f}"
+                }), use_container_width=True)
 
     # =====================
     # TAB 6: Trades & P/L
@@ -1361,9 +1656,7 @@ def main():
     with tab6:
         st.header("💰 Trades & P/L")
 
-        # Update position prices from current market data
-        if markets:
-            update_position_prices(markets)
+        # Note: Position prices are already updated in the main flow
 
         # Summary metrics
         total_unrealized = sum(p.get("unrealized_pnl", 0) for p in st.session_state.open_positions)
@@ -1382,25 +1675,65 @@ def main():
 
         st.divider()
 
-        # Open Positions Section
+        # Open Positions Section with Edge Tracking
         st.subheader("📊 Open Positions")
 
         if st.session_state.open_positions:
+            # Header row
+            header_cols = st.columns([2, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 1, 1])
+            header_cols[0].markdown("**Position**")
+            header_cols[1].markdown("**Side**")
+            header_cols[2].markdown("**Size**")
+            header_cols[3].markdown("**Entry**")
+            header_cols[4].markdown("**Current**")
+            header_cols[5].markdown("**Edge**")
+            header_cols[6].markdown("**P/L**")
+            header_cols[7].markdown("**Status**")
+            header_cols[8].markdown("**Action**")
+            st.divider()
+
             for pos in st.session_state.open_positions:
                 with st.container():
-                    cols = st.columns([2, 1, 1, 1, 1, 1, 1.5])
+                    cols = st.columns([2, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 1, 1])
 
-                    cols[0].markdown(f"**{pos['city']}** - {pos['outcome']}")
-                    cols[1].markdown(f"Side: **{pos['side']}**")
-                    cols[2].markdown(f"Size: ${pos['size']:.2f}")
-                    cols[3].markdown(f"Entry: {pos['entry_price']:.2f}")
-                    cols[4].markdown(f"Current: {pos['current_price']:.2f}")
+                    cols[0].markdown(f"**{pos['city']}**\n{pos['outcome']}")
+                    cols[1].markdown(f"**{pos['side']}**")
+                    cols[2].markdown(f"${pos['size']:.2f}")
+                    cols[3].markdown(f"{pos['entry_price']:.2f}")
+                    cols[4].markdown(f"{pos['current_price']:.2f}")
+
+                    # Show current edge
+                    position = pos.get("position_obj")
+                    if position:
+                        current_edge = position.current_edge
+                        edge_captured = position.edge_captured_pct
+                        edge_trend = position.get_edge_trend()
+
+                        edge_color = "green" if current_edge > 0 else "red"
+                        trend_arrow = "↗️" if edge_trend > 0.005 else "↘️" if edge_trend < -0.005 else "→"
+                        cols[5].markdown(f":{edge_color}[{current_edge:+.1%}] {trend_arrow}")
+                    else:
+                        entry_edge = pos.get('edge_at_entry', 0)
+                        cols[5].markdown(f"{entry_edge:+.1%}")
 
                     pnl = pos.get('unrealized_pnl', 0)
                     pnl_color = "green" if pnl >= 0 else "red"
-                    cols[5].markdown(f"P/L: **:{pnl_color}[${pnl:+.2f}]**")
+                    cols[6].markdown(f"**:{pnl_color}[${pnl:+.2f}]**")
 
-                    if cols[6].button("🔴 SELL", key=f"sell_{pos['id']}"):
+                    # Show edge exhaustion status
+                    if position:
+                        if edge_captured >= 0.75:
+                            cols[7].markdown("⚠️ Edge exhausted")
+                        elif current_edge < 0:
+                            cols[7].markdown("🔴 Edge reversed")
+                        elif edge_trend < -0.005:
+                            cols[7].markdown("📉 Momentum ↓")
+                        else:
+                            cols[7].markdown("🟢 Holding")
+                    else:
+                        cols[7].markdown("—")
+
+                    if cols[8].button("🔴 SELL", key=f"sell_{pos['id']}"):
                         close_position(pos['id'], pos['current_price'])
                         st.rerun()
 
@@ -1504,13 +1837,31 @@ def main():
         # Trade History
         st.subheader("📜 Trade History")
 
-        # Show closed positions
+        # Show closed positions with exit reasons
         if st.session_state.closed_positions:
             st.markdown("**Closed Positions:**")
             for pos in st.session_state.closed_positions[:10]:
                 pnl = pos.get('realized_pnl', 0)
                 pnl_emoji = "🟢" if pnl >= 0 else "🔴"
-                st.markdown(f"{pnl_emoji} {pos['city']} {pos['outcome']} | Entry: {pos['entry_price']:.2f} → Exit: {pos['exit_price']:.2f} | **P/L: ${pnl:+.2f}**")
+                exit_reason = pos.get('exit_reason', 'manual')
+
+                # Format exit reason
+                reason_display = {
+                    'edge_exhausted': '📊 Edge Captured',
+                    'edge_reversed': '↩️ Edge Reversed',
+                    'momentum_shift': '📉 Momentum',
+                    'time_decay': '⏰ Time',
+                    'stop_loss': '🛑 Stop Loss',
+                    'trailing_stop': '📍 Trail Stop',
+                    'manual': '👤 Manual',
+                    'settlement': '🏁 Settled',
+                }.get(exit_reason, exit_reason)
+
+                st.markdown(
+                    f"{pnl_emoji} {pos['city']} {pos['outcome']} | "
+                    f"Entry: {pos['entry_price']:.2f} → Exit: {pos['exit_price']:.2f} | "
+                    f"**P/L: ${pnl:+.2f}** | {reason_display}"
+                )
 
         if st.session_state.trade_history:
             with st.expander("View All Trade Records"):
@@ -1600,11 +1951,12 @@ def main():
     # Footer
     st.markdown("---")
     market_status = "Demo Markets" if use_demo else ("Live Markets" if markets else "No Markets")
+    open_pos_count = len(st.session_state.open_positions)
     st.markdown(
-        f"*Weather Trader v0.3.0* | "
+        f"*Weather Trader v0.4.0 (Smart Trading Engine)* | "
         f"*{market_status}* | "
-        f"*{len(forecasts)} cities • {len(signals)} signals* | "
-        f"*Auto-Trade: {'ON' if auto_trade else 'OFF'}*"
+        f"*{len(forecasts)} cities • {len(signals)} signals • {open_pos_count} positions* | "
+        f"*Auto-Trade: {'🟢 ON' if auto_trade else 'OFF'}*"
     )
 
     # Auto-refresh
