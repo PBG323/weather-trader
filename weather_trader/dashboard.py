@@ -147,7 +147,7 @@ if 'auto_trader' not in st.session_state:
 
 
 # ========================
-# PROBABILITY CLIPPING
+# PROBABILITY CLIPPING & CONTINUITY CORRECTION
 # ========================
 # No weather outcome should be treated as 0% or 100% certain.
 # Weather has fat tails - freak events happen. Clipping prevents
@@ -164,6 +164,47 @@ def clip_probability(p: float) -> float:
     to guard against model error in the distribution tails.
     """
     return max(PROB_FLOOR, min(PROB_CEILING, p))
+
+
+def calc_outcome_probability(
+    temp_low: float,
+    temp_high: float,
+    forecast_mean: float,
+    forecast_std: float,
+) -> float:
+    """Calculate probability for a market outcome with continuity correction.
+
+    Weather markets settle on INTEGER temperatures (e.g., "8°C" means the
+    station reported 8). When modeling discrete integer outcomes with a
+    continuous normal distribution, we must apply continuity correction:
+
+        "8°C" (single temp) → P(7.5 ≤ T < 8.5)
+        "20-21°F" (range)   → P(19.5 ≤ T < 21.5)
+        "≤6°C" (or below)   → P(T < 6.5)
+        "≥12°C" (or higher) → P(T ≥ 11.5)
+
+    Without this, single-degree outcomes like "8°C" compute CDF(8)-CDF(8)=0,
+    which is mathematically correct for a point but wrong for the market's
+    intent (an integer reading of 8).
+
+    Returns clipped probability, or None if inputs are invalid.
+    """
+    CONTINUITY = 0.5
+
+    if temp_low is None and temp_high is not None:
+        # "≤X" - P(temp rounds to X or below)
+        raw_prob = stats.norm.cdf(temp_high + CONTINUITY, loc=forecast_mean, scale=forecast_std)
+    elif temp_high is None and temp_low is not None:
+        # "≥X" - P(temp rounds to X or above)
+        raw_prob = 1 - stats.norm.cdf(temp_low - CONTINUITY, loc=forecast_mean, scale=forecast_std)
+    elif temp_low is not None and temp_high is not None:
+        # Range or single temp - P(low ≤ reading ≤ high)
+        raw_prob = stats.norm.cdf(temp_high + CONTINUITY, loc=forecast_mean, scale=forecast_std) - \
+                   stats.norm.cdf(temp_low - CONTINUITY, loc=forecast_mean, scale=forecast_std)
+    else:
+        return None
+
+    return clip_probability(raw_prob)
 
 
 def run_async(coro):
@@ -635,26 +676,21 @@ def calculate_signals(forecasts, markets, show_all_outcomes=False):
             temp_high = market.get("temp_high")
             market_prob = market["yes_price"]
 
-            # Calculate our probability for this outcome
+            # Calculate our probability with continuity correction + clipping
             if temp_low is None and temp_high is not None:
-                # "≤X" outcome (e.g., "23°F or below"): P(temp <= X)
-                raw_prob = stats.norm.cdf(temp_high, loc=forecast_temp_market, scale=forecast_std_market)
                 range_type = "or_below"
             elif temp_high is None and temp_low is not None:
-                # "≥X" outcome (e.g., "26°F or higher"): P(temp >= X)
-                raw_prob = 1 - stats.norm.cdf(temp_low, loc=forecast_temp_market, scale=forecast_std_market)
                 range_type = "or_higher"
             elif temp_low is not None and temp_high is not None:
-                # "X-Y" range: P(X <= temp <= Y)
-                prob_high = stats.norm.cdf(temp_high, loc=forecast_temp_market, scale=forecast_std_market)
-                prob_low = stats.norm.cdf(temp_low, loc=forecast_temp_market, scale=forecast_std_market)
-                raw_prob = prob_high - prob_low
                 range_type = "range"
             else:
                 continue
 
-            # Clip probability to prevent overconfident tail predictions
-            our_prob = clip_probability(raw_prob)
+            our_prob = calc_outcome_probability(
+                temp_low, temp_high, forecast_temp_market, forecast_std_market
+            )
+            if our_prob is None:
+                continue
 
             edge = our_prob - market_prob
 
@@ -1658,24 +1694,21 @@ def main():
 
                         if fc:
                             if temp_low is None and temp_high is not None:
-                                # "X or below" - P(temp <= X)
-                                raw_prob = stats.norm.cdf(temp_high, loc=forecast_high, scale=forecast_std)
-                                our_prob = clip_probability(raw_prob)
                                 calc_type = "≤ (or below)"
-                                formula = f"P(T≤{temp_high:.0f}) = CDF({temp_high:.0f})"
+                                formula = f"P(T≤{temp_high:.0f}) = CDF({temp_high:.0f}+0.5)"
                             elif temp_high is None and temp_low is not None:
-                                # "X or higher" - P(temp >= X)
-                                raw_prob = 1 - stats.norm.cdf(temp_low, loc=forecast_high, scale=forecast_std)
-                                our_prob = clip_probability(raw_prob)
                                 calc_type = "≥ (or higher)"
-                                formula = f"P(T≥{temp_low:.0f}) = 1-CDF({temp_low:.0f})"
+                                formula = f"P(T≥{temp_low:.0f}) = 1-CDF({temp_low:.0f}-0.5)"
                             elif temp_low is not None and temp_high is not None:
-                                # "X-Y" range
-                                raw_prob = stats.norm.cdf(temp_high, loc=forecast_high, scale=forecast_std) - \
-                                          stats.norm.cdf(temp_low, loc=forecast_high, scale=forecast_std)
-                                our_prob = clip_probability(raw_prob)
-                                calc_type = "range"
-                                formula = f"P({temp_low:.0f}≤T≤{temp_high:.0f})"
+                                if temp_low == temp_high:
+                                    calc_type = f"= {temp_low:.0f}° (±0.5)"
+                                else:
+                                    calc_type = "range"
+                                formula = f"P({temp_low:.0f}-0.5≤T≤{temp_high:.0f}+0.5)"
+
+                            our_prob = calc_outcome_probability(
+                                temp_low, temp_high, forecast_high, forecast_std
+                            )
 
                         edge = (our_prob - yes_price) if our_prob is not None else None
 
@@ -1713,15 +1746,18 @@ def main():
                         **Standard Deviation:** {forecast_std:.2f}°
 
                         **How probabilities are calculated:**
-                        - **"X or below"**: `P(temp ≤ X) = CDF(X)` where CDF is the cumulative normal distribution
-                        - **"X or higher"**: `P(temp ≥ X) = 1 - CDF(X)`
-                        - **"X-Y range"**: `P(X ≤ temp ≤ Y) = CDF(Y) - CDF(X)`
-                        - **Clipping**: All probabilities clipped to [{PROB_FLOOR:.0%}, {PROB_CEILING:.0%}] — weather has fat tails, no outcome is truly impossible
+                        Markets settle on integer temperatures. We apply **continuity correction** (±0.5) to model discrete readings with a continuous normal distribution:
+                        - **"X or below"**: `P(T < X+0.5) = CDF(X+0.5)`
+                        - **"X or higher"**: `P(T ≥ X-0.5) = 1 - CDF(X-0.5)`
+                        - **"X°" (single)**: `P(X-0.5 ≤ T < X+0.5) = CDF(X+0.5) - CDF(X-0.5)`
+                        - **"X-Y range"**: `P(X-0.5 ≤ T < Y+0.5) = CDF(Y+0.5) - CDF(X-0.5)`
+                        - **Clipping**: All probabilities clipped to [{PROB_FLOOR:.0%}, {PROB_CEILING:.0%}]
 
                         **Example for this market:**
-                        - If forecast = {forecast_high:.1f}°{market_unit} with std = {forecast_std:.1f}°
-                        - "≤{forecast_high-2:.0f}" outcome: P(T≤{forecast_high-2:.0f}) = {clip_probability(stats.norm.cdf(forecast_high-2, loc=forecast_high, scale=forecast_std)):.1%}
-                        - "≥{forecast_high+2:.0f}" outcome: P(T≥{forecast_high+2:.0f}) = {clip_probability(1-stats.norm.cdf(forecast_high+2, loc=forecast_high, scale=forecast_std)):.1%}
+                        - Forecast = {forecast_high:.1f}°{market_unit}, std = {forecast_std:.1f}°
+                        - "≤{forecast_high-2:.0f}" → {calc_outcome_probability(None, forecast_high-2, forecast_high, forecast_std):.1%}
+                        - "={forecast_high:.0f}" → {calc_outcome_probability(forecast_high, forecast_high, forecast_high, forecast_std):.1%}
+                        - "≥{forecast_high+2:.0f}" → {calc_outcome_probability(forecast_high+2, None, forecast_high, forecast_std):.1%}
                         """)
         else:
             st.warning("No markets found")
