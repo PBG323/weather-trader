@@ -96,7 +96,13 @@ class TradingConfig:
 
     # Maximum open positions at any time
     max_open_positions: int = field(
-        default_factory=lambda: int(os.getenv("MAX_OPEN_POSITIONS", "10"))
+        default_factory=lambda: int(os.getenv("MAX_OPEN_POSITIONS", "15"))
+    )
+
+    # Minimum edge advantage to replace weakest position (e.g., 0.03 = new signal
+    # must have at least 3% more edge than the weakest open position)
+    min_edge_advantage_to_replace: float = field(
+        default_factory=lambda: float(os.getenv("MIN_EDGE_ADVANTAGE_TO_REPLACE", "0.03"))
     )
 
     # Maximum position size as % of bankroll

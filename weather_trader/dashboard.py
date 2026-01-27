@@ -921,6 +921,7 @@ def auto_trade_check(signals, bankroll, kelly_fraction, max_position, min_edge, 
 
     # PHASE 3: Execute new trades on signals
     trades_made = 0
+    replacements_made = 0
     for signal in signals:
         if signal["signal"] == "PASS":
             continue
@@ -961,6 +962,50 @@ def auto_trade_check(signals, bankroll, kelly_fraction, max_position, min_edge, 
         )
 
         if not can_trade:
+            # POSITION REPLACEMENT: If blocked only by max positions, try replacing weakest
+            max_pos_blocked = any(
+                v.check.value == "max_positions" for v in violations if v.severity == "critical"
+            )
+            only_max_pos_blocked = max_pos_blocked and sum(
+                1 for v in violations if v.severity == "critical"
+            ) == 1
+
+            if only_max_pos_blocked:
+                new_edge = abs(signal["edge"])
+                min_replace_advantage = st.session_state.trading_config.min_edge_advantage_to_replace
+
+                # Find the open position with the weakest current edge
+                weakest_pos = None
+                weakest_edge = float('inf')
+                weakest_legacy = None
+
+                for legacy_pos in st.session_state.open_positions:
+                    pos_obj = legacy_pos.get("position_obj")
+                    if pos_obj and pos_obj.status == PositionStatus.OPEN:
+                        pos_edge = pos_obj.current_edge
+                        if pos_edge < weakest_edge:
+                            weakest_edge = pos_edge
+                            weakest_pos = pos_obj
+                            weakest_legacy = legacy_pos
+
+                # Replace if new signal has meaningfully better edge
+                if weakest_pos and (new_edge - weakest_edge) >= min_replace_advantage:
+                    add_alert(
+                        f"🔄 Replacing weakest position: {weakest_legacy['city']} {weakest_legacy['outcome']} "
+                        f"(edge {weakest_edge:+.1%}) with {signal['city']} {signal.get('outcome','')} "
+                        f"(edge {new_edge:+.1%})",
+                        "info"
+                    )
+                    close_position_smart(
+                        weakest_pos.position_id,
+                        weakest_legacy["current_price"],
+                        ExitReason.RISK_LIMIT
+                    )
+                    execute_trade(signal, position_size, is_live)
+                    trades_made += 1
+                    replacements_made += 1
+                    continue
+
             critical = [v for v in violations if v.severity == "critical"]
             if critical:
                 add_alert(f"⚠️ Trade blocked: {critical[0].message}", "warning")
@@ -970,7 +1015,10 @@ def auto_trade_check(signals, bankroll, kelly_fraction, max_position, min_edge, 
         trades_made += 1
 
     if trades_made > 0:
-        add_alert(f"🤖 Auto-trader executed {trades_made} new trade(s)", "success")
+        msg = f"🤖 Auto-trader executed {trades_made} new trade(s)"
+        if replacements_made > 0:
+            msg += f" ({replacements_made} replaced weaker positions)"
+        add_alert(msg, "success")
 
     st.session_state.last_auto_trade_check = get_est_now()
 
