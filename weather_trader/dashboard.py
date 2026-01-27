@@ -80,6 +80,10 @@ st.markdown("""
 # Initialize session state
 if 'trade_history' not in st.session_state:
     st.session_state.trade_history = []
+if 'open_positions' not in st.session_state:
+    st.session_state.open_positions = []  # Active positions not yet settled
+if 'closed_positions' not in st.session_state:
+    st.session_state.closed_positions = []  # Settled/sold positions
 if 'alerts' not in st.session_state:
     st.session_state.alerts = []
 if 'price_history' not in st.session_state:
@@ -88,6 +92,8 @@ if 'forecast_history' not in st.session_state:
     st.session_state.forecast_history = []
 if 'pnl' not in st.session_state:
     st.session_state.pnl = 0.0
+if 'realized_pnl' not in st.session_state:
+    st.session_state.realized_pnl = 0.0
 if 'total_trades' not in st.session_state:
     st.session_state.total_trades = 0
 if 'winning_trades' not in st.session_state:
@@ -516,29 +522,93 @@ def calculate_signals(forecasts, markets):
 def execute_trade(signal, size, is_live=False):
     """Execute a trade (simulated or real)."""
     outcome = signal.get("outcome", "")
-    trade = {
-        "time": datetime.now(),
+    entry_price = signal["market_prob"] if signal["edge"] > 0 else (1 - signal["market_prob"])
+
+    position = {
+        "id": f"{signal['city']}_{signal.get('condition_id', '')}_{datetime.now().timestamp()}",
+        "open_time": datetime.now(),
         "city": signal["city"],
         "outcome": outcome,
         "side": "YES" if signal["edge"] > 0 else "NO",
         "size": size,
-        "price": signal["market_prob"] if signal["edge"] > 0 else (1 - signal["market_prob"]),
-        "edge": signal["edge"],
+        "entry_price": entry_price,
+        "current_price": entry_price,  # Will be updated on refresh
+        "edge_at_entry": signal["edge"],
         "forecast_prob": signal["our_prob"],
-        "market_prob": signal["market_prob"],
-        "status": "SIMULATED" if not is_live else "LIVE",
+        "market_prob_at_entry": signal["market_prob"],
+        "status": "OPEN",
+        "mode": "LIVE" if is_live else "SIMULATED",
         "is_demo": signal.get("is_demo", False),
         "condition_id": signal.get("condition_id", ""),
         "target_date": signal.get("target_date"),
-        "pnl": 0,
+        "unrealized_pnl": 0.0,
     }
+
+    # Add to open positions
+    st.session_state.open_positions.insert(0, position)
+
+    # Also add to trade history for record keeping
+    trade = {**position, "time": position["open_time"], "price": entry_price}
     st.session_state.trade_history.insert(0, trade)
     st.session_state.total_trades += 1
 
     mode = "LIVE" if is_live else "SIMULATED"
-    add_alert(f"📈 [{mode}] Trade: {signal['city']} {outcome} {trade['side']} ${size:.2f} @ {trade['price']:.2f}",
+    add_alert(f"📈 [{mode}] Opened: {signal['city']} {outcome} {position['side']} ${size:.2f} @ {entry_price:.2f}",
               "success" if is_live else "info")
-    return trade
+    return position
+
+
+def close_position(position_id: str, current_price: float):
+    """Close an open position and realize P/L."""
+    for i, pos in enumerate(st.session_state.open_positions):
+        if pos["id"] == position_id:
+            # Calculate P/L
+            if pos["side"] == "YES":
+                # Bought YES: profit if price went up
+                pnl = pos["size"] * (current_price - pos["entry_price"])
+            else:
+                # Bought NO: profit if YES price went down
+                pnl = pos["size"] * (pos["entry_price"] - current_price)
+
+            # Move to closed positions
+            closed = {**pos}
+            closed["close_time"] = datetime.now()
+            closed["exit_price"] = current_price
+            closed["realized_pnl"] = pnl
+            closed["status"] = "CLOSED"
+
+            st.session_state.closed_positions.insert(0, closed)
+            st.session_state.open_positions.pop(i)
+            st.session_state.realized_pnl += pnl
+
+            if pnl > 0:
+                st.session_state.winning_trades += 1
+
+            add_alert(f"💰 Closed: {pos['city']} {pos['outcome']} @ {current_price:.2f} | P/L: ${pnl:+.2f}",
+                     "success" if pnl > 0 else "warning")
+            return pnl
+    return 0
+
+
+def update_position_prices(markets):
+    """Update current prices for all open positions based on market data."""
+    market_prices = {}
+    for m in markets:
+        key = m.get("condition_id", "")
+        if key:
+            market_prices[key] = m.get("yes_price", 0.5)
+
+    for pos in st.session_state.open_positions:
+        cid = pos.get("condition_id", "")
+        if cid in market_prices:
+            new_price = market_prices[cid]
+            pos["current_price"] = new_price
+
+            # Calculate unrealized P/L
+            if pos["side"] == "YES":
+                pos["unrealized_pnl"] = pos["size"] * (new_price - pos["entry_price"])
+            else:
+                pos["unrealized_pnl"] = pos["size"] * (pos["entry_price"] - new_price)
 
 
 def auto_trade_check(signals, bankroll, kelly_fraction, max_position, min_edge, is_live):
@@ -1091,69 +1161,158 @@ def main():
     with tab6:
         st.header("💰 Trades & P/L")
 
+        # Update position prices from current market data
+        if markets:
+            update_position_prices(markets)
+
+        # Summary metrics
+        total_unrealized = sum(p.get("unrealized_pnl", 0) for p in st.session_state.open_positions)
+        total_pnl = st.session_state.realized_pnl + total_unrealized
+
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Open Positions", len(st.session_state.open_positions))
+        with col2:
+            color = "normal" if total_unrealized >= 0 else "inverse"
+            st.metric("Unrealized P/L", f"${total_unrealized:+.2f}", delta_color=color)
+        with col3:
+            st.metric("Realized P/L", f"${st.session_state.realized_pnl:+.2f}")
+        with col4:
+            st.metric("Total P/L", f"${total_pnl:+.2f}")
+
+        st.divider()
+
+        # Open Positions Section
+        st.subheader("📊 Open Positions")
+
+        if st.session_state.open_positions:
+            for pos in st.session_state.open_positions:
+                with st.container():
+                    cols = st.columns([2, 1, 1, 1, 1, 1, 1.5])
+
+                    cols[0].markdown(f"**{pos['city']}** - {pos['outcome']}")
+                    cols[1].markdown(f"Side: **{pos['side']}**")
+                    cols[2].markdown(f"Size: ${pos['size']:.2f}")
+                    cols[3].markdown(f"Entry: {pos['entry_price']:.2f}")
+                    cols[4].markdown(f"Current: {pos['current_price']:.2f}")
+
+                    pnl = pos.get('unrealized_pnl', 0)
+                    pnl_color = "green" if pnl >= 0 else "red"
+                    cols[5].markdown(f"P/L: **:{pnl_color}[${pnl:+.2f}]**")
+
+                    if cols[6].button("🔴 SELL", key=f"sell_{pos['id']}"):
+                        close_position(pos['id'], pos['current_price'])
+                        st.rerun()
+
+                    st.divider()
+        else:
+            st.info("No open positions. Trades will appear here when executed.")
+
+        st.divider()
+
+        # Position Calculator with explanations
+        st.subheader("🧮 Position Calculator")
+
+        st.markdown("""
+        **How it works:** The calculator helps you determine optimal position sizes based on your edge.
+        """)
+
         col1, col2 = st.columns(2)
 
         with col1:
-            st.subheader("Position Calculator")
-            calc_prob = st.slider("Your Probability (%)", 1, 99, 60) / 100
-            calc_market = st.slider("Market Price (%)", 1, 99, 50) / 100
+            calc_prob = st.slider("Your Probability (%)", 1, 99, 60, help="What you believe the true probability is based on weather forecasts") / 100
+            calc_market = st.slider("Market Price (%)", 1, 99, 50, help="Current Polymarket price (what the market believes)") / 100
 
             edge = calc_prob - calc_market
             kelly = max(0, edge / (1 - calc_market)) if calc_market < 1 else 0
             adj_kelly = kelly * kelly_fraction
             position = min(bankroll * adj_kelly, bankroll * max_position / 100)
 
-            st.metric("Edge", f"{edge:+.1%}")
-            st.metric("Kelly Suggests", f"{kelly:.1%} of bankroll")
-            st.metric("Position Size", f"${position:.2f}")
+        with col2:
+            st.markdown("### Results")
+            st.metric("Edge", f"{edge:+.1%}", help="Your probability minus market price. Positive = market undervalues YES")
+            st.metric("Full Kelly", f"{kelly:.1%}", help="Kelly Criterion suggests this % of bankroll")
+            st.metric("Adjusted Position", f"${position:.2f}", help=f"After {kelly_fraction:.0%} Kelly fraction and {max_position}% max cap")
 
             if edge > min_edge:
-                st.success(f"✅ Trade recommended: ${position:.2f}")
+                st.success(f"✅ Trade signal: BUY {'YES' if edge > 0 else 'NO'} ${position:.2f}")
+            elif edge > 0:
+                st.warning(f"⚠️ Positive edge but below {min_edge:.0%} threshold")
             else:
-                st.warning(f"⚠️ Edge below minimum ({min_edge:.0%})")
+                st.error("❌ No edge - market price higher than forecast")
 
-        with col2:
-            st.subheader("P&L Tracking")
+        # Explanation of settings
+        with st.expander("📖 Understanding the Settings"):
+            st.markdown("""
+            ### Sidebar Settings Explained
 
-            if st.session_state.trade_history:
-                cumulative_pnl = []
-                running = 0
-                for t in st.session_state.trade_history[::-1]:
-                    outcome = random.random() < (0.5 + t['edge'])
-                    pnl = t['size'] * (1 - t['price']) if outcome else -t['size'] * t['price']
-                    running += pnl
-                    cumulative_pnl.append(running)
+            **Bankroll ($)**
+            Your total trading capital. All position sizes are calculated as percentages of this amount.
 
-                st.session_state.pnl = cumulative_pnl[-1] if cumulative_pnl else 0
+            **Kelly Fraction (0.1 - 1.0)**
+            The Kelly Criterion calculates the mathematically optimal bet size to maximize long-term growth.
+            However, full Kelly is very aggressive and can lead to large drawdowns.
+            - **0.25 (Quarter Kelly)**: Conservative, recommended for beginners. Smoother returns.
+            - **0.5 (Half Kelly)**: Balanced approach.
+            - **1.0 (Full Kelly)**: Maximum growth but very volatile. High risk of ruin.
 
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(y=cumulative_pnl, mode='lines+markers',
-                                        line=dict(color='green' if cumulative_pnl[-1] > 0 else 'red')))
-                fig.update_layout(title="Cumulative P&L (Simulated)", yaxis_title="$", height=300)
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("No trades yet")
+            **Max Position (%)**
+            Hard cap on any single trade as a percentage of bankroll. Even if Kelly suggests more,
+            the position won't exceed this. Prevents overexposure to any single market.
 
-        st.markdown("---")
-        st.subheader("Trade History")
+            **Min Edge (%)**
+            Only trade when your edge exceeds this threshold. Accounts for:
+            - Model uncertainty
+            - Execution costs
+            - Market microstructure
+
+            ### The Formula
+            ```
+            Edge = Your Probability - Market Price
+            Kelly % = Edge / (1 - Market Price)
+            Position = min(Bankroll × Kelly × Fraction, Bankroll × Max%)
+            ```
+
+            ### Example
+            - Your forecast: 70% chance of YES
+            - Market price: 55¢
+            - Edge: 70% - 55% = **+15%**
+            - Kelly: 15% / 45% = **33%** of bankroll
+            - With 0.25 fraction: 33% × 0.25 = **8.3%**
+            - With $1000 bankroll and 5% max: **$50** position
+            """)
+
+        st.divider()
+
+        # Trade History
+        st.subheader("📜 Trade History")
+
+        # Show closed positions
+        if st.session_state.closed_positions:
+            st.markdown("**Closed Positions:**")
+            for pos in st.session_state.closed_positions[:10]:
+                pnl = pos.get('realized_pnl', 0)
+                pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+                st.markdown(f"{pnl_emoji} {pos['city']} {pos['outcome']} | Entry: {pos['entry_price']:.2f} → Exit: {pos['exit_price']:.2f} | **P/L: ${pnl:+.2f}**")
 
         if st.session_state.trade_history:
-            df_hist = pd.DataFrame(st.session_state.trade_history)
-            st.dataframe(df_hist[['time', 'city', 'side', 'size', 'price', 'edge', 'status']]
-                        .style.format({
-                            'size': '${:.2f}',
-                            'price': '{:.2f}',
-                            'edge': '{:+.1%}'
-                        }), use_container_width=True)
+            with st.expander("View All Trade Records"):
+                df_hist = pd.DataFrame(st.session_state.trade_history)
+                display_cols = ['time', 'city', 'outcome', 'side', 'size', 'entry_price', 'status']
+                available_cols = [c for c in display_cols if c in df_hist.columns]
+                st.dataframe(df_hist[available_cols], use_container_width=True)
 
-            if st.button("Clear Trade History"):
+            if st.button("🗑️ Clear All History"):
                 st.session_state.trade_history = []
+                st.session_state.open_positions = []
+                st.session_state.closed_positions = []
                 st.session_state.total_trades = 0
                 st.session_state.winning_trades = 0
                 st.session_state.pnl = 0
+                st.session_state.realized_pnl = 0
                 st.rerun()
         else:
-            st.info("No trades recorded")
+            st.info("No trades recorded yet")
 
     # =====================
     # TAB 7: Price Charts
@@ -1195,15 +1354,27 @@ def main():
                 st.rerun()
 
         if st.session_state.alerts:
-            for alert in st.session_state.alerts[:20]:
-                level_colors = {"info": "#e3f2fd", "success": "#e8f5e9", "warning": "#fff3e0", "danger": "#ffebee"}
+            for alert in st.session_state.alerts[:30]:
+                level_styles = {
+                    "info": {"bg": "#1e3a5f", "border": "#3b82f6", "text": "#e0e7ff"},
+                    "success": {"bg": "#14532d", "border": "#22c55e", "text": "#dcfce7"},
+                    "warning": {"bg": "#713f12", "border": "#f59e0b", "text": "#fef3c7"},
+                    "danger": {"bg": "#7f1d1d", "border": "#ef4444", "text": "#fee2e2"}
+                }
                 level_icons = {"info": "ℹ️", "success": "✅", "warning": "⚠️", "danger": "🚨"}
 
+                style = level_styles.get(alert['level'], {"bg": "#374151", "border": "#6b7280", "text": "#f3f4f6"})
+
                 st.markdown(f"""
-                <div style="background-color: {level_colors.get(alert['level'], '#f5f5f5')};
-                            padding: 10px; border-radius: 5px; margin: 5px 0;">
+                <div style="background-color: {style['bg']};
+                            border-left: 4px solid {style['border']};
+                            color: {style['text']};
+                            padding: 12px 15px;
+                            border-radius: 5px;
+                            margin: 8px 0;
+                            font-size: 14px;">
                     {level_icons.get(alert['level'], '📢')}
-                    <strong>{alert['time'].strftime('%H:%M:%S')}</strong> - {alert['message']}
+                    <strong>{alert['time'].strftime('%H:%M:%S')}</strong> — {alert['message']}
                 </div>
                 """, unsafe_allow_html=True)
         else:
