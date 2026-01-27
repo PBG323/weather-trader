@@ -293,7 +293,10 @@ async def _fetch_real_markets():
     async with WeatherMarketFinder() as finder:
         try:
             found = await finder.find_weather_markets(active_only=True, days_ahead=3)
+            add_alert(f"Polymarket API: Found {len(found)} market events", "info")
+
             for market in found:
+                add_alert(f"Processing {market.city}: {len(market.outcomes)} outcomes", "info")
                 # Each market has multiple temperature outcomes
                 for outcome in market.outcomes:
                     markets.append({
@@ -320,8 +323,11 @@ async def _fetch_real_markets():
                     })
                     record_price(outcome.condition_id, outcome.yes_price)
         except Exception as e:
-            add_alert(f"Error fetching markets: {str(e)}", "warning")
+            import traceback
+            add_alert(f"Error fetching markets: {str(e)}", "danger")
+            add_alert(f"Traceback: {traceback.format_exc()[:200]}", "warning")
 
+    add_alert(f"Total outcomes fetched: {len(markets)}", "info")
     return markets
 
 

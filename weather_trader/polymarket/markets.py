@@ -156,6 +156,7 @@ class WeatherMarketFinder:
         """
         markets = []
         cities = [city_filter] if city_filter else list(CITY_CONFIGS.keys())
+        errors = []
 
         for city_key in cities:
             city_config = CITY_CONFIGS.get(city_key)
@@ -172,9 +173,12 @@ class WeatherMarketFinder:
                     if market:
                         if not active_only or market.is_active:
                             markets.append(market)
+                            print(f"[Markets] Found: {slug} with {len(market.outcomes)} outcomes")
                 except Exception as e:
-                    # Market may not exist for this date - that's okay
-                    pass
+                    errors.append(f"{slug}: {str(e)}")
+
+        if errors and len(errors) < 5:
+            print(f"[Markets] Errors: {errors}")
 
         return markets
 
