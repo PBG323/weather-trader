@@ -424,19 +424,20 @@ def calculate_signals(forecasts, markets):
             continue
 
         fc = forecasts[city_key]
-        forecast_temp = fc["high_mean"]
-        forecast_std = max(fc["high_std"], 2.0)
-        temp_unit = group_markets[0].get("temp_unit", "F")
+        forecast_temp_f = fc["high_mean"]  # Forecast is always in Fahrenheit
+        forecast_std_f = max(fc["high_std"], 2.0)
+        market_temp_unit = group_markets[0].get("temp_unit", "F")
         city_config = get_city_config(city_key)
 
-        # Convert forecast to Celsius if needed
-        if temp_unit == "C" and city_config.temp_unit == "C":
-            # Forecast is in F, market is in C - convert forecast
-            forecast_temp_market = (forecast_temp - 32) * 5/9
-            forecast_std_market = forecast_std * 5/9
+        # Convert forecast to market's unit (Celsius for London/Toronto)
+        if market_temp_unit == "C":
+            # Market uses Celsius - convert our Fahrenheit forecast to Celsius
+            forecast_temp_market = (forecast_temp_f - 32) * 5 / 9
+            forecast_std_market = forecast_std_f * 5 / 9
         else:
-            forecast_temp_market = forecast_temp
-            forecast_std_market = forecast_std
+            # Market uses Fahrenheit - no conversion needed
+            forecast_temp_market = forecast_temp_f
+            forecast_std_market = forecast_std_f
 
         # Find the best opportunity across all outcomes
         best_signal = None
@@ -473,13 +474,14 @@ def calculate_signals(forecasts, markets):
                     "outcome": market.get("outcome_desc", f"{temp_low}-{temp_high}"),
                     "temp_low": temp_low,
                     "temp_high": temp_high,
-                    "temp_unit": temp_unit,
+                    "temp_unit": market_temp_unit,
                     "our_prob": our_prob,
                     "market_prob": market_prob,
                     "edge": edge,
                     "confidence": fc["confidence"],
-                    "forecast_high": forecast_temp,
-                    "forecast_std": fc["high_std"],
+                    "forecast_high_f": forecast_temp_f,  # Original Fahrenheit
+                    "forecast_high_market": forecast_temp_market,  # In market's unit
+                    "forecast_std": forecast_std_market,  # In market's unit
                     "condition_id": market["condition_id"],
                     "yes_token_id": market.get("yes_token_id", ""),
                     "is_demo": market.get("is_demo", False),
@@ -859,7 +861,9 @@ def main():
                     temp_unit = row.get('temp_unit', 'F')
                     outcome = row.get('outcome', f"{row.get('temp_low', '?')}-{row.get('temp_high', '?')}")
                     cols[1].markdown(f"Range: {outcome}")
-                    cols[2].markdown(f"Fcst: {row['forecast_high']:.1f}°F")
+                    unit = row.get('temp_unit', 'F')
+                    fcst = row.get('forecast_high_market', row.get('forecast_high_f', 0))
+                    cols[2].markdown(f"Fcst: {fcst:.1f}°{unit}")
                     cols[3].markdown(f"Our: {row['our_prob']:.0%}")
                     cols[4].markdown(f"Mkt: {row['market_prob']:.0%}")
 
@@ -927,28 +931,32 @@ def main():
                         st.markdown(f"### {fc['city']}")
                         st.caption(f"📍 {city_config.station_name}")
 
+                    # Check if this city uses Celsius on Polymarket
+                    uses_celsius = temp_unit == "C"
+                    high_f = fc['high_mean']
+                    low_f = fc['low_mean']
+                    high_c = (high_f - 32) * 5 / 9
+                    low_c = (low_f - 32) * 5 / 9
+
                     with col2:
-                        high_display = fc['high_mean']
-                        if temp_unit == "C":
-                            high_display = (fc['high_mean'] - 32) * 5/9
-                        st.metric(
-                            "High",
-                            f"{fc['high_mean']:.0f}°F",
-                            f"±{fc['high_std']:.1f}°"
-                        )
+                        if uses_celsius:
+                            st.metric("High", f"{high_c:.0f}°C", f"({high_f:.0f}°F)")
+                        else:
+                            st.metric("High", f"{high_f:.0f}°F", f"±{fc['high_std']:.1f}°")
 
                     with col3:
-                        st.metric(
-                            "Low",
-                            f"{fc['low_mean']:.0f}°F",
-                            f"±{fc['low_std']:.1f}°"
-                        )
+                        if uses_celsius:
+                            st.metric("Low", f"{low_c:.0f}°C", f"({low_f:.0f}°F)")
+                        else:
+                            st.metric("Low", f"{low_f:.0f}°F", f"±{fc['low_std']:.1f}°")
 
                     with col4:
-                        st.metric(
-                            "90% Range",
-                            f"{fc['high_ci_lower']:.0f}-{fc['high_ci_upper']:.0f}°F"
-                        )
+                        if uses_celsius:
+                            ci_low_c = (fc['high_ci_lower'] - 32) * 5 / 9
+                            ci_high_c = (fc['high_ci_upper'] - 32) * 5 / 9
+                            st.metric("90% Range", f"{ci_low_c:.0f}-{ci_high_c:.0f}°C")
+                        else:
+                            st.metric("90% Range", f"{fc['high_ci_lower']:.0f}-{fc['high_ci_upper']:.0f}°F")
 
                     with col5:
                         conf_pct = fc['confidence'] * 100
@@ -1081,9 +1089,15 @@ def main():
                     df_outcomes = pd.DataFrame(outcome_data)
                     st.dataframe(df_outcomes, use_container_width=True, hide_index=True)
 
-                    # Show forecast context
+                    # Show forecast context in market's unit
                     if fc:
-                        st.caption(f"📊 Our forecast: {fc.get('high_mean', 0):.1f}°F (±{fc.get('high_std', 0):.1f}°F)")
+                        market_unit = group["outcomes"][0].get("temp_unit", "F") if group["outcomes"] else "F"
+                        fc_high = fc.get('high_mean', 0)
+                        fc_std = fc.get('high_std', 0)
+                        if market_unit == "C":
+                            fc_high = (fc_high - 32) * 5 / 9
+                            fc_std = fc_std * 5 / 9
+                        st.caption(f"📊 Our forecast: {fc_high:.1f}°{market_unit} (±{fc_std:.1f}°)")
         else:
             st.warning("No markets found")
             st.info("Enable Demo Mode in the sidebar to test with simulated markets, or check if Polymarket has active weather markets.")
@@ -1210,36 +1224,53 @@ def main():
 
         st.divider()
 
-        # Position Calculator with explanations
+        # Position Calculator - Shows actual signals with auto-calculated positions
         st.subheader("🧮 Position Calculator")
 
-        st.markdown("""
-        **How it works:** The calculator helps you determine optimal position sizes based on your edge.
-        """)
+        if signals:
+            st.markdown("**Active trading signals with calculated positions:**")
 
-        col1, col2 = st.columns(2)
+            for sig in sorted(signals, key=lambda x: abs(x.get("edge", 0)), reverse=True):
+                if sig["signal"] == "PASS":
+                    continue
 
-        with col1:
-            calc_prob = st.slider("Your Probability (%)", 1, 99, 60, help="What you believe the true probability is based on weather forecasts") / 100
-            calc_market = st.slider("Market Price (%)", 1, 99, 50, help="Current Polymarket price (what the market believes)") / 100
+                edge = sig["edge"]
+                our_prob = sig["our_prob"]
+                market_prob = sig["market_prob"]
 
-            edge = calc_prob - calc_market
-            kelly = max(0, edge / (1 - calc_market)) if calc_market < 1 else 0
-            adj_kelly = kelly * kelly_fraction
-            position = min(bankroll * adj_kelly, bankroll * max_position / 100)
+                kelly = max(0, abs(edge) / (1 - market_prob)) if market_prob < 1 else 0
+                adj_kelly = kelly * kelly_fraction
+                position = min(bankroll * adj_kelly, bankroll * max_position / 100)
 
-        with col2:
-            st.markdown("### Results")
-            st.metric("Edge", f"{edge:+.1%}", help="Your probability minus market price. Positive = market undervalues YES")
-            st.metric("Full Kelly", f"{kelly:.1%}", help="Kelly Criterion suggests this % of bankroll")
-            st.metric("Adjusted Position", f"${position:.2f}", help=f"After {kelly_fraction:.0%} Kelly fraction and {max_position}% max cap")
+                unit = sig.get("temp_unit", "F")
+                fcst = sig.get("forecast_high_market", sig.get("forecast_high_f", 0))
 
-            if edge > min_edge:
-                st.success(f"✅ Trade signal: BUY {'YES' if edge > 0 else 'NO'} ${position:.2f}")
-            elif edge > 0:
-                st.warning(f"⚠️ Positive edge but below {min_edge:.0%} threshold")
-            else:
-                st.error("❌ No edge - market price higher than forecast")
+                with st.container():
+                    st.markdown(f"### {sig['city']} — {sig['outcome']}")
+
+                    col1, col2, col3, col4 = st.columns(4)
+                    col1.metric("Forecast", f"{fcst:.1f}°{unit}")
+                    col2.metric("Our Prob", f"{our_prob:.1%}")
+                    col3.metric("Market", f"{market_prob:.1%}")
+
+                    edge_delta = "normal" if edge > 0 else "inverse"
+                    col4.metric("Edge", f"{edge:+.1%}", delta_color=edge_delta)
+
+                    col1b, col2b, col3b, col4b = st.columns(4)
+                    col1b.metric("Kelly %", f"{kelly:.1%}")
+                    col2b.metric("Adj Kelly", f"{adj_kelly:.1%}")
+                    col3b.metric("Position", f"${position:.2f}")
+
+                    if position >= 1 and abs(edge) >= min_edge:
+                        col4b.success(f"✅ {sig['signal']}")
+                    elif abs(edge) >= min_edge:
+                        col4b.warning("⚠️ Size too small")
+                    else:
+                        col4b.info(f"Edge < {min_edge:.0%}")
+
+                    st.divider()
+        else:
+            st.info("No signals available. Enable markets to see position calculations.")
 
         # Explanation of settings
         with st.expander("📖 Understanding the Settings"):
