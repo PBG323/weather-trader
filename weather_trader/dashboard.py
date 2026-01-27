@@ -146,6 +146,26 @@ if 'auto_trader' not in st.session_state:
     )
 
 
+# ========================
+# PROBABILITY CLIPPING
+# ========================
+# No weather outcome should be treated as 0% or 100% certain.
+# Weather has fat tails - freak events happen. Clipping prevents
+# the model from being catastrophically overconfident on extremes,
+# which would cause outsized Kelly positions on tail bets.
+PROB_FLOOR = 0.01    # 1% minimum - never say "impossible"
+PROB_CEILING = 0.99  # 99% maximum - never say "guaranteed"
+
+def clip_probability(p: float) -> float:
+    """Clip probability to [PROB_FLOOR, PROB_CEILING].
+
+    Prevents tail overconfidence: a raw CDF of 0.001% becomes 1%.
+    This is standard practice in prediction markets and sports betting
+    to guard against model error in the distribution tails.
+    """
+    return max(PROB_FLOOR, min(PROB_CEILING, p))
+
+
 def run_async(coro):
     """Helper to run async functions in Streamlit."""
     loop = asyncio.new_event_loop()
@@ -537,17 +557,18 @@ async def _fetch_forecasts_with_models():
                         )
                         forecasts[city_key] = {
                             "city": city_config.name,
-                            "high_mean": ens.high_mean,
-                            "high_std": ens.high_std,
-                            "low_mean": ens.low_mean,
-                            "low_std": ens.low_std,
-                            "confidence": ens.confidence,
+                            "high_mean": float(ens.high_mean),
+                            "high_std": float(ens.high_std),
+                            "low_mean": float(ens.low_mean),
+                            "low_std": float(ens.low_std),
+                            "confidence": float(ens.confidence),
                             "model_count": ens.model_count,
                             "date": target_date,
                             "models": model_details,
-                            "high_ci_lower": ens.high_ci_lower,
-                            "high_ci_upper": ens.high_ci_upper,
+                            "high_ci_lower": float(ens.high_ci_lower),
+                            "high_ci_upper": float(ens.high_ci_upper),
                         }
+                        print(f"[Forecast] {city_key}: high={ens.high_mean:.1f}F std={ens.high_std:.1f} ({ens.model_count} models)")
                     else:
                         print(f"WARNING: No forecast data for {city_key} on {target_date}")
 
@@ -560,6 +581,7 @@ async def _fetch_forecasts_with_models():
                     record_tomorrow_io_call(tm_call_count)
                     print(f"Tomorrow.io: {tm_call_count} city calls (#{_tomorrow_io_calls_today} today)")
 
+    print(f"[Forecasts] Loaded {len(forecasts)} cities: {list(forecasts.keys())}")
     return forecasts
 
 
@@ -616,20 +638,23 @@ def calculate_signals(forecasts, markets, show_all_outcomes=False):
             # Calculate our probability for this outcome
             if temp_low is None and temp_high is not None:
                 # "≤X" outcome (e.g., "23°F or below"): P(temp <= X)
-                our_prob = stats.norm.cdf(temp_high, loc=forecast_temp_market, scale=forecast_std_market)
+                raw_prob = stats.norm.cdf(temp_high, loc=forecast_temp_market, scale=forecast_std_market)
                 range_type = "or_below"
             elif temp_high is None and temp_low is not None:
                 # "≥X" outcome (e.g., "26°F or higher"): P(temp >= X)
-                our_prob = 1 - stats.norm.cdf(temp_low, loc=forecast_temp_market, scale=forecast_std_market)
+                raw_prob = 1 - stats.norm.cdf(temp_low, loc=forecast_temp_market, scale=forecast_std_market)
                 range_type = "or_higher"
             elif temp_low is not None and temp_high is not None:
                 # "X-Y" range: P(X <= temp <= Y)
                 prob_high = stats.norm.cdf(temp_high, loc=forecast_temp_market, scale=forecast_std_market)
                 prob_low = stats.norm.cdf(temp_low, loc=forecast_temp_market, scale=forecast_std_market)
-                our_prob = prob_high - prob_low
+                raw_prob = prob_high - prob_low
                 range_type = "range"
             else:
                 continue
+
+            # Clip probability to prevent overconfident tail predictions
+            our_prob = clip_probability(raw_prob)
 
             edge = our_prob - market_prob
 
@@ -1602,7 +1627,10 @@ def main():
                     # Show all outcomes as a table with calculation details
                     outcome_data = []
                     city_key = group["city_key"].lower()
-                    fc = forecasts.get(city_key, {})
+                    fc = forecasts.get(city_key)
+
+                    if not fc:
+                        print(f"[Markets] No forecast for '{city_key}' - available keys: {list(forecasts.keys())}")
 
                     # Get forecast in market's unit
                     market_unit = group["outcomes"][0].get("temp_unit", "F") if group["outcomes"] else "F"
@@ -1631,22 +1659,25 @@ def main():
                         if fc:
                             if temp_low is None and temp_high is not None:
                                 # "X or below" - P(temp <= X)
-                                our_prob = stats.norm.cdf(temp_high, loc=forecast_high, scale=forecast_std)
+                                raw_prob = stats.norm.cdf(temp_high, loc=forecast_high, scale=forecast_std)
+                                our_prob = clip_probability(raw_prob)
                                 calc_type = "≤ (or below)"
                                 formula = f"P(T≤{temp_high:.0f}) = CDF({temp_high:.0f})"
                             elif temp_high is None and temp_low is not None:
                                 # "X or higher" - P(temp >= X)
-                                our_prob = 1 - stats.norm.cdf(temp_low, loc=forecast_high, scale=forecast_std)
+                                raw_prob = 1 - stats.norm.cdf(temp_low, loc=forecast_high, scale=forecast_std)
+                                our_prob = clip_probability(raw_prob)
                                 calc_type = "≥ (or higher)"
                                 formula = f"P(T≥{temp_low:.0f}) = 1-CDF({temp_low:.0f})"
                             elif temp_low is not None and temp_high is not None:
                                 # "X-Y" range
-                                our_prob = stats.norm.cdf(temp_high, loc=forecast_high, scale=forecast_std) - \
+                                raw_prob = stats.norm.cdf(temp_high, loc=forecast_high, scale=forecast_std) - \
                                           stats.norm.cdf(temp_low, loc=forecast_high, scale=forecast_std)
+                                our_prob = clip_probability(raw_prob)
                                 calc_type = "range"
                                 formula = f"P({temp_low:.0f}≤T≤{temp_high:.0f})"
 
-                        edge = (our_prob - yes_price) if our_prob else None
+                        edge = (our_prob - yes_price) if our_prob is not None else None
 
                         # Determine if this is likely correct or problematic
                         status = ""
@@ -1662,8 +1693,8 @@ def main():
                             "Outcome": outcome_desc,
                             "Type": calc_type,
                             "Market": f"{yes_price:.1%}",
-                            "Ours": f"{our_prob:.1%}" if our_prob else "N/A",
-                            "Edge": f"{edge:+.1%}" if edge else "N/A",
+                            "Ours": f"{our_prob:.1%}" if our_prob is not None else "N/A",
+                            "Edge": f"{edge:+.1%}" if edge is not None else "N/A",
                             "Signal": status,
                             "Volume": f"${volume:,.0f}"
                         })
@@ -1685,11 +1716,12 @@ def main():
                         - **"X or below"**: `P(temp ≤ X) = CDF(X)` where CDF is the cumulative normal distribution
                         - **"X or higher"**: `P(temp ≥ X) = 1 - CDF(X)`
                         - **"X-Y range"**: `P(X ≤ temp ≤ Y) = CDF(Y) - CDF(X)`
+                        - **Clipping**: All probabilities clipped to [{PROB_FLOOR:.0%}, {PROB_CEILING:.0%}] — weather has fat tails, no outcome is truly impossible
 
                         **Example for this market:**
                         - If forecast = {forecast_high:.1f}°{market_unit} with std = {forecast_std:.1f}°
-                        - "≤{forecast_high-2:.0f}" outcome: P(T≤{forecast_high-2:.0f}) = {stats.norm.cdf(forecast_high-2, loc=forecast_high, scale=forecast_std):.1%}
-                        - "≥{forecast_high+2:.0f}" outcome: P(T≥{forecast_high+2:.0f}) = {1-stats.norm.cdf(forecast_high+2, loc=forecast_high, scale=forecast_std):.1%}
+                        - "≤{forecast_high-2:.0f}" outcome: P(T≤{forecast_high-2:.0f}) = {clip_probability(stats.norm.cdf(forecast_high-2, loc=forecast_high, scale=forecast_std)):.1%}
+                        - "≥{forecast_high+2:.0f}" outcome: P(T≥{forecast_high+2:.0f}) = {clip_probability(1-stats.norm.cdf(forecast_high+2, loc=forecast_high, scale=forecast_std)):.1%}
                         """)
         else:
             st.warning("No markets found")
