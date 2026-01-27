@@ -1076,7 +1076,9 @@ def main():
     # Sync bankroll with risk manager
     if st.session_state.risk_manager.bankroll != bankroll:
         st.session_state.risk_manager.bankroll = bankroll
-        st.session_state.risk_manager.peak_equity = max(st.session_state.risk_manager.peak_equity, bankroll)
+        # Reset peak equity to new bankroll so changing bankroll doesn't trigger false drawdown
+        st.session_state.risk_manager.peak_equity = bankroll
+        st.session_state.risk_manager.reset_halt()
 
     # Risk settings
     st.sidebar.markdown("### ⚙️ Risk Settings")

@@ -382,6 +382,12 @@ class RiskManager:
         return not self._trading_halted
 
     def reset_halt(self) -> None:
-        """Manually reset trading halt (use with caution)."""
+        """Manually reset trading halt. Also resets peak equity to current level."""
         self._trading_halted = False
         self._halt_reason = None
+        # Reset peak equity so drawdown starts fresh from current state
+        current = self.get_current_equity()
+        self.peak_equity = current
+        self._daily_stats.peak_equity = current
+        self._daily_stats.starting_equity = current
+        self._daily_stats.current_equity = current
