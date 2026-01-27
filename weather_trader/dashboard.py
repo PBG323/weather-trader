@@ -16,6 +16,8 @@ from plotly.subplots import make_subplots
 import json
 from pathlib import Path
 import scipy.stats as stats
+import time
+import random
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -51,6 +53,27 @@ st.markdown("""
     .alert-success { background-color: #e8f5e9; border-left: 4px solid #4caf50; }
     .alert-warning { background-color: #fff3e0; border-left: 4px solid #ff9800; }
     .alert-danger { background-color: #ffebee; border-left: 4px solid #f44336; }
+    .live-indicator {
+        display: inline-block;
+        width: 10px;
+        height: 10px;
+        background-color: #00c853;
+        border-radius: 50%;
+        margin-right: 5px;
+        animation: pulse 2s infinite;
+    }
+    @keyframes pulse {
+        0% { opacity: 1; }
+        50% { opacity: 0.5; }
+        100% { opacity: 1; }
+    }
+    .auto-trade-active {
+        background-color: #e8f5e9;
+        border: 2px solid #4caf50;
+        padding: 10px;
+        border-radius: 10px;
+        margin: 10px 0;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -69,6 +92,12 @@ if 'total_trades' not in st.session_state:
     st.session_state.total_trades = 0
 if 'winning_trades' not in st.session_state:
     st.session_state.winning_trades = 0
+if 'auto_trade_enabled' not in st.session_state:
+    st.session_state.auto_trade_enabled = False
+if 'last_auto_trade_check' not in st.session_state:
+    st.session_state.last_auto_trade_check = None
+if 'demo_mode' not in st.session_state:
+    st.session_state.demo_mode = True
 
 
 def run_async(coro):
@@ -88,7 +117,6 @@ def add_alert(message: str, level: str = "info"):
         "message": message,
         "level": level
     })
-    # Keep only last 50 alerts
     st.session_state.alerts = st.session_state.alerts[:50]
 
 
@@ -100,6 +128,41 @@ def record_price(market_id: str, price: float):
         "time": datetime.now(),
         "price": price
     })
+
+
+def generate_demo_markets(forecasts):
+    """Generate demo markets based on real forecasts for testing."""
+    markets = []
+    target_date = date.today() + timedelta(days=1)
+
+    for city_key, fc in forecasts.items():
+        # Create a realistic threshold near the forecast
+        threshold = round(fc["high_mean"] / 5) * 5  # Round to nearest 5
+
+        # Calculate what the "fair" price would be
+        fair_prob = 1 - stats.norm.cdf(threshold, loc=fc["high_mean"], scale=max(fc["high_std"], 2.0))
+
+        # Add some market inefficiency (random noise) for demo
+        market_noise = random.uniform(-0.15, 0.15)
+        market_prob = max(0.05, min(0.95, fair_prob + market_noise))
+
+        markets.append({
+            "city": city_key,
+            "question": f"Will {fc['city']} high temperature be over {threshold}°F on {target_date}?",
+            "threshold": threshold,
+            "yes_price": market_prob,
+            "no_price": 1 - market_prob,
+            "volume": random.randint(5000, 50000),
+            "target_date": target_date,
+            "market_type": "high_over",
+            "condition_id": f"demo_{city_key}_{threshold}",
+            "is_demo": True,
+        })
+
+        # Record demo price for history
+        record_price(f"demo_{city_key}_{threshold}", market_prob)
+
+    return markets
 
 
 @st.cache_data(ttl=300)
@@ -116,7 +179,6 @@ async def _fetch_multi_day():
         for city_key in get_all_cities():
             city_config = get_city_config(city_key)
             try:
-                # Get 7-day forecast
                 daily = await client.get_daily_forecast(city_config, days=7)
                 forecasts[city_key] = {
                     "city": city_config.name,
@@ -131,7 +193,7 @@ async def _fetch_multi_day():
                     ]
                 }
             except Exception as e:
-                st.warning(f"Failed to fetch {city_config.name}: {e}")
+                pass
 
     return forecasts
 
@@ -154,7 +216,6 @@ async def _fetch_model_comparison():
             city_config = get_city_config(city_key)
             city_data = {"city": city_config.name, "models": {}}
 
-            # Fetch from different models
             for model in [WeatherModel.ECMWF, WeatherModel.GFS, WeatherModel.BEST_MATCH]:
                 try:
                     forecasts = await om_client.get_daily_forecast(city_config, model, days=3)
@@ -168,7 +229,6 @@ async def _fetch_model_comparison():
                 except:
                     pass
 
-            # Try Tomorrow.io if configured
             if config.api.tomorrow_io_api_key and "your_" not in config.api.tomorrow_io_api_key.lower():
                 try:
                     async with TomorrowIOClient() as tm_client:
@@ -180,7 +240,7 @@ async def _fetch_model_comparison():
                                     "low": f.temperature_low
                                 }
                                 break
-                except Exception as e:
+                except:
                     pass
 
             comparisons[city_key] = city_data
@@ -189,12 +249,12 @@ async def _fetch_model_comparison():
 
 
 @st.cache_data(ttl=60)
-def fetch_markets_cached():
-    """Fetch Polymarket markets with caching."""
-    return run_async(_fetch_markets())
+def fetch_real_markets():
+    """Fetch real Polymarket markets."""
+    return run_async(_fetch_real_markets())
 
 
-async def _fetch_markets():
+async def _fetch_real_markets():
     """Fetch weather markets from Polymarket."""
     markets = []
 
@@ -212,10 +272,10 @@ async def _fetch_markets():
                     "target_date": m.target_date,
                     "market_type": m.market_type.value,
                     "condition_id": m.condition_id,
+                    "is_demo": False,
                 })
-                # Record price for history
                 record_price(m.condition_id, m.yes_price)
-        except Exception as e:
+        except:
             pass
 
     return markets
@@ -278,17 +338,8 @@ async def _fetch_forecasts_with_models():
                         "high_ci_upper": ens.high_ci_upper,
                     }
 
-                    # Record forecast for accuracy tracking
-                    st.session_state.forecast_history.append({
-                        "time": datetime.now(),
-                        "city": city_key,
-                        "date": target_date,
-                        "forecast_high": ens.high_mean,
-                        "forecast_low": ens.low_mean,
-                    })
-
             except Exception as e:
-                st.warning(f"Failed to fetch {city_config.name}: {e}")
+                pass
 
     return forecasts
 
@@ -306,12 +357,9 @@ def calculate_signals(forecasts, markets):
         threshold = market["threshold"]
         market_prob = market["yes_price"]
 
-        # Calculate our probability using normal distribution
         our_prob = 1 - stats.norm.cdf(threshold, loc=fc["high_mean"], scale=max(fc["high_std"], 2.0))
-
         edge = our_prob - market_prob
 
-        # Determine signal
         if edge > 0.10:
             signal = "STRONG BUY YES"
             signal_color = "#00c853"
@@ -330,6 +378,7 @@ def calculate_signals(forecasts, markets):
 
         signals.append({
             "city": fc["city"],
+            "city_key": city_key,
             "threshold": threshold,
             "our_prob": our_prob,
             "market_prob": market_prob,
@@ -341,17 +390,17 @@ def calculate_signals(forecasts, markets):
             "signal_color": signal_color,
             "signal_strength": abs(edge),
             "condition_id": market["condition_id"],
+            "is_demo": market.get("is_demo", False),
         })
 
-        # Add alert for strong signals
         if abs(edge) > 0.10 and fc["confidence"] > 0.7:
             add_alert(f"🎯 Strong signal: {fc['city']} - {signal} ({edge:+.1%} edge)", "success")
 
     return signals
 
 
-def simulate_trade(signal, size, bankroll):
-    """Simulate a trade execution."""
+def execute_trade(signal, size, is_live=False):
+    """Execute a trade (simulated or real)."""
     trade = {
         "time": datetime.now(),
         "city": signal["city"],
@@ -361,13 +410,56 @@ def simulate_trade(signal, size, bankroll):
         "edge": signal["edge"],
         "forecast_prob": signal["our_prob"],
         "market_prob": signal["market_prob"],
-        "status": "OPEN",
+        "status": "SIMULATED" if not is_live else "LIVE",
+        "is_demo": signal.get("is_demo", False),
         "pnl": 0,
     }
     st.session_state.trade_history.insert(0, trade)
     st.session_state.total_trades += 1
-    add_alert(f"📈 Trade executed: {signal['city']} {trade['side']} ${size:.2f} @ {trade['price']:.2f}", "info")
+
+    mode = "LIVE" if is_live else "SIMULATED"
+    add_alert(f"📈 [{mode}] Trade: {signal['city']} {trade['side']} ${size:.2f} @ {trade['price']:.2f}",
+              "success" if is_live else "info")
     return trade
+
+
+def auto_trade_check(signals, bankroll, kelly_fraction, max_position, min_edge, is_live):
+    """Check signals and execute trades automatically."""
+    if not st.session_state.auto_trade_enabled:
+        return
+
+    trades_made = 0
+    for signal in signals:
+        if signal["signal"] == "PASS":
+            continue
+
+        if abs(signal["edge"]) < min_edge:
+            continue
+
+        if signal["confidence"] < 0.65:
+            continue
+
+        # Calculate position size
+        kelly = max(0, abs(signal["edge"]) / (1 - signal["market_prob"])) if signal["market_prob"] < 1 else 0
+        position = min(bankroll * kelly * kelly_fraction, bankroll * max_position / 100)
+
+        if position < 1:
+            continue
+
+        # Check if we already traded this market recently
+        recent_trades = [t for t in st.session_state.trade_history
+                        if t["city"] == signal["city"]
+                        and (datetime.now() - t["time"]).seconds < 3600]
+        if recent_trades:
+            continue
+
+        execute_trade(signal, position, is_live)
+        trades_made += 1
+
+    if trades_made > 0:
+        add_alert(f"🤖 Auto-trader executed {trades_made} trade(s)", "success")
+
+    st.session_state.last_auto_trade_check = datetime.now()
 
 
 def main():
@@ -387,10 +479,47 @@ def main():
     if is_live:
         st.sidebar.error("⚠️ LIVE TRADING ENABLED")
 
-    # Auto-refresh
-    auto_refresh = st.sidebar.checkbox("Auto-refresh (5 min)", value=False)
-    if auto_refresh:
-        st.sidebar.info("Data refreshes every 5 minutes")
+    # Demo mode toggle
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 📊 Data Source")
+    use_demo = st.sidebar.checkbox(
+        "Demo Mode (Simulated Markets)",
+        value=True,
+        help="Use simulated markets for testing. Disable when real Polymarket weather markets are available."
+    )
+    st.session_state.demo_mode = use_demo
+
+    if use_demo:
+        st.sidebar.info("Using simulated markets for demo")
+    else:
+        st.sidebar.warning("Looking for real Polymarket markets")
+
+    # Auto-trade toggle
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 🤖 Auto-Trading")
+
+    auto_trade = st.sidebar.checkbox(
+        "Enable Auto-Trading",
+        value=st.session_state.auto_trade_enabled,
+        help="Automatically execute trades when signals meet criteria"
+    )
+    st.session_state.auto_trade_enabled = auto_trade
+
+    if auto_trade:
+        st.sidebar.markdown('<div class="auto-trade-active">', unsafe_allow_html=True)
+        st.sidebar.markdown("🟢 **AUTO-TRADE ACTIVE**")
+        if st.session_state.last_auto_trade_check:
+            st.sidebar.caption(f"Last check: {st.session_state.last_auto_trade_check.strftime('%H:%M:%S')}")
+        st.sidebar.markdown('</div>', unsafe_allow_html=True)
+
+    # Auto-refresh for auto-trading
+    auto_refresh = st.sidebar.checkbox(
+        "Auto-refresh (1 min)",
+        value=auto_trade,
+        help="Automatically refresh data for auto-trading"
+    )
+
+    st.sidebar.markdown("---")
 
     # Bankroll setting
     bankroll = st.sidebar.number_input(
@@ -426,14 +555,22 @@ def main():
     st.title("🌤️ Weather Trading Dashboard")
 
     # Status bar
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
-        st.markdown(f"**Mode:** {'🔴 LIVE' if is_live else '🔒 DRY RUN'}")
+        if is_live:
+            st.markdown("**Mode:** 🔴 LIVE")
+        else:
+            st.markdown("**Mode:** 🔒 DRY RUN")
     with col2:
         st.markdown(f"**Bankroll:** ${bankroll:,.2f}")
     with col3:
-        st.markdown(f"**P&L:** ${st.session_state.pnl:+.2f}")
+        if auto_trade:
+            st.markdown('**Auto-Trade:** <span class="live-indicator"></span> ON', unsafe_allow_html=True)
+        else:
+            st.markdown("**Auto-Trade:** OFF")
     with col4:
+        st.markdown(f"**Data:** {'Demo' if use_demo else 'Live'}")
+    with col5:
         st.markdown(f"**Updated:** {datetime.now().strftime('%H:%M:%S')}")
 
     st.markdown("---")
@@ -453,17 +590,49 @@ def main():
     # Fetch data
     with st.spinner("Fetching data..."):
         forecasts = fetch_forecasts_with_models()
-        markets = fetch_markets_cached()
         multi_day = fetch_multi_day_forecasts()
         model_comparison = fetch_model_comparison()
 
-    signals = calculate_signals(forecasts, markets) if markets else []
+        # Get markets (real or demo)
+        if use_demo:
+            markets = generate_demo_markets(forecasts) if forecasts else []
+        else:
+            markets = fetch_real_markets()
+
+    signals = calculate_signals(forecasts, markets) if markets and forecasts else []
+
+    # Auto-trade check
+    if auto_trade and signals:
+        auto_trade_check(signals, bankroll, kelly_fraction, max_position, min_edge, is_live)
 
     # =====================
     # TAB 1: Overview
     # =====================
     with tab1:
         st.header("Trading Overview")
+
+        # Market status banner
+        if use_demo:
+            st.info("📊 **Demo Mode Active** - Using simulated markets based on real weather forecasts. Toggle off 'Demo Mode' in sidebar when real Polymarket weather markets are available.")
+        else:
+            if markets:
+                st.success(f"✅ **Live Markets Found** - {len(markets)} active weather markets on Polymarket")
+            else:
+                st.warning("⚠️ **No Live Markets** - No weather markets currently active on Polymarket. Enable 'Demo Mode' to test the system.")
+
+        # Auto-trade status
+        if auto_trade:
+            st.markdown("""
+            <div class="auto-trade-active">
+                <strong>🤖 Auto-Trading Enabled</strong><br>
+                The bot will automatically execute trades when:
+                <ul>
+                    <li>Edge exceeds minimum threshold</li>
+                    <li>Confidence is above 65%</li>
+                    <li>Position size meets minimum requirements</li>
+                </ul>
+            </div>
+            """, unsafe_allow_html=True)
 
         # Key metrics
         col1, col2, col3, col4, col5 = st.columns(5)
@@ -491,24 +660,29 @@ def main():
             df_signals = pd.DataFrame(signals)
             df_signals = df_signals.sort_values("signal_strength", ascending=False)
 
-            # Display as formatted table
             for _, row in df_signals.iterrows():
                 with st.container():
                     cols = st.columns([2, 1, 1, 1, 1, 1, 2])
-                    cols[0].markdown(f"**{row['city']}**")
+
+                    city_label = f"**{row['city']}**"
+                    if row.get('is_demo'):
+                        city_label += " 🎮"
+                    cols[0].markdown(city_label)
                     cols[1].markdown(f"Threshold: {row['threshold']:.0f}°F")
                     cols[2].markdown(f"Forecast: {row['forecast_high']:.1f}°F")
                     cols[3].markdown(f"Our: {row['our_prob']:.0%}")
                     cols[4].markdown(f"Market: {row['market_prob']:.0%}")
-                    cols[5].markdown(f"Edge: **{row['edge']:+.1%}**")
+
+                    edge_color = "green" if row['edge'] > 0 else "red"
+                    cols[5].markdown(f"Edge: **:{edge_color}[{row['edge']:+.1%}]**")
 
                     if row['signal'] != "PASS":
-                        if cols[6].button(f"{row['signal']}", key=f"trade_{row['city']}"):
-                            # Calculate position size
-                            kelly = max(0, (row['our_prob'] - row['market_prob']) / (1 - row['market_prob']))
+                        button_label = f"{'🤖 ' if auto_trade else ''}{row['signal']}"
+                        if cols[6].button(button_label, key=f"trade_{row['city']}_{row['threshold']}"):
+                            kelly = max(0, abs(row['edge']) / (1 - row['market_prob'])) if row['market_prob'] < 1 else 0
                             position = min(bankroll * kelly * kelly_fraction, bankroll * max_position / 100)
                             if position > 1:
-                                simulate_trade(row, position, bankroll)
+                                execute_trade(row, position, is_live)
                                 st.rerun()
                     else:
                         cols[6].markdown("*No edge*")
@@ -534,12 +708,12 @@ def main():
                 showlegend=False,
                 height=400
             )
-            fig.add_hline(y=5, line_dash="dash", line_color="green", annotation_text="Min Edge")
-            fig.add_hline(y=-5, line_dash="dash", line_color="red")
+            fig.add_hline(y=min_edge*100, line_dash="dash", line_color="green", annotation_text="Min Edge")
+            fig.add_hline(y=-min_edge*100, line_dash="dash", line_color="red")
 
             st.plotly_chart(fig, use_container_width=True)
         else:
-            st.info("No active markets found. Markets may be closed or unavailable.")
+            st.info("No signals available. Enable Demo Mode or wait for real markets.")
 
     # =====================
     # TAB 2: Forecasts
@@ -549,14 +723,12 @@ def main():
         st.markdown(f"**Forecast Date:** {date.today() + timedelta(days=1)}")
 
         if forecasts:
-            # Forecast cards in a grid
             cols = st.columns(min(len(forecasts), 3))
 
             for i, (city_key, fc) in enumerate(forecasts.items()):
                 with cols[i % 3]:
                     st.markdown(f"### {fc['city']}")
 
-                    # Temperature gauge
                     fig = go.Figure(go.Indicator(
                         mode="gauge+number",
                         value=fc['high_mean'],
@@ -572,28 +744,18 @@ def main():
                                 {'range': [70, 85], 'color': "#ffcc80"},
                                 {'range': [85, 100], 'color': "#ffab91"},
                             ],
-                            'threshold': {
-                                'line': {'color': "black", 'width': 4},
-                                'thickness': 0.75,
-                                'value': fc['high_mean']
-                            }
                         }
                     ))
                     fig.update_layout(height=200, margin=dict(l=20, r=20, t=40, b=20))
                     st.plotly_chart(fig, use_container_width=True)
 
                     st.metric("Low", f"{fc['low_mean']:.1f}°F", f"±{fc['low_std']:.1f}°F", delta_color="off")
-
-                    # Confidence bar
-                    conf_color = "green" if fc['confidence'] > 0.7 else ("orange" if fc['confidence'] > 0.5 else "red")
                     st.progress(fc['confidence'], text=f"Confidence: {fc['confidence']:.0%}")
                     st.caption(f"{fc['model_count']} models • 90% CI: {fc['high_ci_lower']:.0f}-{fc['high_ci_upper']:.0f}°F")
-
                     st.markdown("---")
 
-            # Temperature comparison chart
+            # Temperature comparison
             st.subheader("Temperature Comparison")
-
             df_temps = pd.DataFrame([
                 {"City": fc["city"], "High": fc["high_mean"], "Low": fc["low_mean"],
                  "High_err": fc["high_std"], "Low_err": fc["low_std"]}
@@ -607,7 +769,6 @@ def main():
             fig.add_trace(go.Bar(name='Low', x=df_temps['City'], y=df_temps['Low'],
                                 error_y=dict(type='data', array=df_temps['Low_err']),
                                 marker_color='#2196f3'))
-
             fig.update_layout(barmode='group', title="Forecasted Temperatures with Uncertainty",
                             yaxis_title="Temperature (°F)", height=400)
             st.plotly_chart(fig, use_container_width=True)
@@ -618,57 +779,48 @@ def main():
     with tab3:
         st.header("📈 Polymarket Weather Markets")
 
+        if use_demo:
+            st.info("🎮 **Demo Markets** - These are simulated markets based on real forecasts. Disable 'Demo Mode' in sidebar to search for real Polymarket markets.")
+
         if markets:
-            st.success(f"Found {len(markets)} active markets")
+            st.success(f"Found {len(markets)} {'demo' if use_demo else 'active'} markets")
 
             for market in markets:
-                with st.expander(f"**{market['city'].upper()}** - Over {market['threshold']}°F", expanded=True):
+                with st.expander(f"**{market['city'].upper()}** - Over {market['threshold']}°F {'🎮' if market.get('is_demo') else ''}", expanded=True):
                     col1, col2, col3, col4 = st.columns(4)
 
                     with col1:
-                        st.metric("YES Price", f"${market['yes_price']:.2f}",
-                                help="Price to buy YES (probability market assigns)")
+                        st.metric("YES Price", f"${market['yes_price']:.2f}")
                     with col2:
                         st.metric("NO Price", f"${market['no_price']:.2f}")
                     with col3:
                         st.metric("Volume", f"${market['volume']:,.0f}")
                     with col4:
-                        # Compare with forecast
                         city_key = market["city"].lower()
                         if city_key in forecasts:
                             our_prob = 1 - stats.norm.cdf(market["threshold"],
                                                           loc=forecasts[city_key]["high_mean"],
                                                           scale=max(forecasts[city_key]["high_std"], 2))
                             edge = our_prob - market["yes_price"]
-                            st.metric("Our Edge", f"{edge:+.1%}",
-                                    delta=f"We say {our_prob:.0%}")
+                            st.metric("Our Edge", f"{edge:+.1%}", delta=f"We say {our_prob:.0%}")
 
                     st.markdown(f"**Question:** {market['question']}")
                     st.markdown(f"**Target Date:** {market['target_date']} | **Type:** {market['market_type']}")
         else:
-            st.warning("No active weather markets found on Polymarket")
-            st.info("""
-            **Why no markets?**
-            - Weather markets may not be active right now
-            - Markets might use different question formats
-            - Try refreshing later
-
-            The system will automatically detect markets when they become available.
-            """)
+            st.warning("No markets found")
+            st.info("Enable Demo Mode in the sidebar to test with simulated markets.")
 
     # =====================
     # TAB 4: Model Comparison
     # =====================
     with tab4:
         st.header("🔬 Model Comparison")
-        st.markdown("Compare forecasts from different weather models")
 
         if model_comparison:
             for city_key, data in model_comparison.items():
                 st.subheader(data["city"])
 
                 if data["models"]:
-                    # Create comparison chart
                     models = list(data["models"].keys())
                     highs = [data["models"][m]["high"] for m in models]
                     lows = [data["models"][m]["low"] for m in models]
@@ -677,31 +829,26 @@ def main():
                     fig.add_trace(go.Bar(name='High', x=models, y=highs, marker_color='#ff5722'))
                     fig.add_trace(go.Bar(name='Low', x=models, y=lows, marker_color='#2196f3'))
 
-                    # Add ensemble line
                     if city_key in forecasts:
                         fig.add_hline(y=forecasts[city_key]["high_mean"], line_dash="dash",
                                     line_color="red", annotation_text="Ensemble High")
 
                     fig.update_layout(barmode='group', height=300,
-                                    yaxis_title="Temperature (°F)",
-                                    xaxis_title="Model")
+                                    yaxis_title="Temperature (°F)", xaxis_title="Model")
                     st.plotly_chart(fig, use_container_width=True)
 
-                    # Model agreement metric
                     if len(highs) > 1:
                         spread = max(highs) - min(highs)
                         agreement = "High" if spread < 3 else ("Medium" if spread < 6 else "Low")
                         st.metric("Model Agreement", agreement, f"Spread: {spread:.1f}°F")
-                else:
-                    st.info("No model data available")
 
                 st.markdown("---")
 
     # =====================
-    # TAB 5: Multi-Day Forecasts
+    # TAB 5: Multi-Day
     # =====================
     with tab5:
-        st.header("📅 5-Day Forecast")
+        st.header("📅 7-Day Forecast")
 
         if multi_day:
             city_select = st.selectbox("Select City", list(multi_day.keys()),
@@ -711,35 +858,22 @@ def main():
                 data = multi_day[city_select]
                 df = pd.DataFrame(data["daily"])
 
-                # Line chart
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(x=df['date'], y=df['high'], name='High',
-                                        line=dict(color='#ff5722', width=3),
-                                        mode='lines+markers'))
+                                        line=dict(color='#ff5722', width=3), mode='lines+markers'))
                 fig.add_trace(go.Scatter(x=df['date'], y=df['low'], name='Low',
-                                        line=dict(color='#2196f3', width=3),
-                                        mode='lines+markers'))
-
-                # Fill between
+                                        line=dict(color='#2196f3', width=3), mode='lines+markers'))
                 fig.add_trace(go.Scatter(
                     x=list(df['date']) + list(df['date'])[::-1],
                     y=list(df['high']) + list(df['low'])[::-1],
-                    fill='toself',
-                    fillcolor='rgba(255, 87, 34, 0.1)',
-                    line=dict(color='rgba(255,255,255,0)'),
-                    showlegend=False
+                    fill='toself', fillcolor='rgba(255, 87, 34, 0.1)',
+                    line=dict(color='rgba(255,255,255,0)'), showlegend=False
                 ))
-
-                fig.update_layout(
-                    title=f"{data['city']} - 7 Day Forecast",
-                    xaxis_title="Date",
-                    yaxis_title="Temperature (°F)",
-                    height=400,
-                    hovermode='x unified'
-                )
+                fig.update_layout(title=f"{data['city']} - 7 Day Forecast",
+                                xaxis_title="Date", yaxis_title="Temperature (°F)",
+                                height=400, hovermode='x unified')
                 st.plotly_chart(fig, use_container_width=True)
 
-                # Data table
                 st.dataframe(df.style.format({"high": "{:.1f}°F", "low": "{:.1f}°F"}),
                            use_container_width=True)
 
@@ -774,26 +908,23 @@ def main():
             st.subheader("P&L Tracking")
 
             if st.session_state.trade_history:
-                # P&L over time
-                df_trades = pd.DataFrame(st.session_state.trade_history)
-
-                # Simple P&L simulation (random for demo)
                 cumulative_pnl = []
                 running = 0
                 for t in st.session_state.trade_history[::-1]:
-                    # Simulate outcome based on edge
-                    outcome = np.random.random() < (0.5 + t['edge'])
+                    outcome = random.random() < (0.5 + t['edge'])
                     pnl = t['size'] * (1 - t['price']) if outcome else -t['size'] * t['price']
                     running += pnl
                     cumulative_pnl.append(running)
 
+                st.session_state.pnl = cumulative_pnl[-1] if cumulative_pnl else 0
+
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(y=cumulative_pnl, mode='lines+markers',
                                         line=dict(color='green' if cumulative_pnl[-1] > 0 else 'red')))
-                fig.update_layout(title="Cumulative P&L", yaxis_title="$", height=300)
+                fig.update_layout(title="Cumulative P&L (Simulated)", yaxis_title="$", height=300)
                 st.plotly_chart(fig, use_container_width=True)
             else:
-                st.info("No trades yet. Execute trades from the Overview tab.")
+                st.info("No trades yet")
 
         st.markdown("---")
         st.subheader("Trade History")
@@ -806,8 +937,15 @@ def main():
                             'price': '{:.2f}',
                             'edge': '{:+.1%}'
                         }), use_container_width=True)
+
+            if st.button("Clear Trade History"):
+                st.session_state.trade_history = []
+                st.session_state.total_trades = 0
+                st.session_state.winning_trades = 0
+                st.session_state.pnl = 0
+                st.rerun()
         else:
-            st.info("No trades recorded this session")
+            st.info("No trades recorded")
 
     # =====================
     # TAB 7: Price Charts
@@ -819,25 +957,21 @@ def main():
             for market_id, prices in st.session_state.price_history.items():
                 if len(prices) > 1:
                     df = pd.DataFrame(prices)
-                    fig = px.line(df, x='time', y='price', title=f"Market: {market_id[:20]}...")
-                    fig.update_layout(yaxis_tickformat='.0%', height=300)
+                    fig = px.line(df, x='time', y='price', title=f"Market: {market_id[:30]}...")
+                    fig.update_layout(yaxis_tickformat='.2f', height=300)
                     st.plotly_chart(fig, use_container_width=True)
         else:
-            st.info("Price history will accumulate as you refresh data. Each refresh records current prices.")
+            st.info("Price history accumulates with each refresh")
 
-            # Demo chart
-            st.subheader("Demo: What price tracking looks like")
+            # Demo
             demo_times = pd.date_range(end=datetime.now(), periods=20, freq='30min')
             demo_prices = 0.5 + np.cumsum(np.random.randn(20) * 0.02)
             demo_prices = np.clip(demo_prices, 0.1, 0.9)
 
             fig = go.Figure()
-            fig.add_trace(go.Scatter(x=demo_times, y=demo_prices, mode='lines',
-                                    line=dict(color='#2196f3')))
+            fig.add_trace(go.Scatter(x=demo_times, y=demo_prices, mode='lines', line=dict(color='#2196f3')))
             fig.add_hline(y=0.5, line_dash="dash", line_color="gray")
-            fig.update_layout(title="Demo: YES Price Over Time",
-                            yaxis_title="Price ($)", yaxis_tickformat='.2f',
-                            height=300)
+            fig.update_layout(title="Demo: Price Over Time", yaxis_title="Price ($)", height=300)
             st.plotly_chart(fig, use_container_width=True)
 
     # =====================
@@ -854,18 +988,8 @@ def main():
 
         if st.session_state.alerts:
             for alert in st.session_state.alerts[:20]:
-                level_colors = {
-                    "info": "#e3f2fd",
-                    "success": "#e8f5e9",
-                    "warning": "#fff3e0",
-                    "danger": "#ffebee"
-                }
-                level_icons = {
-                    "info": "ℹ️",
-                    "success": "✅",
-                    "warning": "⚠️",
-                    "danger": "🚨"
-                }
+                level_colors = {"info": "#e3f2fd", "success": "#e8f5e9", "warning": "#fff3e0", "danger": "#ffebee"}
+                level_icons = {"info": "ℹ️", "success": "✅", "warning": "⚠️", "danger": "🚨"}
 
                 st.markdown(f"""
                 <div style="background-color: {level_colors.get(alert['level'], '#f5f5f5')};
@@ -875,26 +999,22 @@ def main():
                 </div>
                 """, unsafe_allow_html=True)
         else:
-            st.info("No alerts yet. Alerts appear when:")
-            st.markdown("""
-            - Strong trading signals are detected (>10% edge)
-            - Trades are executed
-            - Data is refreshed
-            - Errors occur
-            """)
+            st.info("No alerts yet")
 
     # Footer
     st.markdown("---")
+    market_status = "Demo Markets" if use_demo else ("Live Markets" if markets else "No Markets")
     st.markdown(
-        f"*Weather Trader v0.2.0* | "
-        f"*Last refresh: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}* | "
-        f"*{len(forecasts)} cities • {len(markets)} markets • {len(signals)} signals*"
+        f"*Weather Trader v0.3.0* | "
+        f"*{market_status}* | "
+        f"*{len(forecasts)} cities • {len(signals)} signals* | "
+        f"*Auto-Trade: {'ON' if auto_trade else 'OFF'}*"
     )
 
     # Auto-refresh
     if auto_refresh:
-        import time
-        time.sleep(300)  # 5 minutes
+        time.sleep(60)
+        st.cache_data.clear()
         st.rerun()
 
 
