@@ -170,6 +170,30 @@ class KalshiMarketFinder:
         Returns:
             List of WeatherMarket objects with populated brackets.
         """
+        # Auto-create client if not using context manager
+        created_client = False
+        if self._client is None:
+            self._client = httpx.AsyncClient(
+                base_url=self._base_url,
+                timeout=30.0,
+                headers={"Accept": "application/json"},
+            )
+            created_client = True
+
+        try:
+            return await self._find_weather_markets_impl(city_filter, days_ahead, active_only)
+        finally:
+            if created_client and self._client:
+                await self._client.aclose()
+                self._client = None
+
+    async def _find_weather_markets_impl(
+        self,
+        city_filter: Optional[str] = None,
+        days_ahead: int = 3,
+        active_only: bool = True,
+    ) -> list[WeatherMarket]:
+        """Internal implementation of market discovery."""
         markets = []
         cities = [city_filter] if city_filter else list(CITY_CONFIGS.keys())
 

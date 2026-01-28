@@ -1414,7 +1414,7 @@ def main():
                     <li>↩️ <strong>Edge Reversed</strong>: Edge turned negative</li>
                     <li>📉 <strong>Momentum Shift</strong>: Edge trending down while profitable</li>
                     <li>🛑 <strong>Stop Loss</strong>: Loss exceeds 30% of position</li>
-                    <li>📍 <strong>Trailing Stop</strong>: Gave back 50%+ of peak profit</li>
+                    <li>📍 <strong>Trailing Stop</strong>: Gave back 30%+ of peak profit</li>
                     <li>⏰ <strong>Time Decay</strong>: Approaching market settlement</li>
                 </ul>
             </div>
