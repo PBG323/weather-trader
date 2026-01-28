@@ -317,7 +317,7 @@ def generate_demo_markets(forecasts):
     return markets
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=600)
 def fetch_multi_day_forecasts():
     """Fetch 5-day forecasts for all cities."""
     return run_async(_fetch_multi_day())
@@ -350,7 +350,7 @@ async def _fetch_multi_day():
     return forecasts
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=600)
 def fetch_model_comparison():
     """Fetch forecasts from different models for comparison."""
     return run_async(_fetch_model_comparison())
@@ -440,7 +440,7 @@ async def _fetch_real_markets():
     return markets
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=600)
 def fetch_forecasts_with_models():
     """Fetch forecasts with individual model data."""
     return run_async(_fetch_forecasts_with_models())
@@ -457,11 +457,11 @@ def can_call_tomorrow_io() -> bool:
     """Check if we can make a Tomorrow.io API call (rate limiting).
 
     Strategy: 500 calls/day, each cache miss uses ~5 calls (one per city).
-    With 5-minute cache TTL = max 12 cache misses/hour = 60 calls/hour.
-    Over 8 hours = 480 calls, within the 500 limit.
+    With 10-minute cache TTL = max 6 cache misses/hour = 30 calls/hour.
+    Over 16 hours = 480 calls, within the 500 limit.
 
-    No per-call cooldown needed since @st.cache_data(ttl=300) already
-    prevents calls more than once per 5 minutes.
+    No per-call cooldown needed since @st.cache_data(ttl=600) already
+    prevents calls more than once per 10 minutes.
     """
     global _tomorrow_io_calls_today, _tomorrow_io_call_date
 
