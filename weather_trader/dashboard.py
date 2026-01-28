@@ -42,7 +42,7 @@ from weather_trader.config import get_all_cities, get_city_config, config
 from weather_trader.apis import OpenMeteoClient, TomorrowIOClient, NWSClient
 from weather_trader.models import EnsembleForecaster, BiasCorrector
 from weather_trader.models.ensemble import ModelForecast
-from weather_trader.polymarket import WeatherMarketFinder, PolymarketAuth
+from weather_trader.polymarket import WeatherMarketFinder, PolymarketAuth, PolymarketClient
 from weather_trader.strategy import ExpectedValueCalculator
 from weather_trader.trading import (
     TradingConfig, PositionManager, RiskManager, ExecutionEngine,
@@ -145,6 +145,12 @@ if 'auto_trader' not in st.session_state:
         risk_manager=st.session_state.risk_manager
     )
 
+# Polymarket live trading client (initialized lazily when live mode is selected)
+if 'polymarket_client' not in st.session_state:
+    st.session_state.polymarket_client = None
+if 'live_wallet_validated' not in st.session_state:
+    st.session_state.live_wallet_validated = False
+
 
 # ========================
 # PROBABILITY CLIPPING & CONTINUITY CORRECTION
@@ -242,7 +248,10 @@ def generate_demo_markets(forecasts):
     markets = []
     target_date = date.today() + timedelta(days=1)
 
-    for city_key, fc in forecasts.items():
+    for city_key in get_all_cities():
+        if city_key not in forecasts:
+            continue
+        fc = forecasts[city_key]
         city_config = get_city_config(city_key)
         forecast_high = fc["high_mean"]
         forecast_std = max(fc["high_std"], 2.0)
@@ -276,7 +285,7 @@ def generate_demo_markets(forecasts):
             market_noise = random.uniform(-0.10, 0.10)
             market_prob = max(0.01, min(0.99, fair_prob + market_noise))
 
-            condition_id = f"demo_{city_key}_{temp_low}_{temp_high}"
+            condition_id = f"demo_{city_key}_{target_date}_{temp_low}_{temp_high}"
 
             markets.append({
                 "city": city_key,
@@ -489,9 +498,16 @@ def get_tomorrow_io_usage() -> dict:
 
 
 async def _fetch_forecasts_with_models():
-    """Fetch forecasts for all cities with model breakdown, including Tomorrow.io."""
+    """Fetch forecasts for all cities with model breakdown, including Tomorrow.io.
+
+    Generates forecasts for today through +3 days to match the market date range
+    from find_weather_markets(days_ahead=3). Stores date-specific entries
+    (e.g. forecasts["nyc_2026-01-28"]) for signal calculation, plus a backward-compat
+    city-level entry (forecasts["nyc"]) pointing to tomorrow's forecast for visualization.
+    """
     forecasts = {}
-    target_date = date.today() + timedelta(days=1)
+    target_dates = [date.today() + timedelta(days=d) for d in range(4)]  # today..+3
+    tomorrow = date.today() + timedelta(days=1)
 
     # Check if Tomorrow.io is available
     use_tomorrow_io = (
@@ -515,45 +531,60 @@ async def _fetch_forecasts_with_models():
             for city_key in get_all_cities():
                 city_config = get_city_config(city_key)
                 try:
-                    om_forecasts = await om_client.get_ensemble_forecast(city_config, days=3)
+                    om_forecasts = await om_client.get_ensemble_forecast(city_config, days=5)
 
-                    model_forecasts = []
-                    model_details = []
-
-                    # Add Open-Meteo models (exact date match only)
-                    for model_name, forecast_list in om_forecasts.items():
-                        for f in forecast_list:
-                            if f.timestamp.date() == target_date:
-                                if f.temperature_high is not None and f.temperature_low is not None:
-                                    model_forecasts.append(ModelForecast(
-                                        model_name=model_name,
-                                        forecast_high=f.temperature_high,
-                                        forecast_low=f.temperature_low,
-                                    ))
-                                    model_details.append({
-                                        "model": model_name,
-                                        "high": f.temperature_high,
-                                        "low": f.temperature_low
-                                    })
-                                else:
-                                    print(f"{city_key}/{model_name}: date matched but temps are None")
-                                break
-                        else:
-                            # No date match found - log available dates for debugging
-                            available = [f.timestamp.date().isoformat() for f in forecast_list]
-                            print(f"{city_key}/{model_name}: no match for {target_date}, "
-                                  f"available dates: {available}")
-
-                    # Fallback: if ensemble returned nothing, try basic forecast endpoint
-                    if not model_forecasts:
-                        print(f"{city_key}: ensemble empty, trying basic forecast")
+                    # Fetch Tomorrow.io once per city (outside date loop)
+                    tm_forecasts_list = None
+                    if tm_client:
                         try:
-                            from weather_trader.apis.open_meteo import WeatherModel
-                            basic = await om_client.get_daily_forecast(
-                                city_config, WeatherModel.BEST_MATCH, days=3)
-                            for f in basic:
-                                if f.temperature_high is not None and f.temperature_low is not None:
-                                    if f.timestamp.date() == target_date or not model_forecasts:
+                            tm_forecasts_list = await tm_client.get_daily_forecast(city_config, days=5)
+                            tm_call_count += 1
+                        except Exception as e:
+                            print(f"Tomorrow.io error for {city_key}: {e}")
+
+                    # Lazy-loaded fallback for basic forecast (fetched at most once per city)
+                    basic_forecasts = None
+                    basic_forecasts_fetched = False
+
+                    for target_date in target_dates:
+                        model_forecasts = []
+                        model_details = []
+
+                        # Add Open-Meteo models (exact date match only)
+                        for model_name, forecast_list in om_forecasts.items():
+                            for f in forecast_list:
+                                if f.timestamp.date() == target_date:
+                                    if f.temperature_high is not None and f.temperature_low is not None:
+                                        model_forecasts.append(ModelForecast(
+                                            model_name=model_name,
+                                            forecast_high=f.temperature_high,
+                                            forecast_low=f.temperature_low,
+                                        ))
+                                        model_details.append({
+                                            "model": model_name,
+                                            "high": f.temperature_high,
+                                            "low": f.temperature_low
+                                        })
+                                    else:
+                                        print(f"{city_key}/{model_name}: date matched but temps are None")
+                                    break
+
+                        # Fallback: if ensemble returned nothing for this date, try basic forecast
+                        if not model_forecasts:
+                            if not basic_forecasts_fetched:
+                                basic_forecasts_fetched = True
+                                print(f"{city_key}: ensemble empty for {target_date}, trying basic forecast")
+                                try:
+                                    from weather_trader.apis.open_meteo import WeatherModel
+                                    basic_forecasts = await om_client.get_daily_forecast(
+                                        city_config, WeatherModel.BEST_MATCH, days=5)
+                                except Exception as fallback_err:
+                                    print(f"{city_key}: basic forecast fallback failed: {fallback_err}")
+                                    basic_forecasts = []
+
+                            if basic_forecasts:
+                                for f in basic_forecasts:
+                                    if f.timestamp.date() == target_date and f.temperature_high is not None and f.temperature_low is not None:
                                         model_forecasts = [ModelForecast(
                                             model_name="best_match",
                                             forecast_high=f.temperature_high,
@@ -564,17 +595,11 @@ async def _fetch_forecasts_with_models():
                                             "high": f.temperature_high,
                                             "low": f.temperature_low
                                         }]
-                                        if f.timestamp.date() == target_date:
-                                            break
-                        except Exception as fallback_err:
-                            print(f"{city_key}: basic forecast fallback also failed: {fallback_err}")
+                                        break
 
-                    # Add Tomorrow.io if available
-                    if tm_client:
-                        try:
-                            tm_forecasts = await tm_client.get_daily_forecast(city_config, days=3)
-                            tm_call_count += 1
-                            for f in tm_forecasts:
+                        # Add Tomorrow.io for this date
+                        if tm_forecasts_list:
+                            for f in tm_forecasts_list:
                                 if f.timestamp.date() == target_date:
                                     if f.temperature_high is not None and f.temperature_low is not None:
                                         model_forecasts.append(ModelForecast(
@@ -588,30 +613,36 @@ async def _fetch_forecasts_with_models():
                                             "low": f.temperature_low
                                         })
                                     break
-                        except Exception as e:
-                            print(f"Tomorrow.io error for {city_key}: {e}")
 
-                    if model_forecasts:
-                        ens = ensemble.create_ensemble(
-                            city_config, model_forecasts, target_date,
-                            apply_bias_correction=False
-                        )
-                        forecasts[city_key] = {
-                            "city": city_config.name,
-                            "high_mean": float(ens.high_mean),
-                            "high_std": float(ens.high_std),
-                            "low_mean": float(ens.low_mean),
-                            "low_std": float(ens.low_std),
-                            "confidence": float(ens.confidence),
-                            "model_count": ens.model_count,
-                            "date": target_date,
-                            "models": model_details,
-                            "high_ci_lower": float(ens.high_ci_lower),
-                            "high_ci_upper": float(ens.high_ci_upper),
-                        }
-                        print(f"[Forecast] {city_key}: high={ens.high_mean:.1f}F std={ens.high_std:.1f} ({ens.model_count} models)")
-                    else:
-                        print(f"WARNING: No forecast data for {city_key} on {target_date}")
+                        if model_forecasts:
+                            ens = ensemble.create_ensemble(
+                                city_config, model_forecasts, target_date,
+                                apply_bias_correction=False
+                            )
+                            entry = {
+                                "city": city_config.name,
+                                "high_mean": float(ens.high_mean),
+                                "high_std": float(ens.high_std),
+                                "low_mean": float(ens.low_mean),
+                                "low_std": float(ens.low_std),
+                                "confidence": float(ens.confidence),
+                                "model_count": ens.model_count,
+                                "date": target_date,
+                                "models": model_details,
+                                "high_ci_lower": float(ens.high_ci_lower),
+                                "high_ci_upper": float(ens.high_ci_upper),
+                            }
+
+                            # Date-specific key for signal calculation
+                            forecasts[f"{city_key}_{target_date.isoformat()}"] = entry
+
+                            # Backward-compat city key = tomorrow's forecast
+                            if target_date == tomorrow:
+                                forecasts[city_key] = entry
+
+                            print(f"[Forecast] {city_key} ({target_date}): high={ens.high_mean:.1f}F std={ens.high_std:.1f} ({ens.model_count} models)")
+                        else:
+                            print(f"WARNING: No forecast data for {city_key} on {target_date}")
 
                 except Exception as e:
                     print(f"ERROR fetching forecast for {city_key}: {e}")
@@ -622,7 +653,9 @@ async def _fetch_forecasts_with_models():
                     record_tomorrow_io_call(tm_call_count)
                     print(f"Tomorrow.io: {tm_call_count} city calls (#{_tomorrow_io_calls_today} today)")
 
-    print(f"[Forecasts] Loaded {len(forecasts)} cities: {list(forecasts.keys())}")
+    city_count = len([k for k in forecasts if '_' not in k or not k.split('_')[-1][:4].isdigit()])
+    date_count = len([k for k in forecasts if '_' in k and k.split('_')[-1][:4].isdigit()])
+    print(f"[Forecasts] Loaded {city_count} cities, {date_count} date-specific entries: {list(forecasts.keys())}")
     return forecasts
 
 
@@ -651,10 +684,12 @@ def calculate_signals(forecasts, markets, show_all_outcomes=False):
             continue
 
         city_key = group_markets[0]["city"].lower()
-        if city_key not in forecasts:
-            continue
+        target_date = group_markets[0].get("target_date", date.today())
+        date_key = f"{city_key}_{target_date.isoformat()}"
 
-        fc = forecasts[city_key]
+        fc = forecasts.get(date_key) or forecasts.get(city_key)
+        if not fc:
+            continue
         forecast_temp_f = fc["high_mean"]  # Forecast is always in Fahrenheit
         forecast_std_f = max(fc["high_std"], 2.0)
         market_temp_unit = group_markets[0].get("temp_unit", "F")
@@ -790,6 +825,53 @@ def execute_trade(signal, size, is_live=False):
         forecast_prob=signal["our_prob"]
     )
 
+    # Submit real order to Polymarket if live trading
+    exchange_order_id = None
+    if is_live and st.session_state.polymarket_client is not None:
+        try:
+            from weather_trader.polymarket.client import (
+                Order as PolyOrder, OrderSide as PolySide,
+                OrderType as PolyOrderType,
+            )
+
+            token_id = signal.get("token_id", "")
+            if not token_id:
+                token_id = signal.get("condition_id", "")
+
+            poly_side = PolySide.BUY  # Entry orders are always buys
+            poly_order = PolyOrder(
+                market=None,
+                side=poly_side,
+                token_id=token_id,
+                size=shares,
+                price=actual_cost_per_share,
+                order_type=PolyOrderType.LIMIT,
+            )
+
+            # ClobClient is synchronous; dashboard runs synchronously in Streamlit
+            clob = st.session_state.polymarket_client._init_clob_client()
+            from py_clob_client.clob_types import OrderArgs, OrderType as ClobOrderType
+            from py_clob_client.order_builder.constants import BUY
+
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=round(actual_cost_per_share, 2),
+                size=round(shares, 2),
+                side=BUY,
+            )
+            signed_order = clob.create_order(order_args)
+            response = clob.post_order(signed_order, ClobOrderType.GTC)
+
+            if isinstance(response, dict) and response.get("success"):
+                exchange_order_id = response.get("orderID")
+                add_alert(f"Live order submitted: {exchange_order_id}", "success")
+            else:
+                error_msg = response if isinstance(response, str) else str(response)
+                add_alert(f"Live order submission issue: {error_msg}", "warning")
+
+        except Exception as e:
+            add_alert(f"Live order failed (position still tracked): {e}", "warning")
+
     # Also add to legacy open_positions for UI compatibility
     legacy_position = {
         "id": position.position_id,
@@ -810,6 +892,7 @@ def execute_trade(signal, size, is_live=False):
         "target_date": target_date,
         "unrealized_pnl": 0.0,
         "position_obj": position,  # Link to actual Position object
+        "exchange_order_id": exchange_order_id,
     }
 
     st.session_state.open_positions.insert(0, legacy_position)
@@ -864,7 +947,12 @@ def check_smart_exits(forecasts, markets):
         current_price = market_prices.get(cid, legacy_pos["current_price"])
 
         # Get current forecast probability
-        fc = forecasts.get(city_key, {})
+        target_date = legacy_pos.get("target_date")
+        if target_date and hasattr(target_date, 'isoformat'):
+            date_key = f"{city_key}_{target_date.isoformat()}"
+            fc = forecasts.get(date_key) or forecasts.get(city_key, {})
+        else:
+            fc = forecasts.get(city_key, {})
         forecast_prob = legacy_pos.get("forecast_prob", 0.5)
 
         if fc:
@@ -1135,7 +1223,30 @@ def main():
     is_live = mode == "🔴 Live Trading"
 
     if is_live:
-        st.sidebar.error("⚠️ LIVE TRADING ENABLED")
+        # Validate wallet and initialize PolymarketClient for live trading
+        auth = PolymarketAuth()
+        if not auth.is_configured:
+            st.sidebar.error("⚠️ Wallet not configured! Set POLYGON_PRIVATE_KEY in .env")
+            st.sidebar.warning("Falling back to Dry Run mode.")
+            is_live = False
+        else:
+            if st.session_state.polymarket_client is None:
+                try:
+                    client = PolymarketClient(auth=auth)
+                    # Trigger ClobClient initialization to validate credentials
+                    client._init_clob_client()
+                    st.session_state.polymarket_client = client
+                    st.session_state.live_wallet_validated = True
+                    st.sidebar.success(f"Wallet connected: {auth.address[:6]}...{auth.address[-4:]}")
+                except Exception as e:
+                    st.sidebar.error(f"⚠️ Live trading init failed: {e}")
+                    st.sidebar.warning("Falling back to Dry Run mode.")
+                    is_live = False
+            else:
+                st.sidebar.success(f"Wallet connected: {auth.address[:6]}...{auth.address[-4:]}")
+
+            if is_live:
+                st.sidebar.error("⚠️ LIVE TRADING ENABLED - Real orders will be submitted")
 
     # Demo mode toggle
     st.sidebar.markdown("---")
