@@ -832,7 +832,11 @@ def execute_trade(signal, size, is_live=False):
                 add_alert("Cannot submit order: invalid ticker (demo market?)", "warning")
             else:
                 kalshi_side = "yes" if side == "YES" else "no"
-                price_cents = max(1, min(99, int(round(actual_cost_per_share * 100))))
+                # Add offset to improve fill rate (pay slightly more to beat the spread)
+                # Default: 2 cents more aggressive than fair value
+                fill_offset = st.session_state.get("fill_offset_cents", 2)
+                base_price = int(round(actual_cost_per_share * 100))
+                price_cents = max(1, min(99, base_price + fill_offset))
                 count = max(1, int(round(shares)))
 
                 async def _place_order():
@@ -1274,6 +1278,25 @@ def main():
         value=auto_trade,
         help="Automatically refresh data for auto-trading"
     )
+
+    st.sidebar.markdown("---")
+
+    # Fill aggressiveness setting
+    st.sidebar.markdown("### 📊 Order Settings")
+    fill_offset = st.sidebar.slider(
+        "Fill Offset (cents)",
+        min_value=0,
+        max_value=10,
+        value=2,
+        help="Add cents to limit price to improve fill rate. 0=exact price, 5=aggressive"
+    )
+    st.session_state.fill_offset_cents = fill_offset
+    if fill_offset == 0:
+        st.sidebar.caption("Orders at exact fair value (may not fill)")
+    elif fill_offset <= 2:
+        st.sidebar.caption("Conservative: small premium for fills")
+    else:
+        st.sidebar.caption("Aggressive: pays more for faster fills")
 
     st.sidebar.markdown("---")
 
