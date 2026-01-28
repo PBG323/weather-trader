@@ -153,8 +153,8 @@ class KalshiClient:
         }
 
         if order_type == "limit":
+            # Kalshi expects yes_price only (not both yes_price and no_price)
             body["yes_price"] = price_cents if side == "yes" else (100 - price_cents)
-            body["no_price"] = (100 - price_cents) if side == "yes" else price_cents
 
         try:
             data = await self._request("POST", "/portfolio/orders", json=body)
@@ -171,9 +171,10 @@ class KalshiClient:
         except httpx.HTTPStatusError as e:
             error_body = ""
             try:
-                error_body = e.response.json().get("message", str(e))
+                error_json = e.response.json()
+                error_body = error_json.get("message", "") or error_json.get("error", "") or str(error_json)
             except Exception:
-                error_body = str(e)
+                error_body = e.response.text or str(e)
             return OrderResult(
                 success=False,
                 message=f"Order failed: {error_body}",
