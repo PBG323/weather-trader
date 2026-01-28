@@ -274,7 +274,7 @@ class EnsembleForecaster:
         """
         Generate forecast probability for a specific market contract.
 
-        Polymarket temperature markets are typically structured as:
+        Kalshi temperature markets are typically structured as:
         "Will NYC high temperature be over/under X degrees?"
 
         Args:

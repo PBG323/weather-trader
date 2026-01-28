@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, AsyncMock
 
 from weather_trader.config import get_city_config
 from weather_trader.models.ensemble import EnsembleForecast, ModelForecast
-from weather_trader.polymarket.markets import WeatherMarket, MarketType
+from weather_trader.kalshi.markets import WeatherMarket, TemperatureBracket
 from weather_trader.strategy.expected_value import (
     ExpectedValueCalculator, TradeSignal, SignalStrength
 )
@@ -16,6 +16,38 @@ from weather_trader.strategy.position_sizing import (
     PositionSizer, PositionRecommendation
 )
 from weather_trader.strategy.executor import TradeExecutor, ExecutionResult
+
+
+def _make_market(yes_price=0.50, city="nyc", target=None):
+    """Helper to create a WeatherMarket with brackets for testing.
+
+    Default bracket is 52-58°F, centered near the sample forecast mean of 55°F.
+    With mean=55, std=3: P(52 ≤ T ≤ 58) ≈ 0.68.
+    """
+    if target is None:
+        target = date(2024, 1, 15)
+    city_config = get_city_config(city)
+    bracket = TemperatureBracket(
+        ticker="KXHIGHNY-24JAN15-T52",
+        event_ticker="KXHIGHNY-24JAN15",
+        description="52-58°F",
+        temp_low=52.0,
+        temp_high=58.0,
+        yes_price_cents=int(yes_price * 100),
+        no_price_cents=int((1 - yes_price) * 100),
+        volume=10000,
+        open_interest=5000,
+    )
+    return WeatherMarket(
+        event_ticker="KXHIGHNY-24JAN15",
+        series_ticker="KXHIGHNY",
+        city=city,
+        city_config=city_config,
+        target_date=target,
+        brackets=[bracket],
+        is_active=True,
+        question="Will NYC high temperature be 52-58°F on Jan 15?",
+    )
 
 
 class TestExpectedValueCalculator:
@@ -31,32 +63,14 @@ class TestExpectedValueCalculator:
 
     @pytest.fixture
     def sample_market(self):
-        return WeatherMarket(
-            condition_id="test_123",
-            question_id="q_123",
-            market_slug="nyc-temp-jan-15",
-            city="nyc",
-            city_config=get_city_config("nyc"),
-            target_date=date(2024, 1, 15),
-            threshold=50.0,
-            market_type=MarketType.HIGH_OVER,
-            yes_token_id="yes_token",
-            no_token_id="no_token",
-            yes_price=0.50,
-            no_price=0.50,
-            volume=10000,
-            liquidity=5000,
-            is_active=True,
-            end_date=datetime(2024, 1, 16),
-            question="Will NYC high temperature be over 50°F on Jan 15?"
-        )
+        return _make_market(yes_price=0.50)
 
     @pytest.fixture
     def sample_forecast(self):
         return EnsembleForecast(
             date=date(2024, 1, 15),
             city="New York City",
-            high_mean=55.0,  # Well above 50, should be bullish
+            high_mean=55.0,
             high_median=55.0,
             low_mean=40.0,
             low_median=40.0,
@@ -72,51 +86,56 @@ class TestExpectedValueCalculator:
         )
 
     def test_calculate_positive_edge(self, calculator, sample_market, sample_forecast):
-        """Test calculating positive edge (forecast > market)."""
-        signal = calculator.calculate_ev(sample_market, sample_forecast)
+        """Test calculating positive edge (forecast prob > market price).
 
-        # Forecast of 55 should give high probability of "over 50"
-        assert signal.forecast_probability > 0.7
-        assert signal.edge > 0  # Positive edge vs 0.50 market price
+        Bracket 52-58°F with forecast mean=55, std=3 → P ≈ 0.68.
+        Market price 50 cents → edge ≈ +0.18.
+        """
+        bracket = sample_market.brackets[0]
+        signal = calculator.calculate_ev(sample_market, bracket, sample_forecast)
+
+        assert signal.forecast_probability > 0.6
+        assert signal.edge > 0
         assert signal.side == "YES"
         assert signal.is_tradeable
 
     def test_calculate_negative_edge(self, calculator, sample_market, sample_forecast):
-        """Test calculating negative edge (forecast < market)."""
-        # Adjust market price to be higher than our forecast probability
-        sample_market.yes_price = 0.95
+        """Test calculating negative edge (forecast prob < market price)."""
+        sample_market.brackets[0].yes_price_cents = 95
+        bracket = sample_market.brackets[0]
 
-        signal = calculator.calculate_ev(sample_market, sample_forecast)
+        signal = calculator.calculate_ev(sample_market, bracket, sample_forecast)
 
-        assert signal.edge < 0  # Negative edge
+        assert signal.edge < 0
         assert signal.side == "NO"
 
     def test_neutral_signal_low_edge(self, calculator, sample_market, sample_forecast):
         """Test that small edge results in neutral signal."""
-        # Set market close to forecast probability
-        sample_market.yes_price = 0.82  # Close to actual probability
+        # Set market price close to forecast probability (~0.68) for small edge
+        sample_market.brackets[0].yes_price_cents = 67
+        bracket = sample_market.brackets[0]
 
-        signal = calculator.calculate_ev(sample_market, sample_forecast)
+        signal = calculator.calculate_ev(sample_market, bracket, sample_forecast)
 
-        # Edge should be small
         assert abs(signal.edge) < 0.05
         assert signal.signal == SignalStrength.NEUTRAL
         assert not signal.is_tradeable
 
     def test_neutral_signal_low_confidence(self, calculator, sample_market, sample_forecast):
         """Test that low confidence results in neutral signal."""
-        sample_forecast.confidence = 0.5  # Below threshold
+        sample_forecast.confidence = 0.5
+        bracket = sample_market.brackets[0]
 
-        signal = calculator.calculate_ev(sample_market, sample_forecast)
+        signal = calculator.calculate_ev(sample_market, bracket, sample_forecast)
 
         assert signal.signal == SignalStrength.NEUTRAL
 
     def test_strong_signal_detection(self, calculator, sample_market, sample_forecast):
         """Test detection of strong signals."""
-        # Set market way off from forecast
-        sample_market.yes_price = 0.30  # Market says 30%, we say ~85%
+        sample_market.brackets[0].yes_price_cents = 30
+        bracket = sample_market.brackets[0]
 
-        signal = calculator.calculate_ev(sample_market, sample_forecast)
+        signal = calculator.calculate_ev(sample_market, bracket, sample_forecast)
 
         assert signal.signal == SignalStrength.STRONG_BUY_YES
         assert signal.edge > 0.15
@@ -130,6 +149,7 @@ class TestExpectedValueCalculator:
 
         assert len(signals) == 1
         assert signals[0].market == sample_market
+        assert signals[0].bracket == sample_market.brackets[0]
 
 
 class TestPositionSizer:
@@ -146,56 +166,33 @@ class TestPositionSizer:
 
     @pytest.fixture
     def sample_signal(self):
-        market = WeatherMarket(
-            condition_id="test_123",
-            question_id="q_123",
-            market_slug="nyc-temp",
-            city="nyc",
-            city_config=get_city_config("nyc"),
-            target_date=date(2024, 1, 15),
-            threshold=50.0,
-            market_type=MarketType.HIGH_OVER,
-            yes_token_id="yes_token",
-            no_token_id="no_token",
-            yes_price=0.50,
-            no_price=0.50,
-            volume=10000,
-            liquidity=5000,
-            is_active=True,
-            end_date=datetime(2024, 1, 16),
-            question="Test question"
-        )
+        market = _make_market(yes_price=0.50)
 
         return TradeSignal(
             market=market,
+            bracket=market.brackets[0],
             forecast=MagicMock(confidence=0.85),
-            forecast_probability=0.70,  # 70% forecast
-            market_probability=0.50,    # 50% market
-            edge=0.20,                  # 20% edge
+            forecast_probability=0.70,
+            market_probability=0.50,
+            edge=0.20,
             expected_value=0.20,
             signal=SignalStrength.STRONG_BUY_YES,
             side="YES",
             confidence=0.85,
             model_agreement=0.90,
-            threshold=50.0,
+            threshold=55.0,
             is_high_temp=True,
             is_over_market=True,
         )
 
     def test_kelly_calculation(self, sizer):
         """Test Kelly criterion calculation."""
-        # 60% win probability, 1:1 odds
         kelly = sizer.calculate_kelly(win_prob=0.6, win_amount=1.0, lose_amount=1.0)
-
-        # Kelly = (p * b - q) / b = (0.6 * 1 - 0.4) / 1 = 0.2
         assert abs(kelly - 0.2) < 0.01
 
     def test_kelly_with_edge(self, sizer):
         """Test Kelly with different odds."""
-        # 55% probability with 2:1 payoff
         kelly = sizer.calculate_kelly(win_prob=0.55, win_amount=2.0, lose_amount=1.0)
-
-        # Kelly = (0.55 * 2 - 0.45) / 2 = 0.325
         assert abs(kelly - 0.325) < 0.01
 
     def test_position_sizing(self, sizer, sample_signal):
@@ -204,36 +201,32 @@ class TestPositionSizer:
 
         assert rec is not None
         assert rec.kelly_fraction > 0
-        assert rec.adjusted_kelly < rec.kelly_fraction  # Fractional Kelly
+        assert rec.adjusted_kelly < rec.kelly_fraction
         assert rec.recommended_size > 0
-        assert rec.recommended_size <= 500  # Max 5% of $10k
+        assert rec.recommended_size <= 500
 
     def test_position_capping(self, sizer, sample_signal):
         """Test that positions are capped at max size."""
-        # Create signal with very high edge to trigger capping
         sample_signal.edge = 0.50
         sample_signal.forecast_probability = 0.90
         sample_signal.expected_value = 0.50
 
         rec = sizer.size_position(sample_signal)
 
-        # Should be capped at 5% of bankroll
         assert rec.recommended_size <= 500
         assert rec.position_capped
 
     def test_daily_loss_limit(self, sizer, sample_signal):
         """Test daily loss limit enforcement."""
-        # Simulate losses
-        sizer.daily_pnl = -800  # $800 loss, limit is $1000
+        sizer.daily_pnl = -800
 
         rec = sizer.size_position(sample_signal)
 
-        # Should have reduced size due to approaching limit
-        assert rec.recommended_size <= 200  # Only $200 risk budget left
+        assert rec.recommended_size <= 200
 
     def test_cannot_trade_at_limit(self, sizer):
         """Test that trading stops at loss limit."""
-        sizer.daily_pnl = -1000  # At limit
+        sizer.daily_pnl = -1000
 
         can_trade, reason = sizer.can_trade()
 
@@ -247,7 +240,6 @@ class TestPositionSizer:
         recs = sizer.recommend_batch(signals, max_positions=3)
 
         assert len(recs) <= 3
-        # Total allocated should not exceed bankroll
         total_allocated = sum(r.recommended_size for r in recs)
         assert total_allocated <= 10000
 
@@ -286,28 +278,11 @@ class TestTradeExecutor:
 
     @pytest.fixture
     def sample_recommendation(self):
-        market = WeatherMarket(
-            condition_id="test_123",
-            question_id="q_123",
-            market_slug="nyc-temp",
-            city="nyc",
-            city_config=get_city_config("nyc"),
-            target_date=date(2024, 1, 15),
-            threshold=50.0,
-            market_type=MarketType.HIGH_OVER,
-            yes_token_id="yes_token",
-            no_token_id="no_token",
-            yes_price=0.50,
-            no_price=0.50,
-            volume=10000,
-            liquidity=5000,
-            is_active=True,
-            end_date=datetime(2024, 1, 16),
-            question="Test"
-        )
+        market = _make_market(yes_price=0.50)
 
         signal = TradeSignal(
             market=market,
+            bracket=market.brackets[0],
             forecast=MagicMock(),
             forecast_probability=0.70,
             market_probability=0.50,
@@ -317,7 +292,7 @@ class TestTradeExecutor:
             side="YES",
             confidence=0.85,
             model_agreement=0.90,
-            threshold=50.0,
+            threshold=55.0,
             is_high_temp=True,
             is_over_market=True,
         )
@@ -347,10 +322,9 @@ class TestTradeExecutor:
     @pytest.mark.asyncio
     async def test_slippage_rejection(self, executor, sample_recommendation, mock_client):
         """Test that high slippage trades are rejected."""
-        # Simulate high slippage
         mock_client.get_market_price = AsyncMock(return_value={
             "yes_bid": 0.45,
-            "yes_ask": 0.60,  # 20% higher than expected
+            "yes_ask": 0.60,
             "yes_mid": 0.525,
             "no_bid": 0.40,
             "no_ask": 0.55,
@@ -374,7 +348,6 @@ class TestTradeExecutor:
 
     def test_journal_tracking(self, executor, sample_recommendation):
         """Test that trades are journaled."""
-        # Simulate adding a result to journal
         result = ExecutionResult(
             recommendation=sample_recommendation,
             order_result=MagicMock(

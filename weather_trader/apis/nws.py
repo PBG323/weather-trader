@@ -1,10 +1,8 @@
 """
 National Weather Service (NWS) API Client
 
-Provides access to official weather station data that Polymarket uses for settlement.
-This is the source of truth for US cities.
-
-For international cities (Toronto, London), we use METAR data from aviation sources.
+Provides access to official weather station data that Kalshi uses for settlement.
+This is the source of truth — Kalshi settles on NWS Daily Climate Report data.
 """
 
 import httpx
@@ -255,7 +253,7 @@ class NWSClient:
         """
         Get official daily climate summary (high/low temperatures).
 
-        This is what Polymarket uses for settlement.
+        This is what Kalshi uses for settlement.
 
         Args:
             city_config: City configuration with station ID

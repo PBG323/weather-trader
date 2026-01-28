@@ -1,6 +1,5 @@
-# Polymarket Trading
-py-clob-client>=0.1.0      # Polymarket CLOB client
-web3>=6.0.0                 # Ethereum/Polygon interaction
+# Kalshi Trading
+cryptography>=41.0.0        # RSA key signing for Kalshi API auth
 
 # HTTP & Async
 httpx>=0.25.0               # Async HTTP client

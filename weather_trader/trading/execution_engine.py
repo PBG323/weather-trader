@@ -1,7 +1,7 @@
 """
 Execution Engine
 
-Handles order creation, submission, and tracking for Polymarket trades.
+Handles order creation, submission, and tracking for Kalshi trades.
 """
 
 from dataclasses import dataclass, field
@@ -48,7 +48,7 @@ class Order:
     order_id: str
     market_id: str
     condition_id: str
-    token_id: str               # Polymarket token ID for the outcome
+    ticker: str                  # Kalshi market ticker for the outcome
     city: str
     outcome_description: str
 
@@ -97,7 +97,7 @@ class ExecutionEngine:
 
     Handles:
     - Order creation and validation
-    - Order submission to Polymarket
+    - Order submission to Kalshi
     - Order status tracking
     - Fill processing
     - Position creation from fills
@@ -108,12 +108,12 @@ class ExecutionEngine:
         config: TradingConfig = None,
         position_manager: PositionManager = None,
         risk_manager: RiskManager = None,
-        polymarket_client=None  # Will be the actual client
+        kalshi_client=None  # Will be the actual client
     ):
         self.config = config or default_config
         self.position_manager = position_manager
         self.risk_manager = risk_manager
-        self.polymarket_client = polymarket_client
+        self.kalshi_client = kalshi_client
 
         self.orders: dict[str, Order] = {}
         self._order_counter = 0
@@ -126,7 +126,7 @@ class ExecutionEngine:
         self,
         market_id: str,
         condition_id: str,
-        token_id: str,
+        ticker: str,
         city: str,
         outcome_description: str,
         outcome_side: str,
@@ -140,9 +140,9 @@ class ExecutionEngine:
         Create an order to enter a new position.
 
         Args:
-            market_id: Polymarket market ID
+            market_id: Market ID (event_ticker)
             condition_id: Condition ID for the outcome
-            token_id: Token ID for the outcome
+            ticker: Kalshi market ticker for the outcome
             city: City for the weather market
             outcome_description: Human-readable outcome
             outcome_side: "YES" or "NO"
@@ -185,7 +185,7 @@ class ExecutionEngine:
             order_id=order_id,
             market_id=market_id,
             condition_id=condition_id,
-            token_id=token_id,
+            ticker=ticker,
             city=city,
             outcome_description=outcome_description,
             order_type=order_type,
@@ -232,7 +232,7 @@ class ExecutionEngine:
             order_id=order_id,
             market_id=position.market_id,
             condition_id=position.condition_id,
-            token_id="",  # Will need to look this up
+            ticker="",  # Will need to look this up
             city=position.city,
             outcome_description=position.outcome_description,
             order_type=order_type,
@@ -258,7 +258,7 @@ class ExecutionEngine:
 
     async def submit_order(self, order: Order) -> bool:
         """
-        Submit an order to Polymarket.
+        Submit an order to Kalshi.
 
         Returns True if submission was successful.
         """
@@ -270,18 +270,13 @@ class ExecutionEngine:
         order.status = OrderStatus.SUBMITTED
 
         # If no client, simulate success for testing
-        if self.polymarket_client is None:
-            logger.warning("No Polymarket client configured - simulating order submission")
-            # Simulate immediate fill for testing
+        if self.kalshi_client is None:
+            logger.warning("No Kalshi client configured - simulating order submission")
             await self._simulate_fill(order)
             return True
 
         try:
-            # Submit to Polymarket
-            if order.order_type == OrderType.MARKET:
-                result = await self._submit_market_order(order)
-            else:
-                result = await self._submit_limit_order(order)
+            result = await self._submit_kalshi_order(order)
 
             if result:
                 logger.info(f"Order {order.order_id} submitted successfully")
@@ -297,86 +292,44 @@ class ExecutionEngine:
             logger.error(f"Order {order.order_id} failed: {e}")
             return False
 
-    async def _submit_market_order(self, order: Order) -> bool:
-        """Submit a market order (FOK) to Polymarket."""
+    async def _submit_kalshi_order(self, order: Order) -> bool:
+        """Submit an order to Kalshi REST API."""
         try:
-            from ..polymarket.client import (
-                Order as PolyOrder, OrderSide as PolySide,
-                OrderType as PolyOrderType,
-            )
+            action = "buy" if order.side == OrderSide.BUY else "sell"
+            side = "yes" if order.outcome_side == "YES" else "no"
+            price_cents = max(1, min(99, int(round(order.price * 100))))
+            count = max(1, int(round(order.shares)))
+            order_type = "market" if order.order_type == OrderType.MARKET else "limit"
 
-            poly_order = PolyOrder(
-                market=None,
-                side=PolySide.BUY if order.side == OrderSide.BUY else PolySide.SELL,
-                token_id=order.token_id,
-                size=order.shares,
-                price=order.price,
-                order_type=PolyOrderType.FOK,
+            result = await self.kalshi_client.place_order(
+                ticker=order.ticker,
+                action=action,
+                side=side,
+                count=count,
+                price_cents=price_cents,
+                order_type=order_type,
             )
-
-            result = await self.polymarket_client.place_order(poly_order)
 
             if result.success:
                 order.exchange_order_id = result.order_id
-                order.filled_shares = result.filled_size if result.filled_size else order.shares
+                order.filled_shares = result.filled_count if result.filled_count else count
                 order.filled_price = result.filled_price if result.filled_price else order.price
                 order.filled_value = order.filled_shares * order.filled_price
                 order.filled_at = datetime.now()
                 order.status = OrderStatus.FILLED
                 self._process_fill(order)
-                logger.info(f"Market order {order.order_id} filled, exchange ID: {result.order_id}")
+                logger.info(f"Kalshi order {order.order_id} filled, exchange ID: {result.order_id}")
             else:
                 order.status = OrderStatus.REJECTED
                 order.error_message = result.message
-                logger.warning(f"Market order {order.order_id} rejected: {result.message}")
+                logger.warning(f"Kalshi order {order.order_id} rejected: {result.message}")
 
             return result.success
 
         except Exception as e:
             order.status = OrderStatus.REJECTED
             order.error_message = str(e)
-            logger.error(f"Market order {order.order_id} failed: {e}")
-            return False
-
-    async def _submit_limit_order(self, order: Order) -> bool:
-        """Submit a limit order (GTC) to Polymarket."""
-        try:
-            from ..polymarket.client import (
-                Order as PolyOrder, OrderSide as PolySide,
-                OrderType as PolyOrderType,
-            )
-
-            poly_order = PolyOrder(
-                market=None,
-                side=PolySide.BUY if order.side == OrderSide.BUY else PolySide.SELL,
-                token_id=order.token_id,
-                size=order.shares,
-                price=order.price,
-                order_type=PolyOrderType.LIMIT,
-            )
-
-            result = await self.polymarket_client.place_order(poly_order)
-
-            if result.success:
-                order.exchange_order_id = result.order_id
-                order.filled_shares = result.filled_size if result.filled_size else order.shares
-                order.filled_price = result.filled_price if result.filled_price else order.price
-                order.filled_value = order.filled_shares * order.filled_price
-                order.filled_at = datetime.now()
-                order.status = OrderStatus.FILLED
-                self._process_fill(order)
-                logger.info(f"Limit order {order.order_id} filled, exchange ID: {result.order_id}")
-            else:
-                order.status = OrderStatus.REJECTED
-                order.error_message = result.message
-                logger.warning(f"Limit order {order.order_id} rejected: {result.message}")
-
-            return result.success
-
-        except Exception as e:
-            order.status = OrderStatus.REJECTED
-            order.error_message = str(e)
-            logger.error(f"Limit order {order.order_id} failed: {e}")
+            logger.error(f"Kalshi order {order.order_id} failed: {e}")
             return False
 
     async def _simulate_fill(self, order: Order) -> None:
@@ -557,7 +510,7 @@ class AutoTrader:
         self,
         market_id: str,
         condition_id: str,
-        token_id: str,
+        ticker: str,
         city: str,
         outcome_description: str,
         outcome_side: str,
@@ -608,7 +561,7 @@ class AutoTrader:
         order, error = self.execution_engine.create_entry_order(
             market_id=market_id,
             condition_id=condition_id,
-            token_id=token_id,
+            ticker=ticker,
             city=city,
             outcome_description=outcome_description,
             outcome_side=outcome_side,

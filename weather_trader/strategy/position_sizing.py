@@ -62,7 +62,7 @@ class PositionSizer:
         Initialize position sizer.
 
         Args:
-            bankroll: Total trading capital (USDC)
+            bankroll: Total trading capital (USD)
             kelly_multiplier: Fraction of Kelly to use (default from config)
             max_position_percent: Max % of bankroll per position (default from config)
             daily_loss_limit_percent: Stop trading if down this % (default from config)
@@ -120,7 +120,7 @@ class PositionSizer:
         """
         # Determine win/lose amounts based on the side we're taking
         if signal.side == "YES":
-            entry_price = signal.market.yes_price
+            entry_price = signal.bracket.yes_price
             # If we buy YES at price P:
             # - Win: receive $1, profit = 1 - P
             # - Lose: receive $0, loss = P
@@ -129,7 +129,7 @@ class PositionSizer:
             win_prob = signal.forecast_probability
         else:
             # If we buy NO (effectively selling YES):
-            entry_price = signal.market.no_price
+            entry_price = signal.bracket.no_price
             win_amount = 1 - entry_price
             lose_amount = entry_price
             win_prob = 1 - signal.forecast_probability

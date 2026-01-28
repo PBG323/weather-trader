@@ -2,7 +2,7 @@
 Bias Correction Models
 
 Weather APIs forecast for grid points, not specific weather stations.
-Polymarket settles on specific NWS station readings, creating systematic bias.
+Kalshi settles on specific NWS station readings, creating systematic bias.
 
 This module trains station-specific bias correction models to adjust
 API forecasts to match expected station readings.
@@ -74,7 +74,7 @@ class BiasCorrector:
     Trains and applies bias correction models for weather forecasts.
 
     The key insight is that weather APIs forecast for grid points,
-    while Polymarket settles on specific station readings. The difference
+    while Kalshi settles on specific station readings. The difference
     is systematic and predictable.
     """
 

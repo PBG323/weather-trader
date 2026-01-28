@@ -42,7 +42,7 @@ from weather_trader.config import get_all_cities, get_city_config, config
 from weather_trader.apis import OpenMeteoClient, TomorrowIOClient, NWSClient
 from weather_trader.models import EnsembleForecaster, BiasCorrector
 from weather_trader.models.ensemble import ModelForecast
-from weather_trader.polymarket import WeatherMarketFinder, PolymarketAuth, PolymarketClient
+from weather_trader.kalshi import KalshiMarketFinder, KalshiAuth, KalshiClient
 from weather_trader.strategy import ExpectedValueCalculator
 from weather_trader.trading import (
     TradingConfig, PositionManager, RiskManager, ExecutionEngine,
@@ -145,9 +145,9 @@ if 'auto_trader' not in st.session_state:
         risk_manager=st.session_state.risk_manager
     )
 
-# Polymarket live trading client (initialized lazily when live mode is selected)
-if 'polymarket_client' not in st.session_state:
-    st.session_state.polymarket_client = None
+# Kalshi live trading client (initialized lazily when live mode is selected)
+if 'kalshi_client' not in st.session_state:
+    st.session_state.kalshi_client = None
 if 'live_wallet_validated' not in st.session_state:
     st.session_state.live_wallet_validated = False
 
@@ -302,7 +302,7 @@ def generate_demo_markets(forecasts):
                 "volume": random.randint(1000, 20000),
                 "liquidity": random.randint(100, 2000),
                 "target_date": target_date,
-                "temp_unit": city_config.temp_unit,
+                "temp_unit": "F",
                 "condition_id": condition_id,
                 "resolution_source": f"Demo - {city_config.station_name}",
                 "is_demo": True,
@@ -389,46 +389,44 @@ async def _fetch_model_comparison():
 
 @st.cache_data(ttl=60)
 def fetch_real_markets():
-    """Fetch real Polymarket markets."""
+    """Fetch real Kalshi markets."""
     return run_async(_fetch_real_markets())
 
 
 async def _fetch_real_markets():
-    """Fetch weather markets from Polymarket."""
+    """Fetch weather markets from Kalshi."""
     markets = []
 
-    async with WeatherMarketFinder() as finder:
+    async with KalshiMarketFinder() as finder:
         try:
             found = await finder.find_weather_markets(active_only=True, days_ahead=3)
-            add_alert(f"Polymarket API: Found {len(found)} market events", "info")
+            add_alert(f"Kalshi API: Found {len(found)} market events", "info")
 
             for market in found:
-                add_alert(f"Processing {market.city}: {len(market.outcomes)} outcomes", "info")
-                # Each market has multiple temperature outcomes
-                for outcome in market.outcomes:
+                add_alert(f"Processing {market.city}: {len(market.brackets)} brackets", "info")
+                for bracket in market.brackets:
                     markets.append({
                         "city": market.city,
                         "city_name": market.city_config.name if market.city_config else market.city,
                         "question": market.question,
-                        "outcome_desc": outcome.description,
-                        "temp_low": outcome.temp_low,
-                        "temp_high": outcome.temp_high,
-                        "temp_midpoint": outcome.midpoint,
-                        "yes_price": outcome.yes_price,
-                        "no_price": 1 - outcome.yes_price,
-                        "volume": outcome.volume,
-                        "liquidity": outcome.liquidity,
+                        "outcome_desc": bracket.description,
+                        "temp_low": bracket.temp_low,
+                        "temp_high": bracket.temp_high,
+                        "temp_midpoint": bracket.midpoint,
+                        "yes_price": bracket.yes_price,
+                        "no_price": 1 - bracket.yes_price,
+                        "volume": bracket.volume,
+                        "liquidity": bracket.open_interest,
                         "target_date": market.target_date,
-                        "temp_unit": market.temp_unit,
-                        "condition_id": outcome.condition_id,
-                        "outcome_id": outcome.outcome_id,
-                        "yes_token_id": outcome.yes_token_id,
+                        "temp_unit": "F",
+                        "condition_id": bracket.ticker,
+                        "ticker": bracket.ticker,
                         "resolution_source": market.resolution_source,
                         "is_demo": False,
-                        "event_slug": market.event_slug,
+                        "event_ticker": market.event_ticker,
                         "total_market_volume": market.total_volume,
                     })
-                    record_price(outcome.condition_id, outcome.yes_price)
+                    record_price(bracket.ticker, bracket.yes_price)
         except Exception as e:
             import traceback
             add_alert(f"Error fetching markets: {str(e)}", "danger")
@@ -664,7 +662,7 @@ def calculate_signals(forecasts, markets, show_all_outcomes=False):
 
     Args:
         forecasts: Weather forecast data
-        markets: Market data from Polymarket
+        markets: Market data from Kalshi
         show_all_outcomes: If True, return signals for ALL outcomes, not just the best
     """
     signals = []
@@ -692,16 +690,11 @@ def calculate_signals(forecasts, markets, show_all_outcomes=False):
             continue
         forecast_temp_f = fc["high_mean"]  # Forecast is always in Fahrenheit
         forecast_std_f = max(fc["high_std"], 2.0)
-        market_temp_unit = group_markets[0].get("temp_unit", "F")
         city_config = get_city_config(city_key)
 
-        # Convert forecast to market's unit (Celsius for London/Toronto)
-        if market_temp_unit == "C":
-            forecast_temp_market = (forecast_temp_f - 32) * 5 / 9
-            forecast_std_market = forecast_std_f * 5 / 9
-        else:
-            forecast_temp_market = forecast_temp_f
-            forecast_std_market = forecast_std_f
+        # All Kalshi markets are Fahrenheit
+        forecast_temp_market = forecast_temp_f
+        forecast_std_market = forecast_std_f
 
         best_signal = None
         best_edge = 0
@@ -752,7 +745,7 @@ def calculate_signals(forecasts, markets, show_all_outcomes=False):
                 "outcome": market.get("outcome_desc", f"{temp_low}-{temp_high}"),
                 "temp_low": temp_low,
                 "temp_high": temp_high,
-                "temp_unit": market_temp_unit,
+                "temp_unit": "F",
                 "range_type": range_type,
                 "our_prob": our_prob,
                 "market_prob": market_prob,
@@ -762,7 +755,7 @@ def calculate_signals(forecasts, markets, show_all_outcomes=False):
                 "forecast_high_market": forecast_temp_market,
                 "forecast_std": forecast_std_market,
                 "condition_id": market["condition_id"],
-                "yes_token_id": market.get("yes_token_id", ""),
+                "ticker": market.get("ticker", ""),
                 "is_demo": market.get("is_demo", False),
                 "target_date": market.get("target_date"),
                 "resolution_source": market.get("resolution_source", ""),
@@ -825,49 +818,32 @@ def execute_trade(signal, size, is_live=False):
         forecast_prob=signal["our_prob"]
     )
 
-    # Submit real order to Polymarket if live trading
+    # Submit real order to Kalshi if live trading
     exchange_order_id = None
-    if is_live and st.session_state.polymarket_client is not None:
+    if is_live and st.session_state.kalshi_client is not None:
         try:
-            from weather_trader.polymarket.client import (
-                Order as PolyOrder, OrderSide as PolySide,
-                OrderType as PolyOrderType,
-            )
+            ticker = signal.get("ticker", "") or signal.get("condition_id", "")
+            kalshi_side = "yes" if side == "YES" else "no"
+            price_cents = max(1, min(99, int(round(actual_cost_per_share * 100))))
+            count = max(1, int(round(shares)))
 
-            token_id = signal.get("token_id", "")
-            if not token_id:
-                token_id = signal.get("condition_id", "")
+            async def _place_order():
+                async with st.session_state.kalshi_client as client:
+                    return await client.place_order(
+                        ticker=ticker,
+                        action="buy",
+                        side=kalshi_side,
+                        count=count,
+                        price_cents=price_cents,
+                    )
 
-            poly_side = PolySide.BUY  # Entry orders are always buys
-            poly_order = PolyOrder(
-                market=None,
-                side=poly_side,
-                token_id=token_id,
-                size=shares,
-                price=actual_cost_per_share,
-                order_type=PolyOrderType.LIMIT,
-            )
+            result = run_async(_place_order())
 
-            # ClobClient is synchronous; dashboard runs synchronously in Streamlit
-            clob = st.session_state.polymarket_client._init_clob_client()
-            from py_clob_client.clob_types import OrderArgs, OrderType as ClobOrderType
-            from py_clob_client.order_builder.constants import BUY
-
-            order_args = OrderArgs(
-                token_id=token_id,
-                price=round(actual_cost_per_share, 2),
-                size=round(shares, 2),
-                side=BUY,
-            )
-            signed_order = clob.create_order(order_args)
-            response = clob.post_order(signed_order, ClobOrderType.GTC)
-
-            if isinstance(response, dict) and response.get("success"):
-                exchange_order_id = response.get("orderID")
+            if result.success:
+                exchange_order_id = result.order_id
                 add_alert(f"Live order submitted: {exchange_order_id}", "success")
             else:
-                error_msg = response if isinstance(response, str) else str(response)
-                add_alert(f"Live order submission issue: {error_msg}", "warning")
+                add_alert(f"Live order submission issue: {result.message}", "warning")
 
         except Exception as e:
             add_alert(f"Live order failed (position still tracked): {e}", "warning")
@@ -1223,27 +1199,28 @@ def main():
     is_live = mode == "🔴 Live Trading"
 
     if is_live:
-        # Validate wallet and initialize PolymarketClient for live trading
-        auth = PolymarketAuth()
+        # Validate credentials and initialize KalshiClient for live trading
+        auth = KalshiAuth()
         if not auth.is_configured:
-            st.sidebar.error("⚠️ Wallet not configured! Set POLYGON_PRIVATE_KEY in .env")
+            st.sidebar.error("⚠️ Kalshi credentials not configured! Set KALSHI_KEY_ID and KALSHI_PRIVATE_KEY_PATH in .env")
             st.sidebar.warning("Falling back to Dry Run mode.")
             is_live = False
         else:
-            if st.session_state.polymarket_client is None:
+            if st.session_state.kalshi_client is None:
                 try:
-                    client = PolymarketClient(auth=auth)
-                    # Trigger ClobClient initialization to validate credentials
-                    client._init_clob_client()
-                    st.session_state.polymarket_client = client
+                    valid, msg = auth.validate_for_trading()
+                    if not valid:
+                        raise ValueError(msg)
+                    client = KalshiClient(auth=auth)
+                    st.session_state.kalshi_client = client
                     st.session_state.live_wallet_validated = True
-                    st.sidebar.success(f"Wallet connected: {auth.address[:6]}...{auth.address[-4:]}")
+                    st.sidebar.success(f"Kalshi connected: {auth.key_id[:8]}...")
                 except Exception as e:
                     st.sidebar.error(f"⚠️ Live trading init failed: {e}")
                     st.sidebar.warning("Falling back to Dry Run mode.")
                     is_live = False
             else:
-                st.sidebar.success(f"Wallet connected: {auth.address[:6]}...{auth.address[-4:]}")
+                st.sidebar.success(f"Kalshi connected: {auth.key_id[:8]}...")
 
             if is_live:
                 st.sidebar.error("⚠️ LIVE TRADING ENABLED - Real orders will be submitted")
@@ -1254,14 +1231,14 @@ def main():
     use_demo = st.sidebar.checkbox(
         "Demo Mode (Simulated Markets)",
         value=True,
-        help="Use simulated markets for testing. Disable when real Polymarket weather markets are available."
+        help="Use simulated markets for testing. Disable when real Kalshi weather markets are available."
     )
     st.session_state.demo_mode = use_demo
 
     if use_demo:
         st.sidebar.info("Using simulated markets for demo")
     else:
-        st.sidebar.warning("Looking for real Polymarket markets")
+        st.sidebar.warning("Looking for real Kalshi markets")
 
     # Auto-trade toggle
     st.sidebar.markdown("---")
@@ -1404,12 +1381,12 @@ def main():
 
         # Market status banner
         if use_demo:
-            st.info("📊 **Demo Mode Active** - Using simulated markets based on real weather forecasts. Toggle off 'Demo Mode' in sidebar when real Polymarket weather markets are available.")
+            st.info("📊 **Demo Mode Active** - Using simulated markets based on real weather forecasts. Toggle off 'Demo Mode' in sidebar when real Kalshi weather markets are available.")
         else:
             if markets:
-                st.success(f"✅ **Live Markets Found** - {len(markets)} active weather markets on Polymarket")
+                st.success(f"✅ **Live Markets Found** - {len(markets)} active weather markets on Kalshi")
             else:
-                st.warning("⚠️ **No Live Markets** - No weather markets currently active on Polymarket. Enable 'Demo Mode' to test the system.")
+                st.warning("⚠️ **No Live Markets** - No weather markets currently active on Kalshi. Enable 'Demo Mode' to test the system.")
 
         # Tomorrow.io status
         if config.api.tomorrow_io_api_key and "your_" not in config.api.tomorrow_io_api_key.lower():
@@ -1503,11 +1480,11 @@ def main():
                 st.markdown("""
                 | Column | What It Means | How It's Calculated |
                 |--------|---------------|---------------------|
-                | **City** | The city/market being analyzed | From Polymarket market data |
+                | **City** | The city/market being analyzed | From Kalshi market data |
                 | **Outcome** | Temperature range we're betting on | The specific bucket (e.g., "20-21°F") |
                 | **Forecast** | Our predicted high temperature | Ensemble average from ECMWF, GFS, etc. |
                 | **Our Prob** | Our probability this outcome wins | `P(temp falls in this range)` using normal distribution |
-                | **Market** | Polymarket's implied probability | Current YES price (e.g., $0.42 = 42%) |
+                | **Market** | Kalshi's implied probability | Current YES price (e.g., $0.42 = 42%) |
                 | **Edge** | Our advantage over the market | `Our Prob - Market Prob` |
                 | **Action** | Trade recommendation | Based on edge size and confidence |
 
@@ -1522,7 +1499,7 @@ def main():
                 - Forecast: 21°F for NYC tomorrow
                 - Outcome: "20-21°F" range
                 - Our Prob: 35% (our model says 35% chance temp is 20-21°F)
-                - Market: 25% (Polymarket prices YES at $0.25)
+                - Market: 25% (Kalshi prices YES at $0.25)
                 - Edge: +10% (we think it's worth 35¢, market sells for 25¢)
                 - Action: BUY YES at $0.25, expecting to win 35% of the time
                 """)
@@ -1620,8 +1597,11 @@ def main():
         st.caption(f"Tomorrow: {target_date.strftime('%A, %B %d, %Y')}")
 
         if forecasts:
-            # Clean card-based layout
-            for city_key, fc in forecasts.items():
+            # Clean card-based layout (only city-level keys, skip date-specific ones)
+            for city_key in get_all_cities():
+                if city_key not in forecasts:
+                    continue
+                fc = forecasts[city_key]
                 city_config = get_city_config(city_key)
                 temp_unit = city_config.temp_unit
 
@@ -1632,32 +1612,17 @@ def main():
                         st.markdown(f"### {fc['city']}")
                         st.caption(f"📍 {city_config.station_name}")
 
-                    # Check if this city uses Celsius on Polymarket
-                    uses_celsius = temp_unit == "C"
                     high_f = fc['high_mean']
                     low_f = fc['low_mean']
-                    high_c = (high_f - 32) * 5 / 9
-                    low_c = (low_f - 32) * 5 / 9
 
                     with col2:
-                        if uses_celsius:
-                            st.metric("High", f"{high_c:.1f}°C", f"({high_f:.1f}°F)")
-                        else:
-                            st.metric("High", f"{high_f:.1f}°F", f"±{fc['high_std']:.1f}°")
+                        st.metric("High", f"{high_f:.1f}°F", f"±{fc['high_std']:.1f}°")
 
                     with col3:
-                        if uses_celsius:
-                            st.metric("Low", f"{low_c:.1f}°C", f"({low_f:.1f}°F)")
-                        else:
-                            st.metric("Low", f"{low_f:.1f}°F", f"±{fc['low_std']:.1f}°")
+                        st.metric("Low", f"{low_f:.1f}°F", f"±{fc['low_std']:.1f}°")
 
                     with col4:
-                        if uses_celsius:
-                            ci_low_c = (fc['high_ci_lower'] - 32) * 5 / 9
-                            ci_high_c = (fc['high_ci_upper'] - 32) * 5 / 9
-                            st.metric("90% Range", f"{ci_low_c:.1f}-{ci_high_c:.1f}°C")
-                        else:
-                            st.metric("90% Range", f"{fc['high_ci_lower']:.1f}-{fc['high_ci_upper']:.1f}°F")
+                        st.metric("90% Range", f"{fc['high_ci_lower']:.1f}-{fc['high_ci_upper']:.1f}°F")
 
                     with col5:
                         conf_pct = fc['confidence'] * 100
@@ -1673,32 +1638,19 @@ def main():
             # Temperature comparison chart - show each city in its market unit
             st.subheader("📊 Temperature Comparison")
 
-            # Build data with correct units per city
+            # Build data — all cities are Fahrenheit
             temp_data = []
-            for city_key, fc in forecasts.items():
-                city_config = get_city_config(city_key)
-                uses_celsius = city_config.temp_unit == "C"
-
-                if uses_celsius:
-                    high = (fc["high_mean"] - 32) * 5 / 9
-                    low = (fc["low_mean"] - 32) * 5 / 9
-                    high_err = fc["high_std"] * 5 / 9
-                    low_err = fc["low_std"] * 5 / 9
-                    unit = "°C"
-                else:
-                    high = fc["high_mean"]
-                    low = fc["low_mean"]
-                    high_err = fc["high_std"]
-                    low_err = fc["low_std"]
-                    unit = "°F"
+            for city_key in get_all_cities():
+                if city_key not in forecasts:
+                    continue
+                fc = forecasts[city_key]
 
                 temp_data.append({
-                    "City": f"{fc['city']} ({unit})",
-                    "High": high,
-                    "Low": low,
-                    "High_err": high_err,
-                    "Low_err": low_err,
-                    "Unit": unit
+                    "City": fc['city'],
+                    "High": fc["high_mean"],
+                    "Low": fc["low_mean"],
+                    "High_err": fc["high_std"],
+                    "Low_err": fc["low_std"],
                 })
 
             df_temps = pd.DataFrame(temp_data)
@@ -1724,24 +1676,23 @@ def main():
             ))
             fig.update_layout(
                 barmode='group',
-                yaxis_title="Temperature",
+                yaxis_title="Temperature (°F)",
                 height=350,
                 margin=dict(t=20, b=40),
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
             )
             st.plotly_chart(fig, use_container_width=True)
-            st.caption("*NYC, Atlanta, Seattle shown in °F; Toronto, London shown in °C (matching Polymarket)*")
 
     # =====================
     # TAB 3: Markets
     # =====================
     with tab3:
-        st.header("📈 Polymarket Weather Markets")
+        st.header("📈 Kalshi Weather Markets")
 
         if use_demo:
-            st.info("🎮 **Demo Markets** - These are simulated markets based on real forecasts. Disable 'Demo Mode' in sidebar to search for real Polymarket markets.")
+            st.info("🎮 **Demo Markets** - These are simulated markets based on real forecasts. Disable 'Demo Mode' in sidebar to search for real Kalshi markets.")
         else:
-            st.info("🔍 **Live Markets** - Fetching from Polymarket API. Markets are grouped by city/date.")
+            st.info("🔍 **Live Markets** - Fetching from Kalshi API. Markets are grouped by city/date.")
 
         if markets:
             # Group markets by city and date for display
@@ -1872,7 +1823,7 @@ def main():
                         """)
         else:
             st.warning("No markets found")
-            st.info("Enable Demo Mode in the sidebar to test with simulated markets, or check if Polymarket has active weather markets.")
+            st.info("Enable Demo Mode in the sidebar to test with simulated markets, or check if Kalshi has active weather markets.")
 
     # =====================
     # TAB 4: Model Comparison
@@ -1883,8 +1834,7 @@ def main():
         if model_comparison:
             for city_key, data in model_comparison.items():
                 city_config = get_city_config(city_key)
-                uses_celsius = city_config.temp_unit == "C"
-                unit_label = "°C" if uses_celsius else "°F"
+                unit_label = "°F"
 
                 st.subheader(f"{data['city']} ({unit_label})")
 
@@ -1901,17 +1851,8 @@ def main():
                                 break
 
                     models = list(data["models"].keys())
-                    # Get temps in F first
-                    highs_f = [data["models"][m]["high"] for m in models]
-                    lows_f = [data["models"][m]["low"] for m in models]
-
-                    # Convert to Celsius for London/Toronto
-                    if uses_celsius:
-                        highs = [(h - 32) * 5 / 9 for h in highs_f]
-                        lows = [(l - 32) * 5 / 9 for l in lows_f]
-                    else:
-                        highs = highs_f
-                        lows = lows_f
+                    highs = [data["models"][m]["high"] for m in models]
+                    lows = [data["models"][m]["low"] for m in models]
 
                     fig = go.Figure()
                     fig.add_trace(go.Bar(name='High', x=models, y=highs, marker_color='#ff5722',
@@ -1921,8 +1862,6 @@ def main():
 
                     if city_key in forecasts:
                         ensemble_high = forecasts[city_key]["high_mean"]
-                        if uses_celsius:
-                            ensemble_high = (ensemble_high - 32) * 5 / 9
                         fig.add_hline(y=ensemble_high, line_dash="dash",
                                     line_color="red", annotation_text="Ensemble High")
 
@@ -1932,11 +1871,7 @@ def main():
 
                     if len(highs) > 1:
                         spread = max(highs) - min(highs)
-                        # Adjust thresholds for Celsius (smaller numbers)
-                        if uses_celsius:
-                            agreement = "High" if spread < 1.7 else ("Medium" if spread < 3.3 else "Low")
-                        else:
-                            agreement = "High" if spread < 3 else ("Medium" if spread < 6 else "Low")
+                        agreement = "High" if spread < 3 else ("Medium" if spread < 6 else "Low")
                         st.metric("Model Agreement", agreement, f"Spread: {spread:.1f}{unit_label}")
 
                 st.markdown("---")
@@ -1992,20 +1927,13 @@ def main():
                                       format_func=lambda x: multi_day[x]["city"])
 
             if city_select:
-                city_config = get_city_config(city_select)
-                uses_celsius = city_config.temp_unit == "C"
-                unit_label = "°C" if uses_celsius else "°F"
+                unit_label = "°F"
 
                 data = multi_day[city_select]
                 df = pd.DataFrame(data["daily"])
 
-                # Convert to Celsius for London/Toronto
-                if uses_celsius:
-                    df['high_display'] = (df['high'] - 32) * 5 / 9
-                    df['low_display'] = (df['low'] - 32) * 5 / 9
-                else:
-                    df['high_display'] = df['high']
-                    df['low_display'] = df['low']
+                df['high_display'] = df['high']
+                df['low_display'] = df['low']
 
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(x=df['date'], y=df['high_display'], name='High',

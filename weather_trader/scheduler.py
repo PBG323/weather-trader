@@ -143,17 +143,18 @@ class TradingScheduler:
     async def _health_check(self):
         """Perform health check."""
         try:
-            # Check wallet balance
-            if self.trader._poly_auth and self.trader._poly_auth.is_configured:
-                balance = self.trader._poly_auth.get_usdc_balance()
+            # Check account balance
+            if self.trader._kalshi_auth and self.trader._kalshi_auth.is_configured:
+                async with self.trader._kalshi_client:
+                    balance = await self.trader._kalshi_client.get_balance()
                 if balance < 10:
-                    logger.warning(f"Low USDC balance: ${balance:.2f}")
+                    logger.warning(f"Low balance: ${balance:.2f}")
                     if self.alerts:
                         await self.alerts.send(
                             Alert(
                                 level=AlertLevel.WARNING,
                                 title="Low Balance",
-                                message=f"USDC balance is ${balance:.2f}",
+                                message=f"Kalshi balance is ${balance:.2f}",
                             )
                         )
 

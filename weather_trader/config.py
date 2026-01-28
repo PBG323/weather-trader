@@ -16,14 +16,14 @@ load_dotenv()
 class CityConfig:
     """Configuration for a tradeable city."""
     name: str
-    station_id: str  # ICAO code for Weather Underground station
+    station_id: str  # ICAO code for NWS station
     station_name: str
     latitude: float
     longitude: float
     timezone: str
-    country: str  # For API routing (US cities use NWS, international use different sources)
-    temp_unit: str = "F"  # F for Fahrenheit, C for Celsius
-    polymarket_slug: str = ""  # City name as used in Polymarket slugs
+    country: str
+    temp_unit: str = "F"
+    kalshi_series_ticker: str = ""  # Kalshi KXHIGH series ticker for this city
 
     @property
     def nws_station_id(self) -> str:
@@ -31,63 +31,85 @@ class CityConfig:
         return self.station_id
 
 
-# Weather Underground Station Mappings - Critical for settlement accuracy
-# Polymarket uses Weather Underground data for resolution
+# NWS Station Mappings - Critical for Kalshi settlement accuracy
+# Kalshi settles on NWS Daily Climate Report data
 CITY_CONFIGS: dict[str, CityConfig] = {
     "nyc": CityConfig(
         name="New York City",
-        station_id="KLGA",
-        station_name="LaGuardia Airport",
-        latitude=40.7769,
-        longitude=-73.8740,
+        station_id="KNYC",
+        station_name="Central Park",
+        latitude=40.7828,
+        longitude=-73.9653,
         timezone="America/New_York",
         country="US",
         temp_unit="F",
-        polymarket_slug="nyc"
+        kalshi_series_ticker="KXHIGHNY",
     ),
-    "atlanta": CityConfig(
-        name="Atlanta",
-        station_id="KATL",
-        station_name="Hartsfield-Jackson Airport",
-        latitude=33.6407,
-        longitude=-84.4277,
+    "chicago": CityConfig(
+        name="Chicago",
+        station_id="KORD",
+        station_name="O'Hare International Airport",
+        latitude=41.9742,
+        longitude=-87.9073,
+        timezone="America/Chicago",
+        country="US",
+        temp_unit="F",
+        kalshi_series_ticker="KXHIGHCHI",
+    ),
+    "miami": CityConfig(
+        name="Miami",
+        station_id="KMIA",
+        station_name="Miami International Airport",
+        latitude=25.7959,
+        longitude=-80.2870,
         timezone="America/New_York",
         country="US",
         temp_unit="F",
-        polymarket_slug="atlanta"
+        kalshi_series_ticker="KXHIGHMIA",
     ),
-    "seattle": CityConfig(
-        name="Seattle",
-        station_id="KSEA",
-        station_name="Seattle-Tacoma Airport",
-        latitude=47.4502,
-        longitude=-122.3088,
+    "austin": CityConfig(
+        name="Austin",
+        station_id="KAUS",
+        station_name="Austin-Bergstrom International Airport",
+        latitude=30.1945,
+        longitude=-97.6699,
+        timezone="America/Chicago",
+        country="US",
+        temp_unit="F",
+        kalshi_series_ticker="KXHIGHAUS",
+    ),
+    "la": CityConfig(
+        name="Los Angeles",
+        station_id="KLAX",
+        station_name="Los Angeles International Airport",
+        latitude=33.9416,
+        longitude=-118.4085,
         timezone="America/Los_Angeles",
         country="US",
         temp_unit="F",
-        polymarket_slug="seattle"
+        kalshi_series_ticker="KXHIGHLA",
     ),
-    "toronto": CityConfig(
-        name="Toronto",
-        station_id="CYYZ",
-        station_name="Pearson International Airport",
-        latitude=43.6777,
-        longitude=-79.6248,
-        timezone="America/Toronto",
-        country="CA",
-        temp_unit="C",
-        polymarket_slug="toronto"
+    "denver": CityConfig(
+        name="Denver",
+        station_id="KDEN",
+        station_name="Denver International Airport",
+        latitude=39.8561,
+        longitude=-104.6737,
+        timezone="America/Denver",
+        country="US",
+        temp_unit="F",
+        kalshi_series_ticker="KXHIGHDEN",
     ),
-    "london": CityConfig(
-        name="London",
-        station_id="EGLC",
-        station_name="London City Airport",
-        latitude=51.5048,
-        longitude=0.0495,
-        timezone="Europe/London",
-        country="UK",
-        temp_unit="C",
-        polymarket_slug="london"
+    "philadelphia": CityConfig(
+        name="Philadelphia",
+        station_id="KPHL",
+        station_name="Philadelphia International Airport",
+        latitude=39.8721,
+        longitude=-75.2411,
+        timezone="America/New_York",
+        country="US",
+        temp_unit="F",
+        kalshi_series_ticker="KXHIGHPHL",
     ),
 }
 
@@ -107,9 +129,10 @@ class APIConfig:
     nws_base_url: str = "https://api.weather.gov"
     nws_user_agent: str = "(WeatherTrader, contact@example.com)"
 
-    # Polymarket CLOB
-    polymarket_clob_url: str = "https://clob.polymarket.com"
-    polymarket_gamma_url: str = "https://gamma-api.polymarket.com"
+    # Kalshi API
+    kalshi_api_base_url: str = field(
+        default_factory=lambda: os.getenv("KALSHI_API_BASE_URL", "https://api.elections.kalshi.com/trade-api/v2")
+    )
 
 
 @dataclass
@@ -142,15 +165,17 @@ class TradingConfig:
 
 
 @dataclass
-class PolygonConfig:
-    """Polygon blockchain configuration."""
-    private_key: str = field(
-        default_factory=lambda: os.getenv("POLYGON_PRIVATE_KEY", "")
+class KalshiConfig:
+    """Kalshi API authentication configuration."""
+    key_id: str = field(
+        default_factory=lambda: os.getenv("KALSHI_KEY_ID", "")
     )
-    rpc_url: str = field(
-        default_factory=lambda: os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")
+    private_key_path: str = field(
+        default_factory=lambda: os.getenv("KALSHI_PRIVATE_KEY_PATH", "")
     )
-    chain_id: int = 137  # Polygon mainnet
+    api_base_url: str = field(
+        default_factory=lambda: os.getenv("KALSHI_API_BASE_URL", "https://api.elections.kalshi.com/trade-api/v2")
+    )
 
 
 @dataclass
@@ -172,7 +197,7 @@ class Config:
     """Main configuration container."""
     api: APIConfig = field(default_factory=APIConfig)
     trading: TradingConfig = field(default_factory=TradingConfig)
-    polygon: PolygonConfig = field(default_factory=PolygonConfig)
+    kalshi: KalshiConfig = field(default_factory=KalshiConfig)
     alerts: AlertConfig = field(default_factory=AlertConfig)
 
     log_level: str = field(

@@ -276,7 +276,7 @@ class PositionManager:
         Create and register a new position.
 
         Args:
-            market_id: Polymarket market identifier
+            market_id: Kalshi event ticker identifier
             condition_id: Specific condition/outcome ID
             city: City for this weather market
             outcome_description: Human-readable outcome (e.g., "20-21°F")

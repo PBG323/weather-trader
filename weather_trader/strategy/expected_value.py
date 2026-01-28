@@ -15,7 +15,7 @@ from typing import Optional
 from enum import Enum
 
 from ..models.ensemble import EnsembleForecast
-from ..polymarket.markets import WeatherMarket
+from ..kalshi.markets import WeatherMarket, TemperatureBracket
 
 
 class SignalStrength(Enum):
@@ -31,6 +31,7 @@ class SignalStrength(Enum):
 class TradeSignal:
     """A trading signal based on EV analysis."""
     market: WeatherMarket
+    bracket: TemperatureBracket  # The specific bracket being evaluated
     forecast: EnsembleForecast
 
     # Probabilities
@@ -83,30 +84,47 @@ class ExpectedValueCalculator:
     def calculate_ev(
         self,
         market: WeatherMarket,
+        bracket: TemperatureBracket,
         forecast: EnsembleForecast
     ) -> TradeSignal:
         """
-        Calculate expected value for a market given our forecast.
+        Calculate expected value for a single bracket given our forecast.
+
+        Kalshi weather events consist of mutually exclusive temperature brackets.
+        Each bracket is a binary contract: will the temp land in this range?
 
         Args:
-            market: The WeatherMarket to analyze
+            market: The WeatherMarket (event context)
+            bracket: The specific TemperatureBracket to evaluate
             forecast: Our ensemble forecast
 
         Returns:
             TradeSignal with EV analysis
         """
-        # Get forecast probability for this specific market outcome
-        is_high = market.is_high_temp_market
-        is_over = market.is_over_market
-        threshold = market.threshold
+        # All KXHIGH series are high temperature markets
+        is_high = True
 
-        if is_over:
-            forecast_prob = forecast.get_probability_above(threshold, for_high=is_high)
+        # Calculate forecast probability for this bracket's range
+        if bracket.temp_low is not None and bracket.temp_high is not None:
+            # Range bracket: e.g. "50-52°F"
+            forecast_prob = forecast.get_probability_in_range(
+                bracket.temp_low, bracket.temp_high, for_high=is_high
+            )
+        elif bracket.temp_high is not None:
+            # Lower-bound bracket: e.g. "≤45°F"
+            forecast_prob = forecast.get_probability_below(
+                bracket.temp_high, for_high=is_high
+            )
+        elif bracket.temp_low is not None:
+            # Upper-bound bracket: e.g. "≥56°F"
+            forecast_prob = forecast.get_probability_above(
+                bracket.temp_low, for_high=is_high
+            )
         else:
-            forecast_prob = forecast.get_probability_below(threshold, for_high=is_high)
+            forecast_prob = 0.0
 
-        # Market implied probability
-        market_prob = market.yes_price
+        # Market implied probability from bracket price
+        market_prob = bracket.yes_price
 
         # Calculate edge
         edge = forecast_prob - market_prob
@@ -136,6 +154,7 @@ class ExpectedValueCalculator:
 
         return TradeSignal(
             market=market,
+            bracket=bracket,
             forecast=forecast,
             forecast_probability=forecast_prob,
             market_probability=market_prob,
@@ -145,9 +164,9 @@ class ExpectedValueCalculator:
             side=side,
             confidence=forecast.confidence,
             model_agreement=model_agreement,
-            threshold=threshold,
+            threshold=bracket.midpoint or 0.0,
             is_high_temp=is_high,
-            is_over_market=is_over,
+            is_over_market=forecast_prob > market_prob,
         )
 
     def _determine_signal(self, edge: float, confidence: float) -> SignalStrength:
@@ -197,8 +216,10 @@ class ExpectedValueCalculator:
             if forecast.date != market.target_date:
                 continue
 
-            signal = self.calculate_ev(market, forecast)
-            signals.append(signal)
+            # Evaluate each bracket independently
+            for bracket in market.brackets:
+                signal = self.calculate_ev(market, bracket, forecast)
+                signals.append(signal)
 
         # Sort by absolute edge (strongest signals first)
         signals.sort(key=lambda s: abs(s.edge), reverse=True)

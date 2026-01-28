@@ -20,7 +20,7 @@ from .apis import OpenMeteoClient, TomorrowIOClient, NWSClient
 from .apis.open_meteo import WeatherModel
 from .models import BiasCorrector, EnsembleForecaster, EnsembleForecast
 from .models.ensemble import ModelForecast
-from .polymarket import PolymarketAuth, PolymarketClient, WeatherMarketFinder
+from .kalshi import KalshiAuth, KalshiClient, KalshiMarketFinder
 from .strategy import ExpectedValueCalculator, PositionSizer, TradeExecutor
 from .monitoring import setup_logging, get_logger, AlertManager
 
@@ -54,9 +54,9 @@ class WeatherTrader:
         self._nws: Optional[NWSClient] = None
         self._bias_corrector: Optional[BiasCorrector] = None
         self._ensemble: Optional[EnsembleForecaster] = None
-        self._market_finder: Optional[WeatherMarketFinder] = None
-        self._poly_auth: Optional[PolymarketAuth] = None
-        self._poly_client: Optional[PolymarketClient] = None
+        self._market_finder: Optional[KalshiMarketFinder] = None
+        self._kalshi_auth: Optional[KalshiAuth] = None
+        self._kalshi_client: Optional[KalshiClient] = None
         self._ev_calculator: Optional[ExpectedValueCalculator] = None
         self._position_sizer: Optional[PositionSizer] = None
         self._executor: Optional[TradeExecutor] = None
@@ -84,24 +84,25 @@ class WeatherTrader:
         self._bias_corrector = BiasCorrector()
         self._ensemble = EnsembleForecaster(self._bias_corrector)
 
-        # Initialize Polymarket
-        self._poly_auth = PolymarketAuth()
-        self._poly_client = PolymarketClient(self._poly_auth)
-        self._market_finder = WeatherMarketFinder()
+        # Initialize Kalshi
+        self._kalshi_auth = KalshiAuth()
+        self._kalshi_client = KalshiClient(self._kalshi_auth)
+        self._market_finder = KalshiMarketFinder()
 
         # Get bankroll
         if self._bankroll is None:
-            if self._poly_auth.is_configured:
-                self._bankroll = self._poly_auth.get_usdc_balance()
+            if self._kalshi_auth.is_configured:
+                async with self._kalshi_client:
+                    self._bankroll = await self._kalshi_client.get_balance()
             else:
                 self._bankroll = 1000.0  # Default for dry run
-                logger.warning(f"Wallet not configured, using default bankroll: ${self._bankroll}")
+                logger.warning(f"Kalshi credentials not configured, using default bankroll: ${self._bankroll}")
 
         # Initialize strategy components
         self._ev_calculator = ExpectedValueCalculator()
         self._position_sizer = PositionSizer(self._bankroll)
         self._executor = TradeExecutor(
-            self._poly_client,
+            self._kalshi_client,
             dry_run=self.dry_run,
         )
 
@@ -119,10 +120,10 @@ class WeatherTrader:
             await self._tomorrow_io.close()
         if self._nws:
             await self._nws.close()
-        if self._poly_client:
-            await self._poly_client.close()
-        if self._market_finder:
-            await self._market_finder.close()
+        if self._kalshi_client and self._kalshi_client._client:
+            await self._kalshi_client.__aexit__(None, None, None)
+        if self._market_finder and self._market_finder._client:
+            await self._market_finder.__aexit__(None, None, None)
         if self._alerts:
             await self._alerts.close()
 
@@ -380,7 +381,7 @@ async def main():
     """Main entry point."""
     import argparse
 
-    parser = argparse.ArgumentParser(description="Weather Trader for Polymarket")
+    parser = argparse.ArgumentParser(description="Weather Trader for Kalshi")
     parser.add_argument("--dry-run", action="store_true", default=True,
                         help="Run without executing real trades")
     parser.add_argument("--live", action="store_true",

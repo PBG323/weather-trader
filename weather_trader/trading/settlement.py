@@ -49,7 +49,7 @@ class SettlementHandler:
     Handles market settlements for weather markets.
 
     When a market settles:
-    1. Fetch the actual outcome from Weather Underground
+    1. Fetch the actual outcome from NWS Daily Climate Report
     2. Determine winning side
     3. Settle all positions in that market
     4. Record P/L

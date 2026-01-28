@@ -26,11 +26,11 @@ Imagine you're a sports bettor, but instead of betting on football games, you're
 
 > "Will New York City's high temperature be over 50°F tomorrow?"
 
-Polymarket is a prediction market where people trade on these outcomes. If you think YES, you buy YES shares. If the temperature ends up being 52°F, your YES shares pay out $1 each. If it's 48°F, they're worth $0.
+Kalshi is a prediction market where people trade on these outcomes. If you think YES, you buy YES contracts. If the temperature ends up being 52°F, your YES contracts pay out $1 each. If it's 48°F, they're worth $0.
 
-**Here's the key insight:** Most traders on Polymarket are just looking at weather.com and guessing. But we have access to the same sophisticated weather models that meteorologists use—ECMWF (the European model that's consistently the world's best), GFS, HRRR, and more.
+**Here's the key insight:** Most traders on Kalshi are just looking at weather.com and guessing. But we have access to the same sophisticated weather models that meteorologists use—ECMWF (the European model that's consistently the world's best), GFS, HRRR, and more.
 
-**Even better:** We know a secret that most traders don't. Polymarket settles these markets based on *specific weather station readings*—like Central Park for NYC or Heathrow Airport for London. Weather apps give you a general city forecast, but stations can read differently. A forecast might say "NYC high: 50°F" but Central Park specifically might hit 52°F because it's in a park (urban heat island effect works differently there).
+**Even better:** We know a secret that most traders don't. Kalshi settles these markets based on *specific weather station readings*—like Central Park for NYC. Weather apps give you a general city forecast, but stations can read differently. A forecast might say "NYC high: 50°F" but Central Park specifically might hit 52°F because it's in a park (urban heat island effect works differently there).
 
 We exploit this gap.
 
@@ -46,7 +46,7 @@ Think of our system as a **factory with an assembly line**:
 │   GATHER    │ ──▶ │   REFINE    │ ──▶ │   DECIDE    │ ──▶ │   EXECUTE   │
 │  Raw Data   │     │  Forecasts  │     │   Trades    │     │   Orders    │
 └─────────────┘     └─────────────┘     └─────────────┘     └─────────────┘
-     APIs              Models            Strategy           Polymarket
+     APIs              Models            Strategy            Kalshi
 ```
 
 **Stage 1 - GATHER:** We pull forecasts from multiple weather APIs. It's like asking five different meteorologists for their opinion instead of just one.
@@ -55,7 +55,7 @@ Think of our system as a **factory with an assembly line**:
 
 **Stage 3 - DECIDE:** We compare our probability estimate to the market price. If we think there's a 75% chance of "over 50°F" but the market is pricing it at 55%, we have a 20% edge. We then figure out how much to bet using the Kelly Criterion (more on this later).
 
-**Stage 4 - EXECUTE:** We place orders on Polymarket's order book and track everything.
+**Stage 4 - EXECUTE:** We place orders on Kalshi and track everything.
 
 ---
 
@@ -101,8 +101,8 @@ Here's how the pieces fit together:
                                │
                                ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                         POLYMARKET CLOB                                 │
-│              (Central Limit Order Book on Polygon)                      │
+│                          KALSHI API                                     │
+│              (REST API with RSA-PSS Authentication)                     │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -140,7 +140,7 @@ CITY_CONFIGS: dict[str, CityConfig] = {
 }
 ```
 
-**Why station IDs matter:** See that `KNYC`? That's the ICAO code for the Central Park weather station. This is what Polymarket uses to settle bets. If we forecast for "New York City" generically, we might be off. We need to forecast for *that exact station*.
+**Why station IDs matter:** See that `KNYC`? That's the ICAO code for the Central Park weather station. This is what Kalshi uses to settle contracts via the NWS Daily Climate Report. If we forecast for "New York City" generically, we might be off. We need to forecast for *that exact station*.
 
 **Lesson:** Configuration should be centralized. When you need to change something (like adding a new city), you change it in ONE place, not hunt through 20 files.
 
@@ -171,7 +171,7 @@ Tomorrow.io costs money but offers proprietary models and hyperlocal data. We us
 
 #### `nws.py` — The Source of Truth
 
-This is special. The National Weather Service provides the *actual readings* that Polymarket uses to settle markets. We use this data to:
+This is special. The National Weather Service provides the *actual readings* that Kalshi uses to settle markets. We use this data to:
 1. Train our bias correction models
 2. Verify our forecasts after the fact
 3. Understand the ground truth
@@ -235,11 +235,11 @@ def get_probability_above(self, threshold: float, for_high: bool = True) -> floa
 
 ---
 
-### 📁 `polymarket/` — The Trading Floor
+### 📁 `kalshi/` — The Trading Floor
 
 #### `auth.py` — The Vault
 
-Handles wallet management and authentication. Polymarket runs on Polygon (an Ethereum Layer 2), so we need to manage private keys carefully.
+Handles API authentication. Kalshi uses RSA key-pair signing — you sign each request with your private key, and Kalshi verifies with your public key.
 
 ```python
 def create_wallet() -> WalletInfo:
@@ -254,7 +254,7 @@ def create_wallet() -> WalletInfo:
 
 #### `markets.py` — The Market Scanner
 
-This scans Polymarket for weather-related markets and parses questions like:
+This scans Kalshi for weather-related markets and parses events like:
 
 > "Will NYC high temperature be over 50°F on January 15?"
 
@@ -271,7 +271,7 @@ WeatherMarket(
 )
 ```
 
-**The parsing challenge:** Market questions are written in natural language. We use regex patterns to extract the city, threshold, and date. This is fragile—if Polymarket changes their question format, our parser breaks. In a production system, we'd want more robust NLP or a direct data feed from Polymarket.
+**The parsing challenge:** Market data comes from Kalshi's REST API with structured fields (series_ticker, floor_strike, cap_strike), making parsing much more reliable than scraping natural-language questions.
 
 #### `client.py` — The Broker
 
@@ -465,8 +465,8 @@ Better logging than the standard library. Colors, rotation, structured output—
 ### APScheduler
 For running trading cycles on a schedule. Supports cron-style triggers and handles timezone-aware scheduling.
 
-### web3.py
-For interacting with the Polygon blockchain. Needed for wallet management and (eventually) direct smart contract interaction.
+### cryptography
+For RSA-PSS signing of Kalshi API requests. Each request is authenticated by signing a timestamp+method+path string with your private key.
 
 ---
 
@@ -569,7 +569,7 @@ Good engineers don't build one giant thing. They build layers that talk to each 
 - Data layer (APIs)
 - Processing layer (Models)
 - Decision layer (Strategy)
-- Execution layer (Polymarket)
+- Execution layer (Kalshi)
 
 If one layer changes, others don't care. This is called **separation of concerns**.
 
@@ -635,8 +635,7 @@ If a market has $500 in liquidity and you try to buy $200, you'll move the price
 
 ### 🚫 Don't Forget About Fees
 
-Polymarket has 0% trading fees, but:
-- You pay gas fees on Polygon (tiny, but not zero)
+Kalshi has low trading fees, and:
 - You pay spreads (bid-ask difference)
 - You pay slippage on larger orders
 
@@ -671,8 +670,8 @@ cp .env.example .env
 TOMORROW_IO_API_KEY=your_key_here
 
 # Required for real trading (not for dry run)
-POLYGON_PRIVATE_KEY=your_private_key
-POLYGON_RPC_URL=https://polygon-rpc.com
+KALSHI_KEY_ID=your_kalshi_api_key_id
+KALSHI_PRIVATE_KEY_PATH=path/to/kalshi_private_key.pem
 
 # Optional: alerts
 DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...

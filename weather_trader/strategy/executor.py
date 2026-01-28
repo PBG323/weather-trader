@@ -15,8 +15,8 @@ from datetime import datetime
 from typing import Optional
 import asyncio
 
-from ..polymarket.client import PolymarketClient, OrderResult
-from ..polymarket.markets import WeatherMarket
+from ..kalshi.client import KalshiClient, OrderResult
+from ..kalshi.markets import WeatherMarket, TemperatureBracket
 from .position_sizing import PositionRecommendation
 from .expected_value import TradeSignal
 
@@ -54,7 +54,7 @@ class ExecutionResult:
         """Convert to journal entry format for logging."""
         return {
             "timestamp": self.execution_time.isoformat(),
-            "market": self.recommendation.signal.market.market_slug,
+            "market": self.recommendation.signal.market.event_slug,
             "city": self.recommendation.signal.market.city,
             "threshold": self.recommendation.signal.threshold,
             "side": self.recommendation.signal.side,
@@ -120,7 +120,7 @@ class TradeExecutor:
 
     def __init__(
         self,
-        client: PolymarketClient,
+        client: KalshiClient,
         max_slippage: float = 0.02,  # 2% max slippage
         use_limit_orders: bool = True,
         dry_run: bool = False,
@@ -129,7 +129,7 @@ class TradeExecutor:
         Initialize trade executor.
 
         Args:
-            client: PolymarketClient for order execution
+            client: KalshiClient for order execution
             max_slippage: Maximum acceptable slippage
             use_limit_orders: Use limit orders (vs market)
             dry_run: If True, don't actually execute trades
@@ -156,18 +156,18 @@ class TradeExecutor:
 
         # Determine order parameters
         market = signal.market
-        side = f"BUY_{signal.side}"
+        bracket = signal.bracket
         size = recommendation.recommended_shares
 
         # Get current price for slippage calculation
-        current_prices = await self.client.get_market_price(market)
+        current_prices = await self.client.get_market_price(bracket)
 
         if signal.side == "YES":
             current_price = current_prices["yes_ask"]
-            intended_price = market.yes_price
+            intended_price = bracket.yes_price
         else:
             current_price = current_prices["no_ask"]
-            intended_price = market.no_price
+            intended_price = bracket.no_price
 
         # Check slippage
         slippage = (current_price - intended_price) / intended_price if intended_price > 0 else 0
@@ -177,11 +177,7 @@ class TradeExecutor:
                 recommendation=recommendation,
                 order_result=OrderResult(
                     success=False,
-                    order_id=None,
-                    filled_size=0,
-                    filled_price=0,
                     message=f"Slippage too high: {slippage:.2%}",
-                    timestamp=datetime.now(),
                 ),
                 intended_size=recommendation.recommended_size,
                 executed_size=0,
@@ -200,20 +196,20 @@ class TradeExecutor:
             order_result = OrderResult(
                 success=True,
                 order_id=f"dry_run_{int(signal_time.timestamp())}",
-                filled_size=size,
-                filled_price=current_price,
+                filled_count=int(size),
+                filled_price_cents=int(round(current_price * 100)),
                 message="Dry run - no actual trade",
-                timestamp=datetime.now(),
             )
         else:
             # Calculate limit price with small offset for better fills
-            limit_price = current_price * 1.005 if self.use_limit_orders else None
+            limit_price_cents = int(round(current_price * 100 * 1.005)) if self.use_limit_orders else int(round(current_price * 100))
+            limit_price_cents = max(1, min(99, limit_price_cents))
 
             order_result = await self.client.place_limit_order(
-                market=market,
-                side=side,
-                size=size,
-                price=limit_price,
+                bracket=bracket,
+                side_str=signal.side,
+                count=max(1, int(round(size))),
+                price_cents=limit_price_cents,
             )
 
         # Build execution result
@@ -271,11 +267,7 @@ class TradeExecutor:
                         recommendation=recommendations[i],
                         order_result=OrderResult(
                             success=False,
-                            order_id=None,
-                            filled_size=0,
-                            filled_price=0,
                             message=str(result),
-                            timestamp=datetime.now(),
                         ),
                         intended_size=recommendations[i].recommended_size,
                         executed_size=0,
@@ -314,19 +306,21 @@ class TradeExecutor:
         expected_from_journal = {}
         for entry in self.journal.entries:
             if entry.success:
-                market_id = entry.recommendation.signal.market.condition_id
+                ticker = entry.recommendation.signal.bracket.ticker
                 side = entry.recommendation.signal.side
 
-                if market_id not in expected_from_journal:
-                    expected_from_journal[market_id] = {"yes": 0, "no": 0}
+                if ticker not in expected_from_journal:
+                    expected_from_journal[ticker] = {"yes": 0, "no": 0}
 
                 if side == "YES":
-                    expected_from_journal[market_id]["yes"] += entry.executed_size
+                    expected_from_journal[ticker]["yes"] += entry.executed_size
                 else:
-                    expected_from_journal[market_id]["no"] += entry.executed_size
+                    expected_from_journal[ticker]["no"] += entry.executed_size
 
         return {
             "expected": expected_from_journal,
-            "actual": {p.market.condition_id: {"yes": p.yes_shares, "no": p.no_shares}
-                       for p in positions},
+            "actual": {p.get("ticker", ""): {
+                "yes": p.get("market_position", {}).get("yes", 0),
+                "no": p.get("market_position", {}).get("no", 0),
+            } for p in positions},
         }
