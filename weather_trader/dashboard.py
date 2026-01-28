@@ -824,30 +824,34 @@ def execute_trade(signal, size, is_live=False):
 
     # Submit real order to Kalshi if live trading
     exchange_order_id = None
-    if is_live and st.session_state.kalshi_client is not None:
+    is_demo_market = signal.get("is_demo", False)
+    if is_live and st.session_state.kalshi_client is not None and not is_demo_market:
         try:
             ticker = signal.get("ticker", "") or signal.get("condition_id", "")
-            kalshi_side = "yes" if side == "YES" else "no"
-            price_cents = max(1, min(99, int(round(actual_cost_per_share * 100))))
-            count = max(1, int(round(shares)))
-
-            async def _place_order():
-                async with st.session_state.kalshi_client as client:
-                    return await client.place_order(
-                        ticker=ticker,
-                        action="buy",
-                        side=kalshi_side,
-                        count=count,
-                        price_cents=price_cents,
-                    )
-
-            result = run_async(_place_order())
-
-            if result.success:
-                exchange_order_id = result.order_id
-                add_alert(f"Live order submitted: {exchange_order_id}", "success")
+            if not ticker or ticker.startswith("demo_"):
+                add_alert("Cannot submit order: invalid ticker (demo market?)", "warning")
             else:
-                add_alert(f"Live order submission issue: {result.message}", "warning")
+                kalshi_side = "yes" if side == "YES" else "no"
+                price_cents = max(1, min(99, int(round(actual_cost_per_share * 100))))
+                count = max(1, int(round(shares)))
+
+                async def _place_order():
+                    async with st.session_state.kalshi_client as client:
+                        return await client.place_order(
+                            ticker=ticker,
+                            action="buy",
+                            side=kalshi_side,
+                            count=count,
+                            price_cents=price_cents,
+                        )
+
+                result = run_async(_place_order())
+
+                if result.success:
+                    exchange_order_id = result.order_id
+                    add_alert(f"Live order submitted: {exchange_order_id} ({ticker})", "success")
+                else:
+                    add_alert(f"Live order failed: {result.message}", "warning")
 
         except Exception as e:
             add_alert(f"Live order failed (position still tracked): {e}", "warning")
@@ -1241,8 +1245,10 @@ def main():
 
     if use_demo:
         st.sidebar.info("Using simulated markets for demo")
+        if is_live:
+            st.sidebar.warning("⚠️ Demo + Live = orders won't submit (fake tickers)")
     else:
-        st.sidebar.warning("Looking for real Kalshi markets")
+        st.sidebar.success("🔍 Using real Kalshi markets")
 
     # Auto-trade toggle
     st.sidebar.markdown("---")
