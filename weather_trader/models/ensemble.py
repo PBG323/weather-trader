@@ -197,21 +197,37 @@ class EnsembleForecaster:
             else:
                 corrected_forecasts.append(f)
 
-        # Apply model weights
+        # Apply model weights with outlier dampening
+        # When a model diverges from the consensus, reduce its weight
+        # proportionally to how far it deviates. This prevents a single
+        # wide-spread model (e.g. ECMWF) from dragging the mean and
+        # inflating uncertainty.
         highs = []
         lows = []
-        weights = []
+        raw_weights = []
 
         for f in corrected_forecasts:
             model_weight = self.weights.get(f.model_name.lower(), 1.0)
             total_weight = f.weight * model_weight
             highs.append(f.forecast_high)
             lows.append(f.forecast_low)
-            weights.append(total_weight)
+            raw_weights.append(total_weight)
 
         highs = np.array(highs)
         lows = np.array(lows)
-        weights = np.array(weights)
+        raw_weights = np.array(raw_weights)
+
+        # Outlier dampening: reduce weight of models that deviate from
+        # the unweighted median. Uses a Gaussian kernel so moderate
+        # disagreement is tolerated but extreme outliers are suppressed.
+        if len(highs) >= 3:
+            median_high = np.median(highs)
+            deviations = np.abs(highs - median_high)
+            # Dampening scale: 3°F deviation → 60% of original weight
+            dampening = np.exp(-0.5 * (deviations / 4.0) ** 2)
+            weights = raw_weights * dampening
+        else:
+            weights = raw_weights
 
         # Normalize weights
         weights = weights / weights.sum()
@@ -229,8 +245,17 @@ class EnsembleForecaster:
         high_std = max(np.sqrt(high_var), min_std)
         low_std = max(np.sqrt(low_var), min_std)
 
-        # If models disagree more, increase uncertainty
-        spread_factor = 1 + (np.std(highs) / 5)  # Increase std if spread is large
+        # Model disagreement increases uncertainty, but cap the amplification
+        # so a single outlier model can't blow up the std.
+        # Old: spread_factor = 1 + (np.std(highs) / 5)  — uncapped
+        # New: use IQR-based spread (robust to outliers), capped at 1.5x
+        if len(highs) >= 4:
+            iqr = np.percentile(highs, 75) - np.percentile(highs, 25)
+            spread_factor = 1 + min(iqr / 8, 0.5)  # caps at 1.5x
+        else:
+            raw_spread = np.std(highs)
+            spread_factor = 1 + min(raw_spread / 5, 0.5)  # caps at 1.5x
+
         high_std *= spread_factor
         low_std *= spread_factor
 
@@ -241,9 +266,19 @@ class EnsembleForecaster:
         low_ci_lower = low_mean - z_90 * low_std
         low_ci_upper = low_mean + z_90 * low_std
 
-        # Overall confidence
-        # Higher if models agree, lower if they spread
-        model_agreement = 1 / (1 + np.std(highs) / 5)
+        # Overall confidence based on consensus-model agreement
+        # Count how many models are within 3°F of the median — the
+        # "consensus core". One outlier shouldn't tank confidence if the
+        # majority agrees.
+        if len(highs) >= 3:
+            median_high = np.median(highs)
+            consensus_count = np.sum(np.abs(highs - median_high) <= 3.0)
+            consensus_ratio = consensus_count / len(highs)
+            # Consensus ratio 1.0 → agreement 0.95, ratio 0.5 → agreement 0.65
+            model_agreement = 0.5 + 0.45 * consensus_ratio
+        else:
+            model_agreement = 1 / (1 + np.std(highs) / 5)
+
         confidence = min(0.95, model_agreement * 0.9)
 
         return EnsembleForecast(
