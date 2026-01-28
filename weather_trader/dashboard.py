@@ -154,6 +154,110 @@ if 'kalshi_client' not in st.session_state:
     st.session_state.kalshi_client = None
 if 'live_wallet_validated' not in st.session_state:
     st.session_state.live_wallet_validated = False
+if 'positions_synced' not in st.session_state:
+    st.session_state.positions_synced = False
+
+
+def sync_positions_from_kalshi():
+    """Sync open positions from Kalshi to dashboard state."""
+    from weather_trader.kalshi import KalshiAuth, KalshiClient
+    from datetime import datetime
+    import re
+
+    auth = KalshiAuth()
+    if not auth.is_configured:
+        add_alert("Cannot sync: Kalshi not configured", "warning")
+        return 0
+
+    async def _fetch_positions():
+        client = KalshiClient(auth)
+        return await client.get_positions()
+
+    try:
+        positions = run_async(_fetch_positions())
+    except Exception as e:
+        add_alert(f"Sync failed: {e}", "error")
+        return 0
+
+    # Filter to weather positions with non-zero holdings
+    weather_positions = [
+        p for p in positions
+        if "KXHIGH" in p.get("ticker", "") and p.get("position", 0) != 0
+    ]
+
+    synced = 0
+    existing_tickers = {pos.get("condition_id", "") for pos in st.session_state.open_positions}
+
+    for kp in weather_positions:
+        ticker = kp.get("ticker", "")
+        if ticker in existing_tickers:
+            continue  # Already tracked
+
+        position_count = kp.get("position", 0)
+        avg_price = kp.get("average_price_paid", 50) or 50
+
+        # Determine side: positive = YES, negative = NO
+        if position_count > 0:
+            side = "YES"
+            shares = position_count
+        else:
+            side = "NO"
+            shares = abs(position_count)
+
+        # Parse city from ticker (e.g., KXHIGHNY-26JAN28-B23.5 -> nyc)
+        city_map = {"NY": "nyc", "CHI": "chicago", "MIA": "miami", "AUS": "austin", "LA": "la", "DEN": "denver", "PHL": "philadelphia"}
+        city = "unknown"
+        for code, city_key in city_map.items():
+            if f"KXHIGH{code}" in ticker:
+                city = city_key
+                break
+
+        # Parse date from ticker
+        date_match = re.search(r'-(\d{2})([A-Z]{3})(\d{2})', ticker)
+        target_date = None
+        if date_match:
+            months = {"JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+                      "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12}
+            try:
+                from datetime import date as dt_date
+                year = 2000 + int(date_match.group(1))
+                month = months.get(date_match.group(2), 1)
+                day = int(date_match.group(3))
+                target_date = dt_date(year, month, day)
+            except:
+                pass
+
+        entry_price = avg_price / 100.0
+
+        legacy_position = {
+            "id": f"sync_{ticker}_{datetime.now().timestamp()}",
+            "open_time": datetime.now(),
+            "city": city,
+            "outcome": ticker.split("-")[-1] if "-" in ticker else ticker,
+            "side": side,
+            "size": shares * entry_price,
+            "entry_price": entry_price,
+            "current_price": entry_price,
+            "edge_at_entry": 0.0,  # Unknown for synced positions
+            "forecast_prob": 0.5,
+            "market_prob_at_entry": entry_price,
+            "status": "OPEN",
+            "mode": "LIVE (synced)",
+            "is_demo": False,
+            "condition_id": ticker,
+            "ticker": ticker,
+            "target_date": target_date,
+            "unrealized_pnl": 0.0,
+            "position_obj": None,
+            "exchange_order_id": None,
+            "shares": shares,
+        }
+
+        st.session_state.open_positions.append(legacy_position)
+        synced += 1
+
+    st.session_state.positions_synced = True
+    return synced
 
 
 # ========================
@@ -1236,6 +1340,21 @@ def main():
 
             if is_live:
                 st.sidebar.error("⚠️ LIVE TRADING ENABLED - Real orders will be submitted")
+
+                # Auto-sync positions on first live connection
+                if not st.session_state.positions_synced:
+                    synced = sync_positions_from_kalshi()
+                    if synced > 0:
+                        add_alert(f"Synced {synced} positions from Kalshi", "success")
+
+                # Manual sync button
+                if st.sidebar.button("🔄 Sync Positions from Kalshi"):
+                    synced = sync_positions_from_kalshi()
+                    if synced > 0:
+                        add_alert(f"Synced {synced} new positions", "success")
+                    else:
+                        add_alert("No new positions to sync", "info")
+                    st.rerun()
 
     # Demo mode toggle
     st.sidebar.markdown("---")
