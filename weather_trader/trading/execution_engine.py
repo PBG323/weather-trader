@@ -298,16 +298,86 @@ class ExecutionEngine:
             return False
 
     async def _submit_market_order(self, order: Order) -> bool:
-        """Submit a market order to Polymarket."""
-        # Implementation will use py-clob-client
-        # For now, placeholder
-        return True
+        """Submit a market order (FOK) to Polymarket."""
+        try:
+            from ..polymarket.client import (
+                Order as PolyOrder, OrderSide as PolySide,
+                OrderType as PolyOrderType,
+            )
+
+            poly_order = PolyOrder(
+                market=None,
+                side=PolySide.BUY if order.side == OrderSide.BUY else PolySide.SELL,
+                token_id=order.token_id,
+                size=order.shares,
+                price=order.price,
+                order_type=PolyOrderType.FOK,
+            )
+
+            result = await self.polymarket_client.place_order(poly_order)
+
+            if result.success:
+                order.exchange_order_id = result.order_id
+                order.filled_shares = result.filled_size if result.filled_size else order.shares
+                order.filled_price = result.filled_price if result.filled_price else order.price
+                order.filled_value = order.filled_shares * order.filled_price
+                order.filled_at = datetime.now()
+                order.status = OrderStatus.FILLED
+                self._process_fill(order)
+                logger.info(f"Market order {order.order_id} filled, exchange ID: {result.order_id}")
+            else:
+                order.status = OrderStatus.REJECTED
+                order.error_message = result.message
+                logger.warning(f"Market order {order.order_id} rejected: {result.message}")
+
+            return result.success
+
+        except Exception as e:
+            order.status = OrderStatus.REJECTED
+            order.error_message = str(e)
+            logger.error(f"Market order {order.order_id} failed: {e}")
+            return False
 
     async def _submit_limit_order(self, order: Order) -> bool:
-        """Submit a limit order to Polymarket."""
-        # Implementation will use py-clob-client
-        # For now, placeholder
-        return True
+        """Submit a limit order (GTC) to Polymarket."""
+        try:
+            from ..polymarket.client import (
+                Order as PolyOrder, OrderSide as PolySide,
+                OrderType as PolyOrderType,
+            )
+
+            poly_order = PolyOrder(
+                market=None,
+                side=PolySide.BUY if order.side == OrderSide.BUY else PolySide.SELL,
+                token_id=order.token_id,
+                size=order.shares,
+                price=order.price,
+                order_type=PolyOrderType.LIMIT,
+            )
+
+            result = await self.polymarket_client.place_order(poly_order)
+
+            if result.success:
+                order.exchange_order_id = result.order_id
+                order.filled_shares = result.filled_size if result.filled_size else order.shares
+                order.filled_price = result.filled_price if result.filled_price else order.price
+                order.filled_value = order.filled_shares * order.filled_price
+                order.filled_at = datetime.now()
+                order.status = OrderStatus.FILLED
+                self._process_fill(order)
+                logger.info(f"Limit order {order.order_id} filled, exchange ID: {result.order_id}")
+            else:
+                order.status = OrderStatus.REJECTED
+                order.error_message = result.message
+                logger.warning(f"Limit order {order.order_id} rejected: {result.message}")
+
+            return result.success
+
+        except Exception as e:
+            order.status = OrderStatus.REJECTED
+            order.error_message = str(e)
+            logger.error(f"Limit order {order.order_id} failed: {e}")
+            return False
 
     async def _simulate_fill(self, order: Order) -> None:
         """Simulate order fill for testing."""

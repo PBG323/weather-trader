@@ -11,6 +11,8 @@ Key concepts:
 """
 
 import time
+import asyncio
+import logging
 import httpx
 from dataclasses import dataclass
 from datetime import datetime
@@ -20,6 +22,16 @@ from enum import Enum
 from ..config import config
 from .auth import PolymarketAuth
 from .markets import WeatherMarket
+
+try:
+    from py_clob_client.client import ClobClient
+    from py_clob_client.clob_types import OrderArgs, MarketOrderArgs, OrderType as ClobOrderType
+    from py_clob_client.order_builder.constants import BUY, SELL
+    HAS_CLOB_CLIENT = True
+except ImportError:
+    HAS_CLOB_CLIENT = False
+
+logger = logging.getLogger(__name__)
 
 
 class OrderSide(Enum):
@@ -77,6 +89,9 @@ class PolymarketClient:
         self.clob_url = config.api.polymarket_clob_url
         self.client = httpx.AsyncClient(timeout=30.0)
 
+        # Lazy-initialized ClobClient for live order submission
+        self._clob_client: Optional["ClobClient"] = None
+
         # Rate limiting
         self._last_request_time = 0
         self._min_request_interval = 0.1  # 100ms between requests
@@ -98,6 +113,27 @@ class PolymarketClient:
         if elapsed < self._min_request_interval:
             time.sleep(self._min_request_interval - elapsed)
         self._last_request_time = time.time()
+
+    def _init_clob_client(self) -> "ClobClient":
+        """Lazily initialize the py-clob-client ClobClient for live order submission."""
+        if self._clob_client is not None:
+            return self._clob_client
+
+        if not HAS_CLOB_CLIENT:
+            raise RuntimeError("py-clob-client is not installed. Install with: pip install py-clob-client")
+
+        if not self.auth.is_configured:
+            raise RuntimeError("Wallet not configured for live trading")
+
+        self._clob_client = ClobClient(
+            host="https://clob.polymarket.com",
+            key=self.auth.wallet.private_key,
+            chain_id=137,
+            signature_type=0,  # EOA wallet
+        )
+        self._clob_client.set_api_creds(self._clob_client.create_or_derive_api_creds())
+        logger.info("ClobClient initialized for live trading")
+        return self._clob_client
 
     async def get_orderbook(self, token_id: str) -> dict:
         """
@@ -203,38 +239,58 @@ class PolymarketClient:
 
         self._rate_limit()
 
-        # In production, use py-clob-client for proper order signing
-        # This is a placeholder showing the order structure
-        order_payload = {
-            "tokenID": order.token_id,
-            "price": str(order.price),
-            "size": str(order.size),
-            "side": order.side.value,
-            "feeRateBps": "0",
-            "nonce": str(int(time.time() * 1000)),
-            "expiration": "0",  # Never expires for GTC
-            "taker": self.auth.address,
-        }
-
         try:
-            # The actual implementation would use py-clob-client
-            # For now, we'll return a simulated result
-            endpoint = f"{self.clob_url}/order"
-
-            # Note: In production, you'd sign the order with the wallet
-            # headers = {"Authorization": f"Bearer {signed_auth}"}
-
-            # Simulated response for development
+            clob = self._init_clob_client()
+        except RuntimeError as e:
+            logger.warning(f"ClobClient not available, falling back to simulation: {e}")
             return OrderResult(
                 success=True,
                 order_id=f"sim_{int(time.time())}",
                 filled_size=order.size,
                 filled_price=order.price,
-                message="Order placed (simulated)",
+                message="Order placed (simulated - clob client unavailable)",
+                timestamp=datetime.now(),
+            )
+
+        side = BUY if order.side == OrderSide.BUY else SELL
+
+        try:
+            if order.order_type == OrderType.FOK:
+                # Market order (fill-or-kill)
+                market_args = MarketOrderArgs(
+                    token_id=order.token_id,
+                    amount=round(order.size, 2),
+                    side=side,
+                )
+                signed_order = await asyncio.to_thread(clob.create_market_order, market_args)
+                response = await asyncio.to_thread(clob.post_order, signed_order, ClobOrderType.FOK)
+            else:
+                # Limit order (GTC)
+                order_args = OrderArgs(
+                    token_id=order.token_id,
+                    price=round(order.price, 2),
+                    size=round(order.size, 2),
+                    side=side,
+                )
+                signed_order = await asyncio.to_thread(clob.create_order, order_args)
+                response = await asyncio.to_thread(clob.post_order, signed_order, ClobOrderType.GTC)
+
+            logger.info(f"CLOB response: {response}")
+
+            success = response.get("success", False) if isinstance(response, dict) else False
+            order_id = response.get("orderID") if isinstance(response, dict) else None
+
+            return OrderResult(
+                success=success,
+                order_id=order_id,
+                filled_size=order.size if success else 0,
+                filled_price=order.price if success else 0,
+                message=response.get("status", "submitted") if isinstance(response, dict) else str(response),
                 timestamp=datetime.now(),
             )
 
         except Exception as e:
+            logger.error(f"Order submission failed: {e}")
             return OrderResult(
                 success=False,
                 order_id=None,
