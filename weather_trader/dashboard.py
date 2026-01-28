@@ -27,6 +27,10 @@ def get_est_now() -> datetime:
     """Get current time in EST."""
     return datetime.now(EST)
 
+def today_est() -> date:
+    """Get today's date in Eastern time (Kalshi market timezone)."""
+    return datetime.now(EST).date()
+
 def format_est_time(dt: datetime = None) -> str:
     """Format datetime in EST."""
     if dt is None:
@@ -246,7 +250,7 @@ def record_price(market_id: str, price: float):
 def generate_demo_markets(forecasts):
     """Generate demo markets based on real forecasts for testing."""
     markets = []
-    target_date = date.today() + timedelta(days=1)
+    target_date = today_est() + timedelta(days=1)
 
     for city_key in get_all_cities():
         if city_key not in forecasts:
@@ -362,7 +366,7 @@ async def _fetch_model_comparison():
     from weather_trader.apis.open_meteo import WeatherModel
 
     comparisons = {}
-    target_date = date.today() + timedelta(days=1)
+    target_date = today_est() + timedelta(days=1)
 
     async with OpenMeteoClient() as om_client:
         for city_key in get_all_cities():
@@ -446,7 +450,7 @@ def fetch_forecasts_with_models():
 # (Must be module-level, NOT session state, to work inside @st.cache_data functions)
 _tomorrow_io_last_call: Optional[datetime] = None
 _tomorrow_io_calls_today: int = 0
-_tomorrow_io_call_date: date = date.today()
+_tomorrow_io_call_date: date = today_est()
 
 
 def can_call_tomorrow_io() -> bool:
@@ -462,9 +466,9 @@ def can_call_tomorrow_io() -> bool:
     global _tomorrow_io_calls_today, _tomorrow_io_call_date
 
     # Reset counter if it's a new day
-    if _tomorrow_io_call_date != date.today():
+    if _tomorrow_io_call_date != today_est():
         _tomorrow_io_calls_today = 0
-        _tomorrow_io_call_date = date.today()
+        _tomorrow_io_call_date = today_est()
 
     # 500 calls/day, use 480 (leave 20 buffer for manual refreshes)
     if _tomorrow_io_calls_today >= 480:
@@ -483,9 +487,9 @@ def record_tomorrow_io_call(count: int = 1):
 def get_tomorrow_io_usage() -> dict:
     """Get Tomorrow.io API usage stats for display."""
     global _tomorrow_io_calls_today, _tomorrow_io_call_date
-    if _tomorrow_io_call_date != date.today():
+    if _tomorrow_io_call_date != today_est():
         _tomorrow_io_calls_today = 0
-        _tomorrow_io_call_date = date.today()
+        _tomorrow_io_call_date = today_est()
     return {
         "calls_today": _tomorrow_io_calls_today,
         "daily_limit": 500,
@@ -504,8 +508,8 @@ async def _fetch_forecasts_with_models():
     city-level entry (forecasts["nyc"]) pointing to tomorrow's forecast for visualization.
     """
     forecasts = {}
-    target_dates = [date.today() + timedelta(days=d) for d in range(4)]  # today..+3
-    tomorrow = date.today() + timedelta(days=1)
+    target_dates = [today_est() + timedelta(days=d) for d in range(4)]  # today..+3
+    tomorrow = today_est() + timedelta(days=1)
 
     # Check if Tomorrow.io is available
     use_tomorrow_io = (
@@ -671,7 +675,7 @@ def calculate_signals(forecasts, markets, show_all_outcomes=False):
     market_groups = {}
     for market in markets:
         city_key = market["city"].lower()
-        target_date = market.get("target_date", date.today())
+        target_date = market.get("target_date", today_est())
         group_key = f"{city_key}_{target_date}"
         if group_key not in market_groups:
             market_groups[group_key] = []
@@ -682,7 +686,7 @@ def calculate_signals(forecasts, markets, show_all_outcomes=False):
             continue
 
         city_key = group_markets[0]["city"].lower()
-        target_date = group_markets[0].get("target_date", date.today())
+        target_date = group_markets[0].get("target_date", today_est())
         date_key = f"{city_key}_{target_date.isoformat()}"
 
         fc = forecasts.get(date_key) or forecasts.get(city_key)
@@ -799,7 +803,7 @@ def execute_trade(signal, size, is_live=False):
     entry_price = yes_price
 
     # Determine settlement date
-    target_date = signal.get("target_date", date.today() + timedelta(days=1))
+    target_date = signal.get("target_date", today_est() + timedelta(days=1))
     if isinstance(target_date, date) and not isinstance(target_date, datetime):
         settlement_date = datetime.combine(target_date, datetime.max.time())
     else:
@@ -1593,7 +1597,7 @@ def main():
     # =====================
     with tab2:
         st.header("🌡️ Weather Forecasts")
-        target_date = date.today() + timedelta(days=1)
+        target_date = today_est() + timedelta(days=1)
         st.caption(f"Tomorrow: {target_date.strftime('%A, %B %d, %Y')}")
 
         if forecasts:
@@ -1699,7 +1703,7 @@ def main():
             market_groups = {}
             for market in markets:
                 city = market.get("city_name", market["city"])
-                target_date = market.get("target_date", date.today())
+                target_date = market.get("target_date", today_est())
                 group_key = f"{city} - {target_date}"
                 if group_key not in market_groups:
                     market_groups[group_key] = {
