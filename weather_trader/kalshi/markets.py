@@ -329,10 +329,10 @@ class KalshiMarketFinder:
         subtitle = market_data.get("subtitle", "") or market_data.get("title", "")
 
         # Extract temperature range from floor_strike / cap_strike
-        # IMPORTANT: Kalshi uses EXCLUSIVE upper bounds (cap_strike)
-        # - cap_strike = 15 means "below 15" = "14 or below"
-        # - floor_strike = 15, cap_strike = 17 means "15-16" (15 and 16 only)
-        # - floor_strike = 20 means "20 or above" (inclusive)
+        # Kalshi bracket interpretation:
+        # - "or below" brackets: cap_strike is EXCLUSIVE (cap=15 means ≤14)
+        # - "or above" brackets: floor_strike is INCLUSIVE (floor=20 means ≥20)
+        # - Range brackets: floor and cap are the actual integers (floor=15, cap=16 means 15-16)
         floor_strike = market_data.get("floor_strike")
         cap_strike = market_data.get("cap_strike")
 
@@ -340,15 +340,15 @@ class KalshiMarketFinder:
         temp_high = None
 
         if floor_strike is not None and cap_strike is not None:
-            # Range bracket: floor is inclusive, cap is exclusive
+            # Range bracket: floor and cap are the actual integer bounds
             temp_low = float(floor_strike)
-            temp_high = float(cap_strike) - 1  # Convert exclusive to inclusive
+            temp_high = float(cap_strike)
         elif floor_strike is not None:
             # "X or higher" bracket - floor is inclusive
             temp_low = float(floor_strike)
             temp_high = None
         elif cap_strike is not None:
-            # "X or lower" bracket - cap is exclusive, so subtract 1
+            # "X or lower" bracket - cap is EXCLUSIVE, so subtract 1
             temp_low = None
             temp_high = float(cap_strike) - 1
         else:
