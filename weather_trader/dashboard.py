@@ -1433,10 +1433,10 @@ def check_smart_exits(forecasts, markets):
                     should_exit = True
                     exit_reason = ExitReason.STOP_LOSS
 
-            # 4. TRAILING STOP - Exit if gave back 30%+ of peak profit (always applies)
+            # 4. TRAILING STOP - Exit if gave back 20%+ of peak profit (always applies)
             elif peak_pnl > 0 and unrealized_pnl > 0:
                 drawdown = (peak_pnl - unrealized_pnl) / peak_pnl
-                if drawdown > 0.30:
+                if drawdown > 0.20:
                     should_exit = True
                     exit_reason = ExitReason.TRAILING_STOP
 

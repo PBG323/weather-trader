@@ -77,9 +77,9 @@ class TradingConfig:
     )
 
     # Trailing stop: lock in gains after position is profitable
-    # e.g., 0.30 = if up 20%, stop triggers if falls back to 14%
+    # e.g., 0.20 = if up 20%, stop triggers if falls back to 16%
     trailing_stop_pct: float = field(
-        default_factory=lambda: float(os.getenv("TRAILING_STOP_PCT", "0.30"))
+        default_factory=lambda: float(os.getenv("TRAILING_STOP_PCT", "0.20"))
     )
 
     # ========================
