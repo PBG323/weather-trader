@@ -223,7 +223,7 @@ class EnsembleForecaster:
         if len(highs) >= 3:
             median_high = np.median(highs)
             deviations = np.abs(highs - median_high)
-            # Dampening scale: 3°F deviation → 60% of original weight
+            # Dampening scale: 3°F deviation → 75% weight, 6°F → 32% weight
             dampening = np.exp(-0.5 * (deviations / 4.0) ** 2)
             weights = raw_weights * dampening
         else:

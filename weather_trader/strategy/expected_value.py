@@ -121,7 +121,9 @@ class ExpectedValueCalculator:
                 bracket.temp_low, for_high=is_high
             )
         else:
-            forecast_prob = 0.0
+            # Malformed bracket with no temperature bounds - use market price as fair value
+            # This prevents false signals; edge will be 0
+            forecast_prob = bracket.yes_price
 
         # Market implied probability from bracket price
         market_prob = bracket.yes_price
@@ -140,17 +142,9 @@ class ExpectedValueCalculator:
             side = "NO"
             expected_value = -edge  # EV per dollar on NO
 
-        # Calculate model agreement
-        if forecast.model_forecasts:
-            temps = [f.forecast_high if is_high else f.forecast_low
-                     for f in forecast.model_forecasts]
-            if temps:
-                import numpy as np
-                model_agreement = 1 / (1 + np.std(temps) / 5)
-            else:
-                model_agreement = 0.5
-        else:
-            model_agreement = 0.5
+        # Use forecast's pre-calculated confidence as model agreement
+        # This is computed in ensemble.py using consensus-based formula
+        model_agreement = forecast.confidence
 
         return TradeSignal(
             market=market,

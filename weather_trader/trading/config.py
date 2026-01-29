@@ -61,6 +61,12 @@ class TradingConfig:
         default_factory=lambda: int(os.getenv("NEGATIVE_TREND_THRESHOLD", "3"))
     )
 
+    # Minimum slope magnitude to consider edge trend significant
+    # e.g., -0.005 means edge must be declining by 0.5% per check
+    edge_trend_slope_threshold: float = field(
+        default_factory=lambda: float(os.getenv("EDGE_TREND_SLOPE_THRESHOLD", "-0.005"))
+    )
+
     # ========================
     # EXIT PARAMETERS - STOP LOSS
     # ========================

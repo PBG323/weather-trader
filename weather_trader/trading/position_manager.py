@@ -400,7 +400,8 @@ class PositionManager:
             if negative_trend_count >= self.config.negative_trend_threshold:
                 # Edge is consistently shrinking
                 edge_trend = position.get_edge_trend()
-                if edge_trend < -0.005:  # Significant negative trend
+                slope_threshold = getattr(self.config, 'edge_trend_slope_threshold', -0.005)
+                if edge_trend < slope_threshold:  # Significant negative trend
                     return True, ExitReason.MOMENTUM_SHIFT
 
         # No exit trigger - continue holding
@@ -433,8 +434,12 @@ class PositionManager:
         position.exit_reason = reason
         position.status = PositionStatus.CLOSED
 
-        # Calculate realized P/L
-        exit_value = exit_price * position.shares
+        # Calculate realized P/L (exit_price is always YES price for consistency)
+        if position.side == "YES":
+            exit_value = exit_price * position.shares
+        else:
+            # NO position: value = (1 - YES_price) * shares
+            exit_value = (1 - exit_price) * position.shares
         position.realized_pnl = exit_value - position.cost_basis
 
         return position
