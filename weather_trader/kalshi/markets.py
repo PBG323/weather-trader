@@ -101,6 +101,11 @@ class WeatherMarket:
         return "F"
 
     @property
+    def is_same_day(self) -> bool:
+        """Check if this market is for today (same-day trading)."""
+        return self.target_date == today_est()
+
+    @property
     def total_volume(self) -> int:
         return sum(b.volume for b in self.brackets)
 
@@ -167,6 +172,7 @@ class KalshiMarketFinder:
         city_filter: Optional[str] = None,
         days_ahead: int = 3,
         active_only: bool = True,
+        include_same_day: bool = False,
     ) -> list[WeatherMarket]:
         """Discover weather temperature markets across all configured cities.
 
@@ -174,6 +180,7 @@ class KalshiMarketFinder:
             city_filter: If provided, only fetch markets for this city key.
             days_ahead: How many days ahead to look for markets.
             active_only: Only return active/open markets.
+            include_same_day: If True, include today's markets (for uncertainty-based trading).
 
         Returns:
             List of WeatherMarket objects with populated brackets.
@@ -189,7 +196,7 @@ class KalshiMarketFinder:
             created_client = True
 
         try:
-            return await self._find_weather_markets_impl(city_filter, days_ahead, active_only)
+            return await self._find_weather_markets_impl(city_filter, days_ahead, active_only, include_same_day)
         finally:
             if created_client and self._client:
                 await self._client.aclose()
@@ -200,6 +207,7 @@ class KalshiMarketFinder:
         city_filter: Optional[str] = None,
         days_ahead: int = 3,
         active_only: bool = True,
+        include_same_day: bool = False,
     ) -> list[WeatherMarket]:
         """Internal implementation of market discovery."""
         markets = []
@@ -221,11 +229,13 @@ class KalshiMarketFinder:
                     if target_date is None:
                         continue
 
-                    # Filter by date range - exclude today's markets (high temp already known)
+                    # Filter by date range
                     # CRITICAL: Use EST timezone since Kalshi markets operate in Eastern time
                     days_until = (target_date - today_est()).days
-                    if days_until <= 0 or days_until > days_ahead:
-                        continue  # Skip today and past dates
+                    if days_until < 0 or days_until > days_ahead:
+                        continue  # Skip past dates and beyond range
+                    if days_until == 0 and not include_same_day:
+                        continue  # Skip today unless explicitly requested
 
                     bracket_markets = await self._fetch_brackets(event_ticker)
                     brackets = []
@@ -386,3 +396,287 @@ class KalshiMarketFinder:
             return float(m.group(1)), float(m.group(2))
 
         return None
+
+
+@dataclass
+class SameDayUncertainty:
+    """Assessment of remaining uncertainty for a same-day temperature bracket."""
+    bracket_ticker: str
+    has_uncertainty: bool
+    current_observed_high: Optional[float]
+    remaining_forecast_high: Optional[float]
+    outcome_determined: bool  # True if outcome is already known
+    probability_adjustment: float  # Multiplier for confidence (0-1)
+    reason: str
+
+
+class SameDayTradingChecker:
+    """
+    Determines if same-day temperature brackets have genuine remaining uncertainty.
+
+    Uses current NWS observations + remaining hourly forecast to assess whether
+    the final high temperature outcome can still change.
+    """
+
+    def __init__(self):
+        self._cache: dict[str, tuple[float, Optional[float], datetime]] = {}
+        self._cache_ttl_minutes = 15  # Refresh observations every 15 min
+
+    async def get_current_conditions(
+        self,
+        city_config: CityConfig
+    ) -> tuple[Optional[float], Optional[float]]:
+        """
+        Get current observed high and remaining forecast high for a city.
+
+        Returns:
+            Tuple of (current_observed_high, remaining_forecast_high)
+        """
+        from ..apis.nws import NWSClient
+
+        cache_key = city_config.key
+        now = datetime.now(EST)
+
+        # Check cache
+        if cache_key in self._cache:
+            cached_obs, cached_remaining, cached_time = self._cache[cache_key]
+            if (now - cached_time).total_seconds() < self._cache_ttl_minutes * 60:
+                return cached_obs, cached_remaining
+
+        async with NWSClient() as nws:
+            current_high = await nws.get_current_day_high(city_config)
+            remaining_forecast = await nws.get_remaining_day_forecast(city_config)
+
+        remaining_high = None
+        if remaining_forecast:
+            remaining_high = remaining_forecast.get("remaining_high")
+
+        # Cache the result
+        self._cache[cache_key] = (current_high, remaining_high, now)
+
+        return current_high, remaining_high
+
+    async def check_bracket_uncertainty(
+        self,
+        bracket: TemperatureBracket,
+        city_config: CityConfig,
+        current_high: Optional[float] = None,
+        remaining_high: Optional[float] = None
+    ) -> SameDayUncertainty:
+        """
+        Assess whether a same-day bracket still has genuine uncertainty.
+
+        Logic:
+        - If current observed high already exceeds bracket's upper bound,
+          and bracket is "X-Y°F", the outcome is DETERMINED (bracket lost).
+        - If current observed high is below bracket's lower bound and
+          remaining forecast is also below, bracket will likely lose.
+        - If there's overlap between possible final high and bracket range,
+          genuine uncertainty exists.
+
+        Args:
+            bracket: The temperature bracket to assess
+            city_config: City configuration
+            current_high: Pre-fetched current observed high (optional)
+            remaining_high: Pre-fetched remaining forecast high (optional)
+
+        Returns:
+            SameDayUncertainty assessment
+        """
+        # Fetch conditions if not provided
+        if current_high is None or remaining_high is None:
+            fetched_current, fetched_remaining = await self.get_current_conditions(city_config)
+            current_high = current_high or fetched_current
+            remaining_high = remaining_high if remaining_high is not None else fetched_remaining
+
+        # If we can't get observations, be conservative - don't allow trading
+        if current_high is None:
+            return SameDayUncertainty(
+                bracket_ticker=bracket.ticker,
+                has_uncertainty=False,
+                current_observed_high=None,
+                remaining_forecast_high=remaining_high,
+                outcome_determined=False,
+                probability_adjustment=0.0,
+                reason="Unable to fetch current observations"
+            )
+
+        # Calculate the potential final high
+        # The final high will be MAX(current_observed_high, remaining_forecast_temps)
+        if remaining_high is not None:
+            potential_final_high = max(current_high, remaining_high)
+            # Add uncertainty buffer (+/- 2°F for forecast error)
+            potential_high_upper = potential_final_high + 2.0
+            potential_high_lower = current_high  # Can't go below what's observed
+        else:
+            # No remaining forecast means day is essentially over
+            potential_final_high = current_high
+            potential_high_upper = current_high + 0.5  # Small buffer for late readings
+            potential_high_lower = current_high
+
+        temp_low = bracket.temp_low
+        temp_high = bracket.temp_high
+
+        # Case 1: "X°F or below" bracket (temp_low is None)
+        if temp_low is None and temp_high is not None:
+            if current_high > temp_high:
+                # Already exceeded - bracket LOST, outcome determined
+                return SameDayUncertainty(
+                    bracket_ticker=bracket.ticker,
+                    has_uncertainty=False,
+                    current_observed_high=current_high,
+                    remaining_forecast_high=remaining_high,
+                    outcome_determined=True,
+                    probability_adjustment=0.0,
+                    reason=f"Current high {current_high:.0f}°F already exceeds {temp_high:.0f}°F threshold"
+                )
+            elif potential_high_upper <= temp_high:
+                # Will stay below - bracket likely WON
+                return SameDayUncertainty(
+                    bracket_ticker=bracket.ticker,
+                    has_uncertainty=False,
+                    current_observed_high=current_high,
+                    remaining_forecast_high=remaining_high,
+                    outcome_determined=True,
+                    probability_adjustment=0.0,
+                    reason=f"High will likely stay below {temp_high:.0f}°F (current: {current_high:.0f}°F)"
+                )
+            else:
+                # Uncertain - could go either way
+                uncertainty_range = potential_high_upper - potential_high_lower
+                adjustment = min(1.0, uncertainty_range / 5.0)  # Scale by uncertainty
+                return SameDayUncertainty(
+                    bracket_ticker=bracket.ticker,
+                    has_uncertainty=True,
+                    current_observed_high=current_high,
+                    remaining_forecast_high=remaining_high,
+                    outcome_determined=False,
+                    probability_adjustment=adjustment,
+                    reason=f"Genuine uncertainty: current {current_high:.0f}°F, threshold {temp_high:.0f}°F"
+                )
+
+        # Case 2: "X°F or above" bracket (temp_high is None)
+        elif temp_high is None and temp_low is not None:
+            if current_high >= temp_low:
+                # Already reached - bracket WON, outcome determined
+                return SameDayUncertainty(
+                    bracket_ticker=bracket.ticker,
+                    has_uncertainty=False,
+                    current_observed_high=current_high,
+                    remaining_forecast_high=remaining_high,
+                    outcome_determined=True,
+                    probability_adjustment=0.0,
+                    reason=f"Current high {current_high:.0f}°F already reached {temp_low:.0f}°F threshold"
+                )
+            elif potential_high_upper < temp_low:
+                # Won't reach - bracket likely LOST
+                return SameDayUncertainty(
+                    bracket_ticker=bracket.ticker,
+                    has_uncertainty=False,
+                    current_observed_high=current_high,
+                    remaining_forecast_high=remaining_high,
+                    outcome_determined=True,
+                    probability_adjustment=0.0,
+                    reason=f"High unlikely to reach {temp_low:.0f}°F (potential max: {potential_high_upper:.0f}°F)"
+                )
+            else:
+                # Uncertain
+                gap = temp_low - current_high
+                adjustment = min(1.0, max(0.3, 1.0 - gap / 10.0))
+                return SameDayUncertainty(
+                    bracket_ticker=bracket.ticker,
+                    has_uncertainty=True,
+                    current_observed_high=current_high,
+                    remaining_forecast_high=remaining_high,
+                    outcome_determined=False,
+                    probability_adjustment=adjustment,
+                    reason=f"Genuine uncertainty: current {current_high:.0f}°F, need {temp_low:.0f}°F"
+                )
+
+        # Case 3: "X to Y°F" range bracket
+        elif temp_low is not None and temp_high is not None:
+            if current_high > temp_high:
+                # Already exceeded upper bound - bracket LOST
+                return SameDayUncertainty(
+                    bracket_ticker=bracket.ticker,
+                    has_uncertainty=False,
+                    current_observed_high=current_high,
+                    remaining_forecast_high=remaining_high,
+                    outcome_determined=True,
+                    probability_adjustment=0.0,
+                    reason=f"Current high {current_high:.0f}°F exceeds bracket upper bound {temp_high:.0f}°F"
+                )
+            elif potential_high_upper < temp_low:
+                # Won't reach lower bound - bracket LOST
+                return SameDayUncertainty(
+                    bracket_ticker=bracket.ticker,
+                    has_uncertainty=False,
+                    current_observed_high=current_high,
+                    remaining_forecast_high=remaining_high,
+                    outcome_determined=True,
+                    probability_adjustment=0.0,
+                    reason=f"High unlikely to reach bracket range {temp_low:.0f}-{temp_high:.0f}°F"
+                )
+            elif current_high >= temp_low and potential_high_upper <= temp_high:
+                # Locked into bracket range - bracket likely WON
+                return SameDayUncertainty(
+                    bracket_ticker=bracket.ticker,
+                    has_uncertainty=False,
+                    current_observed_high=current_high,
+                    remaining_forecast_high=remaining_high,
+                    outcome_determined=True,
+                    probability_adjustment=0.0,
+                    reason=f"High locked in bracket {temp_low:.0f}-{temp_high:.0f}°F range"
+                )
+            else:
+                # Genuine uncertainty - outcome could still change
+                # Calculate how much of the bracket range overlaps with potential outcomes
+                overlap_low = max(temp_low, potential_high_lower)
+                overlap_high = min(temp_high, potential_high_upper)
+                overlap = max(0, overlap_high - overlap_low)
+                bracket_range = temp_high - temp_low
+                adjustment = min(1.0, overlap / bracket_range) if bracket_range > 0 else 0.5
+                return SameDayUncertainty(
+                    bracket_ticker=bracket.ticker,
+                    has_uncertainty=True,
+                    current_observed_high=current_high,
+                    remaining_forecast_high=remaining_high,
+                    outcome_determined=False,
+                    probability_adjustment=adjustment,
+                    reason=f"Uncertain: current {current_high:.0f}°F, bracket {temp_low:.0f}-{temp_high:.0f}°F"
+                )
+
+        # Fallback - no valid bracket bounds
+        return SameDayUncertainty(
+            bracket_ticker=bracket.ticker,
+            has_uncertainty=False,
+            current_observed_high=current_high,
+            remaining_forecast_high=remaining_high,
+            outcome_determined=False,
+            probability_adjustment=0.0,
+            reason="Invalid bracket bounds"
+        )
+
+    async def filter_tradeable_brackets(
+        self,
+        market: WeatherMarket,
+        city_config: CityConfig
+    ) -> list[tuple[TemperatureBracket, SameDayUncertainty]]:
+        """
+        Filter a market's brackets to only those with genuine uncertainty.
+
+        Returns:
+            List of (bracket, uncertainty_assessment) tuples for tradeable brackets
+        """
+        # Fetch current conditions once for all brackets
+        current_high, remaining_high = await self.get_current_conditions(city_config)
+
+        tradeable = []
+        for bracket in market.brackets:
+            uncertainty = await self.check_bracket_uncertainty(
+                bracket, city_config, current_high, remaining_high
+            )
+            if uncertainty.has_uncertainty:
+                tradeable.append((bracket, uncertainty))
+
+        return tradeable

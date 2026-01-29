@@ -46,7 +46,7 @@ from weather_trader.config import get_all_cities, get_city_config, config
 from weather_trader.apis import OpenMeteoClient, TomorrowIOClient, NWSClient
 from weather_trader.models import EnsembleForecaster, BiasCorrector
 from weather_trader.models.ensemble import ModelForecast
-from weather_trader.kalshi import KalshiMarketFinder, KalshiAuth, KalshiClient
+from weather_trader.kalshi import KalshiMarketFinder, KalshiAuth, KalshiClient, SameDayTradingChecker
 from weather_trader.strategy import ExpectedValueCalculator
 from weather_trader.trading import (
     TradingConfig, PositionManager, RiskManager, ExecutionEngine,
@@ -726,8 +726,11 @@ def generate_demo_markets(forecasts):
                 "target_date": target_date,
                 "temp_unit": "F",
                 "condition_id": condition_id,
+                "ticker": condition_id,
                 "resolution_source": f"Demo - {city_config.station_name}",
                 "is_demo": True,
+                "is_same_day": False,  # Demo markets are always for tomorrow
+                "city_config": city_config,
             })
 
             record_price(condition_id, market_prob)
@@ -816,16 +819,22 @@ def fetch_real_markets():
 
 
 async def _fetch_real_markets():
-    """Fetch weather markets from Kalshi."""
+    """Fetch weather markets from Kalshi, including same-day markets with uncertainty."""
     markets = []
 
     async with KalshiMarketFinder() as finder:
         try:
-            found = await finder.find_weather_markets(active_only=True, days_ahead=3)
+            # Include same-day markets - they will be filtered by uncertainty checker
+            found = await finder.find_weather_markets(
+                active_only=True,
+                days_ahead=3,
+                include_same_day=True  # Allow same-day markets through
+            )
             add_alert(f"Kalshi API: Found {len(found)} market events", "info")
 
             for market in found:
-                add_alert(f"Processing {market.city}: {len(market.brackets)} brackets", "info")
+                is_same_day = market.is_same_day
+                add_alert(f"Processing {market.city}: {len(market.brackets)} brackets (same_day={is_same_day})", "info")
                 for bracket in market.brackets:
                     markets.append({
                         "city": market.city,
@@ -845,8 +854,10 @@ async def _fetch_real_markets():
                         "ticker": bracket.ticker,
                         "resolution_source": market.resolution_source,
                         "is_demo": False,
+                        "is_same_day": is_same_day,  # Flag for uncertainty check
                         "event_ticker": market.event_ticker,
                         "total_market_volume": market.total_volume,
+                        "city_config": market.city_config,  # For uncertainty checker
                     })
                     record_price(bracket.ticker, bracket.yes_price)
         except Exception as e:
@@ -1079,6 +1090,83 @@ async def _fetch_forecasts_with_models():
     return forecasts
 
 
+def check_same_day_uncertainty(markets):
+    """
+    Check same-day markets for genuine remaining uncertainty.
+
+    Returns a dict mapping ticker -> SameDayUncertainty assessment.
+    Only same-day markets are checked; future markets are not included.
+    """
+    return run_async(_check_same_day_uncertainty_async(markets))
+
+
+async def _check_same_day_uncertainty_async(markets):
+    """Async implementation of same-day uncertainty checking."""
+    from weather_trader.kalshi.markets import TemperatureBracket
+
+    uncertainty_map = {}
+    checker = SameDayTradingChecker()
+
+    # Group same-day markets by city to batch the NWS calls
+    same_day_by_city = {}
+    for market in markets:
+        if market.get("is_same_day", False):
+            city_key = market["city"].lower()
+            if city_key not in same_day_by_city:
+                same_day_by_city[city_key] = []
+            same_day_by_city[city_key].append(market)
+
+    if not same_day_by_city:
+        return uncertainty_map
+
+    # Process each city
+    for city_key, city_markets in same_day_by_city.items():
+        try:
+            city_config = city_markets[0].get("city_config")
+            if not city_config:
+                city_config = get_city_config(city_key)
+
+            # Fetch current conditions once per city
+            current_high, remaining_high = await checker.get_current_conditions(city_config)
+
+            for market in city_markets:
+                ticker = market.get("ticker", market.get("condition_id", ""))
+
+                # Create a TemperatureBracket for the checker
+                bracket = TemperatureBracket(
+                    ticker=ticker,
+                    event_ticker=market.get("event_ticker", ""),
+                    description=market.get("outcome_desc", ""),
+                    temp_low=market.get("temp_low"),
+                    temp_high=market.get("temp_high"),
+                    yes_price_cents=int(market.get("yes_price", 0.5) * 100),
+                )
+
+                # Check uncertainty for this bracket
+                uncertainty = await checker.check_bracket_uncertainty(
+                    bracket, city_config, current_high, remaining_high
+                )
+                uncertainty_map[ticker] = uncertainty
+
+                # Log for debugging
+                if uncertainty.has_uncertainty:
+                    add_alert(
+                        f"Same-day {city_key}: {market.get('outcome_desc')} has uncertainty "
+                        f"(current: {current_high}°F, {uncertainty.reason})",
+                        "info"
+                    )
+                else:
+                    add_alert(
+                        f"Same-day {city_key}: {market.get('outcome_desc')} outcome determined - {uncertainty.reason}",
+                        "warning"
+                    )
+
+        except Exception as e:
+            add_alert(f"Error checking same-day uncertainty for {city_key}: {e}", "warning")
+
+    return uncertainty_map
+
+
 def calculate_signals(forecasts, markets, show_all_outcomes=False):
     """Calculate trading signals for multi-outcome markets.
 
@@ -1086,8 +1174,17 @@ def calculate_signals(forecasts, markets, show_all_outcomes=False):
         forecasts: Weather forecast data
         markets: Market data from Kalshi
         show_all_outcomes: If True, return signals for ALL outcomes, not just the best
+
+    Same-day markets are now supported with uncertainty-based filtering:
+    - Markets where the outcome is already determined are skipped
+    - Markets with genuine remaining uncertainty can be traded
+    - Confidence is adjusted based on the uncertainty level
     """
     signals = []
+
+    # Pre-check same-day market uncertainty
+    # This fetches current observations and forecasts from NWS
+    same_day_uncertainty = check_same_day_uncertainty(markets)
 
     # Group markets by city and date
     market_groups = {}
@@ -1105,10 +1202,11 @@ def calculate_signals(forecasts, markets, show_all_outcomes=False):
 
         city_key = group_markets[0]["city"].lower()
         target_date = group_markets[0].get("target_date", today_est())
+        is_same_day = target_date == today_est()
 
-        # CRITICAL: Skip same-day markets - high temp is already known or nearly known
-        # This prevents trading on markets where the outcome is already determined
-        if target_date <= today_est():
+        # For same-day markets, we now allow trading IF there's genuine uncertainty
+        # Skip only past dates (before today)
+        if target_date < today_est():
             continue
 
         date_key = f"{city_key}_{target_date.isoformat()}"
@@ -1128,6 +1226,28 @@ def calculate_signals(forecasts, markets, show_all_outcomes=False):
         best_edge = 0
 
         for market in group_markets:
+            ticker = market.get("ticker", market.get("condition_id", ""))
+
+            # SAME-DAY UNCERTAINTY CHECK
+            # For same-day markets, only trade if there's genuine remaining uncertainty
+            uncertainty_adjustment = 1.0  # Default: full confidence
+            if is_same_day:
+                uncertainty = same_day_uncertainty.get(ticker)
+                if uncertainty is None:
+                    # No uncertainty data - skip same-day market to be safe
+                    continue
+                if not uncertainty.has_uncertainty:
+                    # Outcome is determined - skip this bracket
+                    continue
+                if uncertainty.outcome_determined:
+                    # Outcome is known - skip
+                    continue
+                # Apply probability adjustment based on remaining uncertainty
+                uncertainty_adjustment = uncertainty.probability_adjustment
+                if uncertainty_adjustment < 0.3:
+                    # Too little uncertainty remaining - not worth the risk
+                    continue
+
             temp_low = market.get("temp_low")
             temp_high = market.get("temp_high")
             market_prob = market["yes_price"]
@@ -1150,6 +1270,14 @@ def calculate_signals(forecasts, markets, show_all_outcomes=False):
 
             edge = our_prob - market_prob
 
+            # For same-day markets, require higher edge to compensate for reduced forecast value
+            if is_same_day:
+                # Require 50% more edge for same-day trades
+                effective_edge_threshold = 0.075  # 7.5% instead of 5%
+                if abs(edge) < effective_edge_threshold:
+                    # Edge too small for same-day risk
+                    continue
+
             # Determine signal type
             if edge > 0.10:
                 signal_type = "STRONG BUY YES"
@@ -1167,6 +1295,13 @@ def calculate_signals(forecasts, markets, show_all_outcomes=False):
                 signal_type = "PASS"
                 signal_color = "#9e9e9e"
 
+            # Adjust confidence for same-day trades based on remaining uncertainty
+            base_confidence = fc["confidence"]
+            if is_same_day:
+                adjusted_confidence = base_confidence * uncertainty_adjustment
+            else:
+                adjusted_confidence = base_confidence
+
             signal_data = {
                 "city": fc["city"],
                 "city_key": city_key,
@@ -1178,13 +1313,16 @@ def calculate_signals(forecasts, markets, show_all_outcomes=False):
                 "our_prob": our_prob,
                 "market_prob": market_prob,
                 "edge": edge,
-                "confidence": fc["confidence"],
+                "confidence": adjusted_confidence,
+                "base_confidence": base_confidence,
                 "forecast_high_f": forecast_temp_f,
                 "forecast_high_market": forecast_temp_market,
                 "forecast_std": forecast_std_market,
                 "condition_id": market["condition_id"],
                 "ticker": market.get("ticker", ""),
                 "is_demo": market.get("is_demo", False),
+                "is_same_day": is_same_day,
+                "uncertainty_adjustment": uncertainty_adjustment if is_same_day else 1.0,
                 "target_date": market.get("target_date"),
                 "resolution_source": market.get("resolution_source", ""),
                 "volume": market.get("volume", 0),

@@ -373,3 +373,114 @@ class NWSClient:
         forecast_data = response.json()
 
         return forecast_data.get("properties", {}).get("periods", [])
+
+    async def get_current_day_high(
+        self,
+        city_config: CityConfig
+    ) -> Optional[float]:
+        """
+        Get the observed high temperature so far today.
+
+        This is the maximum temperature recorded since midnight local time.
+        Used for same-day market trading decisions.
+
+        Args:
+            city_config: City configuration with station ID
+
+        Returns:
+            Current observed high in Fahrenheit, or None if no observations
+        """
+        from zoneinfo import ZoneInfo
+
+        # Get observations for last 24 hours to ensure we cover today
+        observations = await self.get_station_observations(city_config, hours=24)
+
+        if not observations:
+            return None
+
+        # Filter to today's date in the city's timezone
+        # Most US cities use Eastern, Central, Mountain, or Pacific
+        # For simplicity, use the observation timestamps which are already localized
+        today = datetime.now(ZoneInfo("America/New_York")).date()
+
+        today_obs = [
+            obs for obs in observations
+            if obs.timestamp.date() == today
+        ]
+
+        if not today_obs:
+            return None
+
+        return max(obs.temperature for obs in today_obs)
+
+    async def get_remaining_day_forecast(
+        self,
+        city_config: CityConfig
+    ) -> Optional[dict]:
+        """
+        Get forecast for remaining hours of today.
+
+        Returns the forecasted high for the rest of the day, which helps
+        determine if the current observed high might be exceeded.
+
+        Args:
+            city_config: City configuration
+
+        Returns:
+            Dict with 'remaining_high' and 'confidence' keys, or None
+        """
+        if city_config.country != "US":
+            return None
+
+        try:
+            # Get hourly forecast
+            points_url = f"{self.nws_base_url}/points/{city_config.latitude},{city_config.longitude}"
+            response = await self.client.get(points_url)
+            response.raise_for_status()
+            points_data = response.json()
+
+            hourly_url = points_data.get("properties", {}).get("forecastHourly")
+            if not hourly_url:
+                return None
+
+            response = await self.client.get(hourly_url)
+            response.raise_for_status()
+            hourly_data = response.json()
+
+            periods = hourly_data.get("properties", {}).get("periods", [])
+
+            if not periods:
+                return None
+
+            from zoneinfo import ZoneInfo
+            now = datetime.now(ZoneInfo("America/New_York"))
+            today = now.date()
+
+            # Filter to remaining hours today
+            remaining_temps = []
+            for period in periods:
+                start_time_str = period.get("startTime", "")
+                if not start_time_str:
+                    continue
+
+                try:
+                    start_time = datetime.fromisoformat(start_time_str)
+                    if start_time.date() == today and start_time > now:
+                        temp = period.get("temperature")
+                        if temp is not None:
+                            remaining_temps.append(float(temp))
+                except (ValueError, TypeError):
+                    continue
+
+            if not remaining_temps:
+                # No remaining hours - day is essentially over
+                return {"remaining_high": None, "confidence": 0.95}
+
+            return {
+                "remaining_high": max(remaining_temps),
+                "hours_remaining": len(remaining_temps),
+                "confidence": 0.8 if len(remaining_temps) > 4 else 0.9
+            }
+
+        except Exception:
+            return None

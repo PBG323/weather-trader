@@ -7,7 +7,14 @@ Kalshi weather temperature markets (KXHIGH series).
 
 from .auth import KalshiAuth
 from .client import KalshiClient, OrderResult
-from .markets import KalshiMarketFinder, WeatherMarket, TemperatureBracket
+from .markets import (
+    KalshiMarketFinder,
+    WeatherMarket,
+    TemperatureBracket,
+    SameDayUncertainty,
+    SameDayTradingChecker,
+    today_est,
+)
 
 __all__ = [
     "KalshiAuth",
@@ -16,4 +23,7 @@ __all__ = [
     "KalshiMarketFinder",
     "WeatherMarket",
     "TemperatureBracket",
+    "SameDayUncertainty",
+    "SameDayTradingChecker",
+    "today_est",
 ]
