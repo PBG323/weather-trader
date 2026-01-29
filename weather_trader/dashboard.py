@@ -801,18 +801,38 @@ def reconcile_positions_with_kalshi():
     for pos_id in positions_to_remove:
         for i, pos in enumerate(st.session_state.open_positions):
             if pos["id"] == pos_id:
-                # Move to closed positions with zero P/L (already settled in Kalshi)
+                # Calculate realized P/L properly
+                entry_price = pos.get("entry_price", 0.5)
+                exit_price = pos.get("current_price", entry_price)
+                shares = pos.get("shares", 1)
+                side = pos.get("side", "YES")
+
+                if side == "YES":
+                    realized_pnl = (exit_price - entry_price) * shares
+                else:
+                    # NO position: P/L = (current_NO_value - entry_NO_price) * shares
+                    current_no_value = 1 - exit_price
+                    realized_pnl = (current_no_value - entry_price) * shares
+
+                # Use pending exit reason if position was CLOSING, otherwise generic
+                exit_reason = pos.get("exit_reason_pending", "Closed in Kalshi")
+
                 closed = {
                     **pos,
                     "close_time": datetime.now(),
-                    "close_price": pos.get("current_price", pos.get("entry_price", 0.5)),
+                    "exit_price": exit_price,
                     "status": "CLOSED",
-                    "exit_reason": "Closed in Kalshi",
-                    "realized_pnl": 0,  # Already realized in Kalshi
+                    "exit_reason": exit_reason,
+                    "realized_pnl": realized_pnl,
                 }
                 st.session_state.closed_positions.insert(0, closed)
                 st.session_state.open_positions.pop(i)
+                st.session_state.realized_pnl += realized_pnl
                 removed += 1
+
+                pnl_str = f"+${realized_pnl:.2f}" if realized_pnl >= 0 else f"-${abs(realized_pnl):.2f}"
+                add_alert(f"Position {pos.get('ticker', '')} closed ({exit_reason}): {pnl_str}",
+                         "success" if realized_pnl >= 0 else "warning")
                 break
 
     # 2. UPDATE existing positions with latest Kalshi data
@@ -2173,6 +2193,10 @@ def check_smart_exits(forecasts, markets):
     min_edge_exit = st.session_state.get("min_edge_exit_pct", 0.05)
 
     for legacy_pos in st.session_state.open_positions:
+        # Skip positions already in CLOSING state (exit order pending)
+        if legacy_pos.get("status") == "CLOSING":
+            continue
+
         position = legacy_pos.get("position_obj")
         cid = legacy_pos.get("condition_id", "") or legacy_pos.get("ticker", "")
         city_key = legacy_pos.get("city", "").lower()
@@ -2298,10 +2322,15 @@ def close_position_smart(position_id: str, current_price: float, exit_reason: Ex
             ticker = pos.get("ticker") or pos.get("condition_id", "")
             is_live_position = pos.get("mode", "").startswith("LIVE")
 
+            exit_order_submitted = False
             if is_live_position and ticker and not ticker.startswith("demo_") and st.session_state.kalshi_client is not None:
                 # Check for existing pending order to prevent duplicates
                 if has_pending_order_for_ticker(ticker):
                     add_alert(f"Skipping exit: pending order exists for {ticker}", "info")
+                    # Mark as closing - don't remove from open_positions yet
+                    pos["status"] = "CLOSING"
+                    pos["exit_reason_pending"] = exit_reason.value
+                    return 0  # Don't close yet, wait for order to fill
                 else:
                     try:
                         # Determine sell parameters
@@ -2347,12 +2376,22 @@ def close_position_smart(position_id: str, current_price: float, exit_reason: Ex
                             result = run_async(_sell_order())
 
                             if result.success:
+                                exit_order_submitted = True
                                 add_alert(f"SELL order submitted: {ticker} x{shares} @ {price_cents}c ({exit_reason.value})", "success")
+                                # Mark as CLOSING - don't remove until order fills
+                                pos["status"] = "CLOSING"
+                                pos["exit_reason_pending"] = exit_reason.value
+                                pos["exit_order_id"] = result.order_id
                             else:
                                 add_alert(f"SELL order issue: {result.message}", "warning")
 
                     except Exception as e:
                         add_alert(f"SELL order failed: {e}", "error")
+
+                # For LIVE positions: Don't remove from open_positions until Kalshi confirms closure
+                # The reconcile_positions_with_kalshi() function will handle removal when position is gone from Kalshi
+                if exit_order_submitted:
+                    return 0  # Don't close in dashboard yet - wait for Kalshi confirmation
 
             # Get Position object for accurate P/L calculation
             position = pos.get("position_obj")
