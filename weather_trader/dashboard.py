@@ -1272,8 +1272,8 @@ def calculate_signals(forecasts, markets, show_all_outcomes=False):
 
             # For same-day markets, require higher edge to compensate for reduced forecast value
             if is_same_day:
-                # Require 50% more edge for same-day trades
-                effective_edge_threshold = 0.075  # 7.5% instead of 5%
+                # Require 25% more edge for same-day trades
+                effective_edge_threshold = 0.0625  # 6.25% instead of 5%
                 if abs(edge) < effective_edge_threshold:
                     # Edge too small for same-day risk
                     continue
