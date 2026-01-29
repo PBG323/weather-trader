@@ -2912,10 +2912,11 @@ def main():
         st.sidebar.markdown('</div>', unsafe_allow_html=True)
 
     # Auto-refresh for auto-trading
+    refresh_mins = TradingDefaults.REFRESH_CYCLE_SECONDS // 60
     auto_refresh = st.sidebar.checkbox(
-        "Auto-refresh (1 min)",
+        f"Auto-refresh ({refresh_mins} min)",
         value=auto_trade,
-        help="Automatically refresh data for auto-trading"
+        help=f"Automatically refresh data every {refresh_mins} minutes for auto-trading"
     )
 
     st.sidebar.markdown("---")
