@@ -787,25 +787,41 @@ async def _fetch_model_comparison():
     from weather_trader.apis.open_meteo import WeatherModel
 
     comparisons = {}
-    target_date = today_est() + timedelta(days=1)
+    today = today_est()
+    tomorrow = today_est() + timedelta(days=1)
+
+    # Models to compare - include HRRR for US cities
+    all_models = [WeatherModel.ECMWF, WeatherModel.GFS, WeatherModel.HRRR, WeatherModel.BEST_MATCH]
 
     async with OpenMeteoClient() as om_client:
         for city_key in get_all_cities():
             city_config = get_city_config(city_key)
-            city_data = {"city": city_config.name, "models": {}}
+            city_data = {
+                "city": city_config.name,
+                "today": {"date": today, "models": {}},
+                "tomorrow": {"date": tomorrow, "models": {}},
+            }
 
-            for model in [WeatherModel.ECMWF, WeatherModel.GFS, WeatherModel.BEST_MATCH]:
+            for model in all_models:
+                # Skip HRRR for non-US cities
+                if model == WeatherModel.HRRR and city_config.country != "US":
+                    continue
+
                 try:
                     forecasts = await om_client.get_daily_forecast(city_config, model, days=3)
                     for f in forecasts:
-                        if f.timestamp.date() == target_date:
-                            city_data["models"][model.value] = {
+                        if f.timestamp.date() == today:
+                            city_data["today"]["models"][model.value] = {
                                 "high": f.temperature_high,
                                 "low": f.temperature_low
                             }
-                            break
-                except Exception:
-                    pass
+                        elif f.timestamp.date() == tomorrow:
+                            city_data["tomorrow"]["models"][model.value] = {
+                                "high": f.temperature_high,
+                                "low": f.temperature_low
+                            }
+                except Exception as e:
+                    print(f"Model comparison error for {city_key}/{model.value}: {e}")
 
             comparisons[city_key] = city_data
 
@@ -2449,47 +2465,62 @@ def main():
     # =====================
     with tab2:
         st.header("🌡️ Weather Forecasts")
-        target_date = today_est() + timedelta(days=1)
-        st.caption(f"Tomorrow: {target_date.strftime('%A, %B %d, %Y')}")
+        today = today_est()
+        tomorrow = today_est() + timedelta(days=1)
+        st.caption(f"Today: {today.strftime('%A, %B %d')} | Tomorrow: {tomorrow.strftime('%A, %B %d')}")
 
         if forecasts:
-            # Clean card-based layout (only city-level keys, skip date-specific ones)
+            # Show both today's and tomorrow's forecasts for each city
             for city_key in get_all_cities():
-                if city_key not in forecasts:
-                    continue
-                fc = forecasts[city_key]
                 city_config = get_city_config(city_key)
-                temp_unit = city_config.temp_unit
 
-                with st.container():
-                    col1, col2, col3, col4, col5 = st.columns([2, 1.5, 1.5, 1.5, 1.5])
+                # Get forecasts for today and tomorrow
+                today_key = f"{city_key}_{today.isoformat()}"
+                tomorrow_key = f"{city_key}_{tomorrow.isoformat()}"
+                fc_today = forecasts.get(today_key)
+                fc_tomorrow = forecasts.get(tomorrow_key) or forecasts.get(city_key)
 
-                    with col1:
-                        st.markdown(f"### {fc['city']}")
-                        st.caption(f"📍 {city_config.station_name}")
+                if not fc_today and not fc_tomorrow:
+                    continue
 
-                    high_f = fc['high_mean']
-                    low_f = fc['low_mean']
+                st.markdown(f"### {city_config.name}")
+                st.caption(f"📍 {city_config.station_name}")
 
-                    with col2:
-                        st.metric("High", f"{high_f:.1f}°F", f"±{fc['high_std']:.1f}°")
+                col1, col2 = st.columns(2)
 
-                    with col3:
-                        st.metric("Low", f"{low_f:.1f}°F", f"±{fc['low_std']:.1f}°")
+                # TODAY's forecast
+                with col1:
+                    st.markdown(f"**Today** ({today.strftime('%b %d')})")
+                    if fc_today:
+                        subcol1, subcol2, subcol3 = st.columns(3)
+                        with subcol1:
+                            st.metric("High", f"{fc_today['high_mean']:.1f}°F", f"±{fc_today['high_std']:.1f}°")
+                        with subcol2:
+                            st.metric("Low", f"{fc_today['low_mean']:.1f}°F")
+                        with subcol3:
+                            conf_pct = fc_today['confidence'] * 100
+                            conf_color = "🟢" if conf_pct >= 80 else "🟡" if conf_pct >= 60 else "🔴"
+                            st.metric("Conf", f"{conf_color} {conf_pct:.0f}%", f"{fc_today['model_count']} models")
+                    else:
+                        st.info("No forecast available for today")
 
-                    with col4:
-                        st.metric("90% Range", f"{fc['high_ci_lower']:.1f}-{fc['high_ci_upper']:.1f}°F")
+                # TOMORROW's forecast
+                with col2:
+                    st.markdown(f"**Tomorrow** ({tomorrow.strftime('%b %d')})")
+                    if fc_tomorrow:
+                        subcol1, subcol2, subcol3 = st.columns(3)
+                        with subcol1:
+                            st.metric("High", f"{fc_tomorrow['high_mean']:.1f}°F", f"±{fc_tomorrow['high_std']:.1f}°")
+                        with subcol2:
+                            st.metric("Low", f"{fc_tomorrow['low_mean']:.1f}°F")
+                        with subcol3:
+                            conf_pct = fc_tomorrow['confidence'] * 100
+                            conf_color = "🟢" if conf_pct >= 80 else "🟡" if conf_pct >= 60 else "🔴"
+                            st.metric("Conf", f"{conf_color} {conf_pct:.0f}%", f"{fc_tomorrow['model_count']} models")
+                    else:
+                        st.info("No forecast available for tomorrow")
 
-                    with col5:
-                        conf_pct = fc['confidence'] * 100
-                        conf_color = "🟢" if conf_pct >= 80 else "🟡" if conf_pct >= 60 else "🔴"
-                        st.metric(
-                            "Confidence",
-                            f"{conf_color} {conf_pct:.0f}%",
-                            f"{fc['model_count']} models"
-                        )
-
-                    st.divider()
+                st.divider()
 
             # Temperature comparison chart - show each city in its market unit
             st.subheader("📊 Temperature Comparison")
@@ -2686,6 +2717,7 @@ def main():
     # =====================
     with tab4:
         st.header("🔬 Model Comparison")
+        st.caption("Comparing forecasts from ECMWF, GFS, HRRR, Tomorrow.io, and Best Match models")
 
         if model_comparison:
             for city_key, data in model_comparison.items():
@@ -2694,41 +2726,59 @@ def main():
 
                 st.subheader(f"{data['city']} ({unit_label})")
 
-                if data["models"]:
-                    # Merge Tomorrow.io data from forecasts (fetched separately)
-                    if city_key in forecasts and "tomorrow.io" not in data["models"]:
-                        fc_models = forecasts[city_key].get("models", [])
-                        for m in fc_models:
-                            if m.get("model") == "tomorrow.io":
-                                data["models"]["tomorrow.io"] = {
-                                    "high": m["high"],
-                                    "low": m["low"]
-                                }
-                                break
+                # Display both TODAY and TOMORROW forecasts
+                col1, col2 = st.columns(2)
 
-                    models = list(data["models"].keys())
-                    highs = [data["models"][m]["high"] for m in models]
-                    lows = [data["models"][m]["low"] for m in models]
+                for col, day_key, day_label in [(col1, "today", "Today"), (col2, "tomorrow", "Tomorrow")]:
+                    with col:
+                        day_data = data.get(day_key, {})
+                        day_date = day_data.get("date", today_est())
+                        models_data = day_data.get("models", {})
 
-                    fig = go.Figure()
-                    fig.add_trace(go.Bar(name='High', x=models, y=highs, marker_color='#ff5722',
-                                        text=[f"{h:.1f}{unit_label}" for h in highs], textposition='outside'))
-                    fig.add_trace(go.Bar(name='Low', x=models, y=lows, marker_color='#2196f3',
-                                        text=[f"{l:.1f}{unit_label}" for l in lows], textposition='outside'))
+                        st.markdown(f"**{day_label}** ({day_date.strftime('%b %d')})")
 
-                    if city_key in forecasts:
-                        ensemble_high = forecasts[city_key]["high_mean"]
-                        fig.add_hline(y=ensemble_high, line_dash="dash",
-                                    line_color="red", annotation_text="Ensemble High")
+                        if models_data:
+                            # Merge Tomorrow.io data from forecasts (fetched separately)
+                            date_key = f"{city_key}_{day_date.isoformat()}"
+                            fc = forecasts.get(date_key) or (forecasts.get(city_key) if day_key == "tomorrow" else None)
+                            if fc and "tomorrow" not in [m.lower() for m in models_data.keys()]:
+                                fc_models = fc.get("models", [])
+                                for m in fc_models:
+                                    if m.get("model") == "tomorrow":
+                                        models_data["tomorrow.io"] = {
+                                            "high": m["high"],
+                                            "low": m["low"]
+                                        }
+                                        break
 
-                    fig.update_layout(barmode='group', height=300,
-                                    yaxis_title=f"Temperature ({unit_label})", xaxis_title="Model")
-                    st.plotly_chart(fig, use_container_width=True)
+                            models = list(models_data.keys())
+                            highs = [models_data[m]["high"] for m in models]
+                            lows = [models_data[m]["low"] for m in models]
 
-                    if len(highs) > 1:
-                        spread = max(highs) - min(highs)
-                        agreement = "High" if spread < 3 else ("Medium" if spread < 6 else "Low")
-                        st.metric("Model Agreement", agreement, f"Spread: {spread:.1f}{unit_label}")
+                            fig = go.Figure()
+                            fig.add_trace(go.Bar(name='High', x=models, y=highs, marker_color='#ff5722',
+                                                text=[f"{h:.1f}" for h in highs], textposition='outside'))
+                            fig.add_trace(go.Bar(name='Low', x=models, y=lows, marker_color='#2196f3',
+                                                text=[f"{l:.1f}" for l in lows], textposition='outside'))
+
+                            # Add ensemble line if available
+                            if fc:
+                                ensemble_high = fc.get("high_mean")
+                                if ensemble_high:
+                                    fig.add_hline(y=ensemble_high, line_dash="dash",
+                                                line_color="red", annotation_text=f"Ensemble: {ensemble_high:.1f}")
+
+                            fig.update_layout(barmode='group', height=280, showlegend=False,
+                                            yaxis_title=f"Temp ({unit_label})", xaxis_title="",
+                                            margin=dict(l=40, r=20, t=20, b=40))
+                            st.plotly_chart(fig, use_container_width=True, key=f"model_{city_key}_{day_key}")
+
+                            if len(highs) > 1:
+                                spread = max(highs) - min(highs)
+                                agreement = "High" if spread < 3 else ("Medium" if spread < 6 else "Low")
+                                st.caption(f"Agreement: {agreement} (spread: {spread:.1f}°F)")
+                        else:
+                            st.info("No model data available")
 
                 st.markdown("---")
 

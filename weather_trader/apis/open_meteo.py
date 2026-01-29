@@ -87,15 +87,20 @@ class OpenMeteoClient:
             List of ForecastPoint objects with daily high/low temperatures
         """
         # Build endpoint based on model
+        # Open-Meteo API endpoints:
+        # - /forecast: Auto-selects best model (blends multiple sources)
+        # - /ecmwf: ECMWF IFS model
+        # - /gfs: NCEP GFS model
+        # - /forecast with models=hrrr_conus: HRRR for US
         if model == WeatherModel.ECMWF:
             endpoint = f"{self.base_url}/ecmwf"
         elif model == WeatherModel.GFS:
             endpoint = f"{self.base_url}/gfs"
         elif model == WeatherModel.HRRR:
-            # HRRR only available for US
+            # HRRR only available for US via forecast endpoint with model parameter
             if city_config.country != "US":
                 raise ValueError("HRRR model only available for US cities")
-            endpoint = f"{self.base_url}/gfs"  # HRRR accessed via forecast endpoint
+            endpoint = f"{self.base_url}/forecast"
         else:
             endpoint = f"{self.base_url}/forecast"
 
@@ -107,6 +112,10 @@ class OpenMeteoClient:
             "timezone": city_config.timezone,
             "forecast_days": min(days, 16),
         }
+
+        # HRRR requires specifying the model explicitly
+        if model == WeatherModel.HRRR:
+            params["models"] = "hrrr_conus"
 
         response = await self.client.get(endpoint, params=params)
         response.raise_for_status()
@@ -205,7 +214,8 @@ class OpenMeteoClient:
         # Models to fetch based on city location
         models = [WeatherModel.ECMWF, WeatherModel.GFS]
         if city_config.country == "US":
-            models.append(WeatherModel.BEST_MATCH)  # Includes HRRR blending
+            models.append(WeatherModel.HRRR)  # Best for short-term US forecasts
+            models.append(WeatherModel.BEST_MATCH)  # Auto-blend model
 
         for model in models:
             try:
