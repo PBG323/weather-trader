@@ -1079,6 +1079,46 @@ def close_position_smart(position_id: str, current_price: float, exit_reason: Ex
     """Close an open position with specified exit reason and realize P/L."""
     for i, pos in enumerate(st.session_state.open_positions):
         if pos["id"] == position_id:
+            # Submit SELL order to Kalshi if live trading
+            ticker = pos.get("ticker") or pos.get("condition_id", "")
+            is_live_position = pos.get("mode", "").startswith("LIVE")
+
+            if is_live_position and ticker and not ticker.startswith("demo_") and st.session_state.kalshi_client is not None:
+                try:
+                    # Determine sell parameters
+                    shares = pos.get("shares") or int(pos.get("size", 1) / max(0.01, pos.get("entry_price", 0.5)))
+                    original_side = pos.get("side", "YES")
+
+                    # To close: sell what we bought
+                    # If we bought YES, we sell YES
+                    # If we bought NO, we sell NO
+                    kalshi_side = "yes" if original_side == "YES" else "no"
+
+                    # Use current market price with fill offset for faster exit
+                    fill_offset = st.session_state.get("fill_offset_cents", 2)
+                    # For selling, we go BELOW market to fill faster (accept less)
+                    price_cents = max(1, min(99, int(current_price * 100) - fill_offset))
+
+                    async def _sell_order():
+                        async with st.session_state.kalshi_client as client:
+                            return await client.place_order(
+                                ticker=ticker,
+                                action="sell",
+                                side=kalshi_side,
+                                count=shares,
+                                price_cents=price_cents,
+                            )
+
+                    result = run_async(_sell_order())
+
+                    if result.success:
+                        add_alert(f"SELL order submitted: {ticker} x{shares} @ {price_cents}c ({exit_reason.value})", "success")
+                    else:
+                        add_alert(f"SELL order issue: {result.message}", "warning")
+
+                except Exception as e:
+                    add_alert(f"SELL order failed: {e}", "error")
+
             # Get Position object for accurate P/L calculation
             position = pos.get("position_obj")
 
