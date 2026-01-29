@@ -451,6 +451,161 @@ def cancel_stale_orders(max_age_minutes: int = 5):
         return 0
 
 
+def has_pending_order_for_ticker(ticker: str) -> bool:
+    """Check if there's already a pending order for this ticker.
+
+    Prevents duplicate orders by checking session state's pending_orders list.
+    Returns True if an open/pending order exists for the ticker.
+    """
+    if 'pending_orders' not in st.session_state:
+        return False
+
+    for order in st.session_state.pending_orders:
+        if order.get("ticker", "") == ticker:
+            status = order.get("status", "")
+            remaining = order.get("remaining_count", 0)
+            if status in ("open", "pending") and remaining > 0:
+                return True
+    return False
+
+
+def get_fresh_market_price(ticker: str) -> tuple[float, float, float]:
+    """Fetch fresh bid/ask prices from Kalshi for a ticker.
+
+    Returns: (yes_bid, yes_ask, mid_price) as floats 0-1
+    Returns (0, 0, 0) on error.
+    """
+    from weather_trader.kalshi import KalshiAuth, KalshiClient
+
+    auth = KalshiAuth()
+    if not auth.is_configured:
+        return 0.0, 0.0, 0.0
+
+    async def _fetch_price():
+        client = KalshiClient(auth)
+        data = await client._request("GET", f"/markets/{ticker}")
+        market = data.get("market", data)
+        yes_bid = (market.get("yes_bid", 0) or 0) / 100.0
+        yes_ask = (market.get("yes_ask", 0) or 0) / 100.0
+        mid = (yes_bid + yes_ask) / 2 if (yes_bid and yes_ask) else yes_bid or yes_ask
+        return yes_bid, yes_ask, mid
+
+    try:
+        return run_async(_fetch_price())
+    except Exception as e:
+        add_alert(f"Error fetching price for {ticker}: {e}", "warning")
+        return 0.0, 0.0, 0.0
+
+
+def cancel_and_reprice_stale_orders(max_age_minutes: int = 5):
+    """Cancel stale orders and reprice them at current market prices.
+
+    This function:
+    1. Finds orders older than max_age_minutes
+    2. Cancels them
+    3. For SELL orders (exits), reprices at current yes_bid - offset
+    4. Places new orders at better prices
+
+    Returns: (cancelled_count, repriced_count)
+    """
+    from weather_trader.kalshi import KalshiAuth, KalshiClient
+    from datetime import datetime, timedelta, timezone
+    import asyncio
+
+    auth = KalshiAuth()
+    if not auth.is_configured:
+        return 0, 0
+
+    async def _cancel_and_reprice():
+        client = KalshiClient(auth)
+        data = await client._request("GET", "/portfolio/orders")
+        orders = data.get("orders", [])
+
+        cancelled = 0
+        repriced = 0
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=max_age_minutes)
+        fill_offset = st.session_state.get("fill_offset_cents", 2)
+
+        for order in orders:
+            if order.get("status") not in ("open", "pending"):
+                continue
+            if order.get("remaining_count", 0) == 0:
+                continue
+            ticker = order.get("ticker", "")
+            if "KXHIGH" not in ticker:
+                continue
+
+            # Check age
+            created = order.get("created_time", "")
+            if not created:
+                continue
+
+            try:
+                if created.endswith("Z"):
+                    order_time = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                else:
+                    order_time = datetime.fromisoformat(created)
+
+                if order_time.tzinfo is None:
+                    order_time = order_time.replace(tzinfo=timezone.utc)
+
+                if order_time >= cutoff:
+                    continue  # Not stale yet
+
+                # Cancel the stale order
+                order_id = order.get("order_id", "")
+                if not order_id:
+                    continue
+
+                success = await client.cancel_order(order_id)
+                if not success:
+                    continue
+
+                cancelled += 1
+                await asyncio.sleep(0.2)  # Rate limit
+
+                # Reprice: fetch fresh market data and place new order
+                action = order.get("action", "buy")
+                side = order.get("side", "yes")
+                count = order.get("remaining_count", 0)
+
+                if action == "sell" and count > 0:
+                    # For sell orders, get fresh bid and go slightly below it
+                    market_data = await client._request("GET", f"/markets/{ticker}")
+                    market = market_data.get("market", market_data)
+                    yes_bid = market.get("yes_bid", 0) or 0
+
+                    if yes_bid > 0:
+                        # Price slightly below bid to fill faster
+                        new_price = max(1, yes_bid - fill_offset)
+
+                        result = await client.place_order(
+                            ticker=ticker,
+                            action="sell",
+                            side=side,
+                            count=count,
+                            price_cents=new_price,
+                        )
+
+                        if result.success:
+                            repriced += 1
+                            add_alert(f"Repriced {ticker} SELL: {count}x @ {new_price}c", "info")
+
+                        await asyncio.sleep(0.2)  # Rate limit
+
+            except Exception as e:
+                # Continue with other orders
+                pass
+
+        return cancelled, repriced
+
+    try:
+        return run_async(_cancel_and_reprice())
+    except Exception as e:
+        add_alert(f"Error in cancel_and_reprice: {e}", "warning")
+        return 0, 0
+
+
 def sync_positions_from_kalshi():
     """Sync open positions from Kalshi to dashboard state."""
     from weather_trader.kalshi import KalshiAuth, KalshiClient
@@ -1908,11 +2063,15 @@ def execute_trade(signal, size, is_live=False):
     exchange_order_id = None
     is_demo_market = signal.get("is_demo", False)
     if is_live and st.session_state.kalshi_client is not None and not is_demo_market:
-        try:
-            ticker = signal.get("ticker", "") or signal.get("condition_id", "")
-            if not ticker or ticker.startswith("demo_"):
-                add_alert("Cannot submit order: invalid ticker (demo market?)", "warning")
-            else:
+        ticker = signal.get("ticker", "") or signal.get("condition_id", "")
+
+        # Check for existing pending order to prevent duplicates
+        if ticker and has_pending_order_for_ticker(ticker):
+            add_alert(f"Skipping entry: pending order already exists for {ticker}", "info")
+        elif not ticker or ticker.startswith("demo_"):
+            add_alert("Cannot submit order: invalid ticker (demo market?)", "warning")
+        else:
+            try:
                 kalshi_side = "yes" if side == "YES" else "no"
                 # Add offset to improve fill rate (pay slightly more to beat the spread)
                 # Default: 2 cents more aggressive than fair value
@@ -1939,8 +2098,8 @@ def execute_trade(signal, size, is_live=False):
                 else:
                     add_alert(f"Live order failed: {result.message}", "warning")
 
-        except Exception as e:
-            add_alert(f"Live order failed (position still tracked): {e}", "warning")
+            except Exception as e:
+                add_alert(f"Live order failed (position still tracked): {e}", "warning")
 
     # Also add to legacy open_positions for UI compatibility
     legacy_position = {
@@ -2140,40 +2299,60 @@ def close_position_smart(position_id: str, current_price: float, exit_reason: Ex
             is_live_position = pos.get("mode", "").startswith("LIVE")
 
             if is_live_position and ticker and not ticker.startswith("demo_") and st.session_state.kalshi_client is not None:
-                try:
-                    # Determine sell parameters
-                    shares = pos.get("shares") or int(pos.get("size", 1) / max(0.01, pos.get("entry_price", 0.5)))
-                    original_side = pos.get("side", "YES")
+                # Check for existing pending order to prevent duplicates
+                if has_pending_order_for_ticker(ticker):
+                    add_alert(f"Skipping exit: pending order exists for {ticker}", "info")
+                else:
+                    try:
+                        # Determine sell parameters
+                        shares = pos.get("shares") or int(pos.get("size", 1) / max(0.01, pos.get("entry_price", 0.5)))
+                        original_side = pos.get("side", "YES")
 
-                    # To close: sell what we bought
-                    # If we bought YES, we sell YES
-                    # If we bought NO, we sell NO
-                    kalshi_side = "yes" if original_side == "YES" else "no"
+                        # To close: sell what we bought
+                        # If we bought YES, we sell YES
+                        # If we bought NO, we sell NO
+                        kalshi_side = "yes" if original_side == "YES" else "no"
 
-                    # Use current market price with fill offset for faster exit
-                    fill_offset = st.session_state.get("fill_offset_cents", 2)
-                    # For selling, we go BELOW market to fill faster (accept less)
-                    price_cents = max(1, min(99, int(current_price * 100) - fill_offset))
+                        # FETCH FRESH MARKET PRICE - don't use stale current_price
+                        # This prevents the 1-cent order bug when current_price is 0 or stale
+                        yes_bid, yes_ask, mid_price = get_fresh_market_price(ticker)
 
-                    async def _sell_order():
-                        async with st.session_state.kalshi_client as client:
-                            return await client.place_order(
-                                ticker=ticker,
-                                action="sell",
-                                side=kalshi_side,
-                                count=shares,
-                                price_cents=price_cents,
-                            )
+                        fill_offset = st.session_state.get("fill_offset_cents", 2)
 
-                    result = run_async(_sell_order())
+                        if yes_bid > 0:
+                            # Use fresh bid price minus offset for faster fill
+                            price_cents = max(1, min(99, int(yes_bid * 100) - fill_offset))
+                        elif mid_price > 0:
+                            # Fallback to mid price
+                            price_cents = max(1, min(99, int(mid_price * 100) - fill_offset))
+                        elif current_price > 0.05:
+                            # Only use passed current_price if it's reasonable (> 5 cents)
+                            price_cents = max(1, min(99, int(current_price * 100) - fill_offset))
+                        else:
+                            # Don't place order at unreasonable prices
+                            add_alert(f"Skipping exit for {ticker}: no valid price (bid={yes_bid:.2f})", "warning")
+                            price_cents = 0
 
-                    if result.success:
-                        add_alert(f"SELL order submitted: {ticker} x{shares} @ {price_cents}c ({exit_reason.value})", "success")
-                    else:
-                        add_alert(f"SELL order issue: {result.message}", "warning")
+                        if price_cents > 0:
+                            async def _sell_order():
+                                async with st.session_state.kalshi_client as client:
+                                    return await client.place_order(
+                                        ticker=ticker,
+                                        action="sell",
+                                        side=kalshi_side,
+                                        count=shares,
+                                        price_cents=price_cents,
+                                    )
 
-                except Exception as e:
-                    add_alert(f"SELL order failed: {e}", "error")
+                            result = run_async(_sell_order())
+
+                            if result.success:
+                                add_alert(f"SELL order submitted: {ticker} x{shares} @ {price_cents}c ({exit_reason.value})", "success")
+                            else:
+                                add_alert(f"SELL order issue: {result.message}", "warning")
+
+                    except Exception as e:
+                        add_alert(f"SELL order failed: {e}", "error")
 
             # Get Position object for accurate P/L calculation
             position = pos.get("position_obj")
@@ -2543,16 +2722,16 @@ def main():
                 pending_count = len(st.session_state.pending_orders)
                 if pending_count > 0:
                     st.sidebar.warning(f"⏳ {pending_count} orders waiting to fill")
-                    if st.sidebar.button("❌ Cancel Stale Orders (>5min)"):
-                        cancelled = cancel_stale_orders(5)
-                        if cancelled > 0:
-                            add_alert(f"Cancelled {cancelled} stale orders", "info")
+                    if st.sidebar.button("🔄 Cancel & Reprice Stale Orders"):
+                        cancelled, repriced = cancel_and_reprice_stale_orders(5)
+                        if cancelled > 0 or repriced > 0:
+                            add_alert(f"Cancelled {cancelled}, repriced {repriced} stale orders", "info")
                         else:
-                            add_alert("No stale orders to cancel", "info")
+                            add_alert("No stale orders to process", "info")
                         st.rerun()
                 else:
                     st.sidebar.caption("No pending orders")
-                st.sidebar.caption("Orders >5min auto-cancelled on refresh")
+                st.sidebar.caption("Stale orders (>5min) auto-cancelled & repriced")
 
     # Demo mode toggle
     st.sidebar.markdown("---")
@@ -3733,10 +3912,10 @@ def main():
                 # 2. Check and update pending order status
                 check_pending_orders()
 
-                # 3. Cancel orders pending > 5 minutes
-                cancelled = cancel_stale_orders(5)
-                if cancelled > 0:
-                    add_alert(f"Auto-cancelled {cancelled} stale orders (>5min)", "info")
+                # 3. Cancel and reprice orders pending > 5 minutes
+                cancelled, repriced = cancel_and_reprice_stale_orders(5)
+                if cancelled > 0 or repriced > 0:
+                    add_alert(f"Auto-processed stale orders: {cancelled} cancelled, {repriced} repriced", "info")
 
                 # 4. Check for settled markets and close positions
                 settled = check_settled_markets()
