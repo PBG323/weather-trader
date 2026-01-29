@@ -156,6 +156,108 @@ if 'live_wallet_validated' not in st.session_state:
     st.session_state.live_wallet_validated = False
 if 'positions_synced' not in st.session_state:
     st.session_state.positions_synced = False
+if 'pending_orders' not in st.session_state:
+    st.session_state.pending_orders = []  # Track orders waiting to fill
+
+
+def check_pending_orders():
+    """Check status of pending orders on Kalshi and update tracking."""
+    from weather_trader.kalshi import KalshiAuth, KalshiClient
+
+    auth = KalshiAuth()
+    if not auth.is_configured:
+        return
+
+    async def _fetch_orders():
+        client = KalshiClient(auth)
+        data = await client._request("GET", "/portfolio/orders")
+        return data.get("orders", [])
+
+    try:
+        orders = run_async(_fetch_orders())
+    except Exception as e:
+        add_alert(f"Error checking orders: {e}", "warning")
+        return
+
+    # Filter to weather orders
+    weather_orders = [o for o in orders if "KXHIGH" in o.get("ticker", "")]
+
+    filled_count = 0
+    pending_count = 0
+    cancelled_count = 0
+
+    for order in weather_orders:
+        status = order.get("status", "")
+        ticker = order.get("ticker", "")
+        remaining = order.get("remaining_count", 0)
+        filled = order.get("filled_count", 0) or order.get("fill_count", 0)
+
+        if status == "executed" and filled > 0:
+            filled_count += 1
+        elif status in ("open", "pending") and remaining > 0:
+            pending_count += 1
+        elif status == "cancelled":
+            cancelled_count += 1
+
+    # Update session state
+    st.session_state.pending_orders = [
+        o for o in weather_orders
+        if o.get("status") in ("open", "pending") and o.get("remaining_count", 0) > 0
+    ]
+
+    return {
+        "filled": filled_count,
+        "pending": pending_count,
+        "cancelled": cancelled_count,
+        "pending_orders": st.session_state.pending_orders
+    }
+
+
+def cancel_stale_orders(max_age_minutes: int = 30):
+    """Cancel orders that have been pending too long."""
+    from weather_trader.kalshi import KalshiAuth, KalshiClient
+    from datetime import datetime, timedelta
+
+    auth = KalshiAuth()
+    if not auth.is_configured:
+        return 0
+
+    async def _cancel_stale():
+        client = KalshiClient(auth)
+        data = await client._request("GET", "/portfolio/orders")
+        orders = data.get("orders", [])
+
+        cancelled = 0
+        cutoff = datetime.utcnow() - timedelta(minutes=max_age_minutes)
+
+        for order in orders:
+            if order.get("status") not in ("open", "pending"):
+                continue
+            if order.get("remaining_count", 0) == 0:
+                continue
+            if "KXHIGH" not in order.get("ticker", ""):
+                continue
+
+            # Check age
+            created = order.get("created_time", "")
+            if created:
+                try:
+                    order_time = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                    if order_time.replace(tzinfo=None) < cutoff:
+                        order_id = order.get("order_id", "")
+                        if order_id:
+                            await client.cancel_order(order_id)
+                            cancelled += 1
+                except:
+                    pass
+
+        return cancelled
+
+    try:
+        return run_async(_cancel_stale())
+    except Exception as e:
+        add_alert(f"Error cancelling orders: {e}", "warning")
+        return 0
 
 
 def sync_positions_from_kalshi():
@@ -1451,12 +1553,38 @@ def main():
                         add_alert("No new positions to sync", "info")
                     st.rerun()
 
+                # Pending orders section
+                st.sidebar.markdown("---")
+                st.sidebar.markdown("**📋 Pending Orders**")
+                if st.sidebar.button("🔍 Check Order Status"):
+                    result = check_pending_orders()
+                    if result:
+                        add_alert(f"Orders: {result['filled']} filled, {result['pending']} pending", "info")
+                    st.rerun()
+
+                pending_count = len(st.session_state.pending_orders)
+                if pending_count > 0:
+                    st.sidebar.warning(f"⏳ {pending_count} orders waiting to fill")
+                    if st.sidebar.button("❌ Cancel Stale Orders (>30min)"):
+                        cancelled = cancel_stale_orders(30)
+                        if cancelled > 0:
+                            add_alert(f"Cancelled {cancelled} stale orders", "info")
+                        else:
+                            add_alert("No stale orders to cancel", "info")
+                        st.rerun()
+                else:
+                    st.sidebar.caption("No pending orders")
+
     # Demo mode toggle
     st.sidebar.markdown("---")
     st.sidebar.markdown("### 📊 Data Source")
+    # Remember demo mode state (default True only on first load)
+    if 'demo_mode_set' not in st.session_state:
+        st.session_state.demo_mode_set = True
+        st.session_state.demo_mode = True
     use_demo = st.sidebar.checkbox(
         "Demo Mode (Simulated Markets)",
-        value=True,
+        value=st.session_state.demo_mode,
         help="Use simulated markets for testing. Disable when real Kalshi weather markets are available."
     )
     st.session_state.demo_mode = use_demo
