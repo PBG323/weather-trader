@@ -123,8 +123,8 @@ class TradingDefaults:
     MIN_TIME_TO_SETTLEMENT_HOURS = 4  # Don't enter within 4 hours of settlement
 
     # === PRICE LIMITS (avoid extreme tail bets) ===
-    MIN_ENTRY_PRICE_CENTS = 5    # Don't buy below 5¢ (too risky, 20:1 odds)
-    MAX_ENTRY_PRICE_CENTS = 95   # Don't buy above 95¢ (too risky, 1:20 odds)
+    MIN_ENTRY_PRICE_CENTS = 2    # Don't buy below 2¢ (50:1 odds)
+    MAX_ENTRY_PRICE_CENTS = 98   # Don't buy above 98¢ (1:50 odds)
 
     # === POSITION SIZING ===
     KELLY_FRACTION = 0.30        # 30% Kelly (up from 25%)
