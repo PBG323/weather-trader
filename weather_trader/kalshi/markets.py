@@ -8,10 +8,18 @@ import re
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import httpx
 
 from ..config import CityConfig, CITY_CONFIGS, get_city_config, config
+
+# Kalshi markets operate in Eastern time
+EST = ZoneInfo("America/New_York")
+
+def today_est() -> date:
+    """Get today's date in Eastern time (Kalshi market timezone)."""
+    return datetime.now(EST).date()
 
 
 @dataclass
@@ -214,7 +222,8 @@ class KalshiMarketFinder:
                         continue
 
                     # Filter by date range - exclude today's markets (high temp already known)
-                    days_until = (target_date - date.today()).days
+                    # CRITICAL: Use EST timezone since Kalshi markets operate in Eastern time
+                    days_until = (target_date - today_est()).days
                     if days_until <= 0 or days_until > days_ahead:
                         continue  # Skip today and past dates
 
