@@ -467,12 +467,18 @@ def sync_positions_from_kalshi():
     ]
 
     synced = 0
-    existing_tickers = {pos.get("condition_id", "") for pos in st.session_state.open_positions}
+    # Check both condition_id and ticker fields to avoid duplicates
+    existing_tickers = set()
+    for pos in st.session_state.open_positions:
+        if pos.get("condition_id"):
+            existing_tickers.add(pos.get("condition_id"))
+        if pos.get("ticker"):
+            existing_tickers.add(pos.get("ticker"))
 
     for kp in weather_positions:
         ticker = kp.get("ticker", "")
-        if ticker in existing_tickers:
-            continue  # Already tracked
+        if not ticker or ticker in existing_tickers:
+            continue  # Already tracked or invalid
 
         position_count = kp.get("position", 0)
         avg_price = kp.get("average_price_paid", 50) or 50
@@ -1099,6 +1105,12 @@ def calculate_signals(forecasts, markets, show_all_outcomes=False):
 
         city_key = group_markets[0]["city"].lower()
         target_date = group_markets[0].get("target_date", today_est())
+
+        # CRITICAL: Skip same-day markets - high temp is already known or nearly known
+        # This prevents trading on markets where the outcome is already determined
+        if target_date <= today_est():
+            continue
+
         date_key = f"{city_key}_{target_date.isoformat()}"
 
         fc = forecasts.get(date_key) or forecasts.get(city_key)
@@ -1891,14 +1903,32 @@ def main():
 
     st.sidebar.markdown("---")
 
-    # Bankroll setting
+    # Bankroll setting - default to Kalshi balance if available in live mode
+    default_bankroll = 1000.0
+    if is_live and 'kalshi_balance' in st.session_state:
+        default_bankroll = st.session_state.kalshi_balance
+
+    # Use session state to remember bankroll setting
+    if 'user_bankroll' not in st.session_state:
+        st.session_state.user_bankroll = default_bankroll
+
     bankroll = st.sidebar.number_input(
         "Bankroll ($)",
         min_value=10.0,
         max_value=100000.0,
-        value=1000.0,
-        step=100.0
+        value=st.session_state.user_bankroll,
+        step=100.0,
+        help="In live mode, this syncs with your Kalshi balance"
     )
+    st.session_state.user_bankroll = bankroll
+
+    # Sync with Kalshi balance button in live mode
+    if is_live and 'kalshi_balance' in st.session_state:
+        if st.sidebar.button("🔄 Sync Bankroll with Kalshi"):
+            st.session_state.user_bankroll = st.session_state.kalshi_balance
+            bankroll = st.session_state.kalshi_balance
+            st.rerun()
+
     # Sync bankroll with risk manager
     if st.session_state.risk_manager.bankroll != bankroll:
         st.session_state.risk_manager.bankroll = bankroll

@@ -213,10 +213,10 @@ class KalshiMarketFinder:
                     if target_date is None:
                         continue
 
-                    # Filter by date range
+                    # Filter by date range - exclude today's markets (high temp already known)
                     days_until = (target_date - date.today()).days
-                    if days_until < 0 or days_until > days_ahead:
-                        continue
+                    if days_until <= 0 or days_until > days_ahead:
+                        continue  # Skip today and past dates
 
                     bracket_markets = await self._fetch_brackets(event_ticker)
                     brackets = []

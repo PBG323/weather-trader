@@ -129,15 +129,16 @@ class EnsembleForecast:
 
 
 # Default model weights based on historical accuracy
-# ECMWF is generally most accurate, followed by GFS
+# GFS and Tomorrow.io weighted higher for US weather markets
+# ECMWF reduced due to larger spread/variance observed
 DEFAULT_WEIGHTS = {
-    "ecmwf": 1.5,
-    "gfs": 1.0,
-    "hrrr": 1.2,  # Best for short-term US
-    "best_match": 1.1,
-    "tomorrow": 1.3,
-    "nws": 1.0,  # NWS point forecast
-    "unknown": 0.8,
+    "ecmwf": 0.8,   # Reduced - shows larger spread
+    "gfs": 1.2,     # Increased - good for US
+    "hrrr": 1.3,    # Best for short-term US
+    "best_match": 1.0,
+    "tomorrow": 1.4,  # Tomorrow.io strong for US cities
+    "nws": 1.1,     # NWS point forecast - local expertise
+    "unknown": 0.7,
 }
 
 
