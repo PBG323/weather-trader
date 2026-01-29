@@ -1106,33 +1106,68 @@ async def _fetch_forecasts_with_models():
     return forecasts
 
 
-def check_same_day_uncertainty(markets):
+def check_same_day_uncertainty(markets, ensemble_forecasts=None):
     """
     Check same-day markets for genuine remaining uncertainty.
 
     Returns a tuple of:
     - uncertainty_map: dict mapping ticker -> SameDayUncertainty assessment
-    - same_day_forecasts: dict mapping city_key -> NWS-based forecast for today
+    - same_day_forecasts: dict mapping city_key -> blended forecast for today
 
-    The same_day_forecasts uses actual NWS observations (current high so far)
-    plus remaining hourly forecast to construct a reliable same-day forecast.
+    The same_day_forecasts blends NWS observations with ensemble forecasts
+    based on time of day:
+    - Early morning (midnight-8am): 80% ensemble, 20% NWS
+    - Morning (8am-noon): 50% ensemble, 50% NWS
+    - Afternoon (noon-6pm): 20% ensemble, 80% NWS
+    - Evening (6pm+): 100% NWS (observations are ground truth)
     """
-    return run_async(_check_same_day_uncertainty_async(markets))
+    return run_async(_check_same_day_uncertainty_async(markets, ensemble_forecasts))
 
 
-async def _check_same_day_uncertainty_async(markets):
+async def _check_same_day_uncertainty_async(markets, ensemble_forecasts=None):
     """Async implementation of same-day uncertainty checking.
 
     Returns:
         Tuple of (uncertainty_map, same_day_forecasts)
         - uncertainty_map: ticker -> SameDayUncertainty
-        - same_day_forecasts: city_key -> dict with NWS-based forecast for today
+        - same_day_forecasts: city_key -> dict with blended forecast for today
+
+    Blending weights by time of day (EST):
+    - 00:00-08:00: 80% ensemble, 20% NWS (day hasn't started)
+    - 08:00-12:00: 50% ensemble, 50% NWS (warming phase)
+    - 12:00-18:00: 20% ensemble, 80% NWS (peak time, observations reliable)
+    - 18:00-24:00: 0% ensemble, 100% NWS (day over, observations are truth)
     """
     from weather_trader.kalshi.markets import TemperatureBracket
 
     uncertainty_map = {}
-    same_day_forecasts = {}  # NEW: Store NWS-based forecasts for same-day
+    same_day_forecasts = {}
     checker = SameDayTradingChecker()
+
+    # Calculate time-based weights for blending
+    now_est = get_est_now()
+    hour = now_est.hour
+
+    if hour < 8:
+        # Early morning: trust ensemble more (day hasn't started)
+        ensemble_weight = 0.80
+        nws_weight = 0.20
+        blend_reason = "early morning (ensemble-heavy)"
+    elif hour < 12:
+        # Morning: blend evenly (warming phase)
+        ensemble_weight = 0.50
+        nws_weight = 0.50
+        blend_reason = "morning (balanced blend)"
+    elif hour < 18:
+        # Afternoon: trust NWS more (near/past peak)
+        ensemble_weight = 0.20
+        nws_weight = 0.80
+        blend_reason = "afternoon (NWS-heavy)"
+    else:
+        # Evening: NWS only (day essentially over)
+        ensemble_weight = 0.0
+        nws_weight = 1.0
+        blend_reason = "evening (NWS only)"
 
     # Group same-day markets by city to batch the NWS calls
     same_day_by_city = {}
@@ -1156,38 +1191,88 @@ async def _check_same_day_uncertainty_async(markets):
             # Fetch current conditions once per city
             current_high, remaining_high = await checker.get_current_conditions(city_config)
 
-            # BUILD NWS-BASED FORECAST FOR SAME-DAY TRADING
-            # The expected high is MAX(current observed, remaining forecast)
+            # BUILD BLENDED FORECAST FOR SAME-DAY TRADING
+            # Combines NWS observations with ensemble forecast based on time of day
+
+            # Get NWS-based expected high
             if current_high is not None:
                 if remaining_high is not None:
-                    expected_high = max(current_high, remaining_high)
-                    # Uncertainty is low late in day - use small std
-                    # If remaining temps are close to current, very low uncertainty
-                    uncertainty_range = abs(remaining_high - current_high)
-                    forecast_std = max(1.5, min(3.0, uncertainty_range / 2))
+                    nws_expected_high = max(current_high, remaining_high)
+                    nws_uncertainty = abs(remaining_high - current_high)
+                    nws_std = max(1.5, min(3.0, nws_uncertainty / 2))
                 else:
-                    # No remaining forecast - day is over, use current high
-                    expected_high = current_high
-                    forecast_std = 1.0  # Very low uncertainty
+                    nws_expected_high = current_high
+                    nws_std = 1.0
+            else:
+                nws_expected_high = None
+                nws_std = 3.0
 
-                same_day_forecasts[city_key] = {
-                    "city": city_config.name,
-                    "high_mean": expected_high,
-                    "high_std": forecast_std,
-                    "low_mean": expected_high - 10,  # Rough estimate
-                    "low_std": 3.0,
-                    "confidence": 0.85,  # High confidence for NWS observations
-                    "model_count": 1,
-                    "date": today_est(),
-                    "source": "NWS_observations",
-                    "current_high": current_high,
-                    "remaining_high": remaining_high,
-                }
-                add_alert(
-                    f"Same-day forecast for {city_key}: {expected_high:.0f}°F "
-                    f"(current: {current_high:.0f}°F, remaining: {remaining_high}°F, std: {forecast_std:.1f})",
-                    "info"
-                )
+            # Get ensemble forecast for today
+            today_key = f"{city_key}_{today_est().isoformat()}"
+            ensemble_fc = None
+            if ensemble_forecasts:
+                ensemble_fc = ensemble_forecasts.get(today_key)
+
+            ensemble_high = ensemble_fc.get("high_mean") if ensemble_fc else None
+            ensemble_std = ensemble_fc.get("high_std", 3.0) if ensemble_fc else 3.0
+
+            # Blend forecasts based on time-of-day weights
+            if nws_expected_high is not None and ensemble_high is not None:
+                # Both available - blend them
+                blended_high = (ensemble_weight * ensemble_high) + (nws_weight * nws_expected_high)
+                blended_std = (ensemble_weight * ensemble_std) + (nws_weight * nws_std)
+                source = f"blended ({ensemble_weight:.0%} ensemble + {nws_weight:.0%} NWS)"
+                model_count = (ensemble_fc.get("model_count", 1) if ensemble_fc else 0) + 1
+            elif nws_expected_high is not None:
+                # Only NWS available
+                blended_high = nws_expected_high
+                blended_std = nws_std
+                source = "NWS_only"
+                model_count = 1
+            elif ensemble_high is not None:
+                # Only ensemble available
+                blended_high = ensemble_high
+                blended_std = ensemble_std
+                source = "ensemble_only"
+                model_count = ensemble_fc.get("model_count", 1) if ensemble_fc else 1
+            else:
+                # Neither available - skip
+                continue
+
+            # Confidence based on blend quality
+            if nws_expected_high is not None and ensemble_high is not None:
+                # Both sources agree closely = higher confidence
+                agreement = abs(ensemble_high - nws_expected_high)
+                if agreement < 2:
+                    confidence = 0.90
+                elif agreement < 4:
+                    confidence = 0.80
+                else:
+                    confidence = 0.70
+            else:
+                confidence = 0.75
+
+            same_day_forecasts[city_key] = {
+                "city": city_config.name,
+                "high_mean": blended_high,
+                "high_std": blended_std,
+                "low_mean": blended_high - 10,
+                "low_std": 3.0,
+                "confidence": confidence,
+                "model_count": model_count,
+                "date": today_est(),
+                "source": source,
+                "current_high": current_high,
+                "remaining_high": remaining_high,
+                "ensemble_high": ensemble_high,
+                "nws_high": nws_expected_high,
+                "blend_weights": {"ensemble": ensemble_weight, "nws": nws_weight},
+            }
+            add_alert(
+                f"Same-day {city_key}: {blended_high:.1f}°F ({blend_reason}) "
+                f"[NWS: {nws_expected_high}, Ensemble: {ensemble_high}]",
+                "info"
+            )
 
             for market in city_markets:
                 ticker = market.get("ticker", market.get("condition_id", ""))
@@ -1244,8 +1329,8 @@ def calculate_signals(forecasts, markets, show_all_outcomes=False):
     signals = []
 
     # Pre-check same-day market uncertainty
-    # This fetches current NWS observations and builds same-day forecasts
-    same_day_uncertainty, same_day_forecasts = check_same_day_uncertainty(markets)
+    # This fetches NWS observations and blends with ensemble based on time of day
+    same_day_uncertainty, same_day_forecasts = check_same_day_uncertainty(markets, forecasts)
 
     # Group markets by city and date
     market_groups = {}
