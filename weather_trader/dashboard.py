@@ -101,6 +101,59 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# ============================================================================
+# TRADING CONFIGURATION - Centralized parameters for the balanced strategy
+# ============================================================================
+# These values implement a "smart swing trader" approach:
+# - Patient on entry (8% edge minimum)
+# - Aggressive on execution (cross spread, urgent exit pricing)
+# - Disciplined on exits (stop loss, trailing stop)
+
+class TradingDefaults:
+    """Centralized trading configuration defaults."""
+
+    # === TIMING ===
+    REFRESH_CYCLE_SECONDS = 240  # 4 minutes between cycles
+    ORDER_STALE_MINUTES = 4      # Cancel/reprice orders older than this
+
+    # === ENTRY CRITERIA ===
+    MIN_EDGE_ENTRY = 0.08        # 8% minimum edge to enter (up from 5%)
+    MIN_CONFIDENCE = 0.75        # 75% model confidence required
+    MAX_SPREAD_CENTS = 12        # Don't enter if spread > 12 cents
+    MIN_TIME_TO_SETTLEMENT_HOURS = 4  # Don't enter within 4 hours of settlement
+
+    # === POSITION SIZING ===
+    KELLY_FRACTION = 0.30        # 30% Kelly (up from 25%)
+    MAX_POSITION_DOLLARS = 50    # Cap per position
+    MAX_POSITION_PCT = 0.15      # Max 15% of bankroll per position
+
+    # === EXIT THRESHOLDS ===
+    STOP_LOSS_PCT = -0.25        # Exit if P/L < -25% (up from -30%)
+    TRAILING_STOP_PCT = 0.18     # Exit if drawdown > 18% from peak (down from 20%)
+    MIN_EDGE_EXIT = 0.03         # Exit when edge < 3% (take profit)
+    EDGE_REVERSED_THRESHOLD = -0.05  # Exit if edge goes negative by 5%
+
+    # === ORDER PRICING (in cents) ===
+    # Entry: Cross the spread to get filled
+    ENTRY_OFFSET_NORMAL = 3      # MID + 3 cents for normal entries
+    ENTRY_OFFSET_STRONG = 5      # Pay up to ASK for strong edge (>12%)
+
+    # Exit: Price aggressively based on urgency
+    EXIT_OFFSET_NORMAL = 3       # BID - 3 cents for normal exits
+    EXIT_OFFSET_URGENT = 5       # BID - 5 cents for stop loss/trailing
+    EXIT_OFFSET_EMERGENCY = 10   # BID - 10 cents after timeout
+    EXIT_OFFSET_DISTRESSED = 15  # BID - 15 cents for final attempt
+
+    # === REPRICING ESCALATION ===
+    REPRICE_AFTER_MINUTES = 2    # Escalate exit pricing after 2 minutes
+
+    # === RISK LIMITS ===
+    MAX_DAILY_LOSS = 100         # Stop new entries if daily loss exceeds
+    MAX_OPEN_POSITIONS = 10      # Maximum concurrent positions
+    MAX_POSITIONS_PER_CITY = 3   # Maximum positions per city
+    CONSECUTIVE_STOPS_PAUSE = 3  # Pause after 3 consecutive stop losses
+
+
 # Initialize session state
 if 'trade_history' not in st.session_state:
     st.session_state.trade_history = []
@@ -497,14 +550,16 @@ def get_fresh_market_price(ticker: str) -> tuple[float, float, float]:
         return 0.0, 0.0, 0.0
 
 
-def cancel_and_reprice_stale_orders(max_age_minutes: int = 5):
-    """Cancel stale orders and reprice them at current market prices.
+def cancel_and_reprice_stale_orders(max_age_minutes: int = 4):
+    """Cancel stale orders and reprice them with escalating urgency.
 
     This function:
     1. Finds orders older than max_age_minutes
     2. Cancels them
-    3. For SELL orders (exits), reprices at current yes_bid - offset
-    4. Places new orders at better prices
+    3. Reprices with ESCALATING URGENCY based on age:
+       - First reprice (4-6 min old): BID - 5 cents (urgent)
+       - Second reprice (6-8 min old): BID - 10 cents (emergency)
+       - Third+ reprice (8+ min old): BID - 15 cents (distressed)
 
     Returns: (cancelled_count, repriced_count)
     """
@@ -523,8 +578,8 @@ def cancel_and_reprice_stale_orders(max_age_minutes: int = 5):
 
         cancelled = 0
         repriced = 0
-        cutoff = datetime.now(timezone.utc) - timedelta(minutes=max_age_minutes)
-        fill_offset = st.session_state.get("fill_offset_cents", 2)
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(minutes=max_age_minutes)
 
         for order in orders:
             if order.get("status") not in ("open", "pending"):
@@ -552,6 +607,9 @@ def cancel_and_reprice_stale_orders(max_age_minutes: int = 5):
                 if order_time >= cutoff:
                     continue  # Not stale yet
 
+                # Calculate order age for escalating urgency
+                age_minutes = (now - order_time).total_seconds() / 60
+
                 # Cancel the stale order
                 order_id = order.get("order_id", "")
                 if not order_id:
@@ -570,14 +628,27 @@ def cancel_and_reprice_stale_orders(max_age_minutes: int = 5):
                 count = order.get("remaining_count", 0)
 
                 if action == "sell" and count > 0:
-                    # For sell orders, get fresh bid and go slightly below it
+                    # For sell orders, get fresh bid and apply ESCALATING urgency
                     market_data = await client._request("GET", f"/markets/{ticker}")
                     market = market_data.get("market", market_data)
                     yes_bid = market.get("yes_bid", 0) or 0
 
                     if yes_bid > 0:
-                        # Price slightly below bid to fill faster
-                        new_price = max(1, yes_bid - fill_offset)
+                        # ESCALATING URGENCY: Older orders get more aggressive pricing
+                        if age_minutes < 6:
+                            # First reprice: urgent
+                            offset = TradingDefaults.EXIT_OFFSET_URGENT
+                            urgency = "urgent"
+                        elif age_minutes < 8:
+                            # Second reprice: emergency
+                            offset = TradingDefaults.EXIT_OFFSET_EMERGENCY
+                            urgency = "emergency"
+                        else:
+                            # Third+ reprice: distressed (just get out!)
+                            offset = TradingDefaults.EXIT_OFFSET_DISTRESSED
+                            urgency = "DISTRESSED"
+
+                        new_price = max(1, yes_bid - offset)
 
                         result = await client.place_order(
                             ticker=ticker,
@@ -589,7 +660,7 @@ def cancel_and_reprice_stale_orders(max_age_minutes: int = 5):
 
                         if result.success:
                             repriced += 1
-                            add_alert(f"Repriced {ticker} SELL: {count}x @ {new_price}c", "info")
+                            add_alert(f"Repriced ({urgency}) {ticker}: {count}x @ {new_price}c (was {age_minutes:.0f}min old)", "info")
 
                         await asyncio.sleep(0.2)  # Rate limit
 
@@ -2093,12 +2164,28 @@ def execute_trade(signal, size, is_live=False):
         else:
             try:
                 kalshi_side = "yes" if side == "YES" else "no"
-                # Add offset to improve fill rate (pay slightly more to beat the spread)
-                # Default: 2 cents more aggressive than fair value
-                fill_offset = st.session_state.get("fill_offset_cents", 2)
-                base_price = int(round(actual_cost_per_share * 100))
-                price_cents = max(1, min(99, base_price + fill_offset))
                 count = max(1, int(round(shares)))
+                edge = abs(signal.get("edge", 0))
+
+                # FETCH FRESH MARKET PRICES for smart entry pricing
+                yes_bid, yes_ask, mid_price = get_fresh_market_price(ticker)
+
+                # ENTRY PRICING: Cross the spread based on edge strength
+                # Strong edge (>12%): Pay up to ask to get filled immediately
+                # Normal edge (8-12%): Price at mid + 3 cents
+                if edge > 0.12 and yes_ask > 0:
+                    # Strong conviction: Pay up to get in
+                    price_cents = max(1, min(99, int(yes_ask * 100)))
+                    entry_urgency = "strong"
+                elif mid_price > 0:
+                    # Normal entry: Cross the spread slightly
+                    price_cents = max(1, min(99, int(mid_price * 100) + TradingDefaults.ENTRY_OFFSET_NORMAL))
+                    entry_urgency = "normal"
+                else:
+                    # Fallback to original pricing
+                    base_price = int(round(actual_cost_per_share * 100))
+                    price_cents = max(1, min(99, base_price + TradingDefaults.ENTRY_OFFSET_NORMAL))
+                    entry_urgency = "fallback"
 
                 async def _place_order():
                     async with st.session_state.kalshi_client as client:
@@ -2114,7 +2201,7 @@ def execute_trade(signal, size, is_live=False):
 
                 if result.success:
                     exchange_order_id = result.order_id
-                    add_alert(f"Live order submitted: {exchange_order_id} ({ticker})", "success")
+                    add_alert(f"BUY order ({entry_urgency}): {ticker} x{count} @ {price_cents}c (edge: {edge:.1%})", "success")
                 else:
                     add_alert(f"Live order failed: {result.message}", "warning")
 
@@ -2282,22 +2369,22 @@ def check_smart_exits(forecasts, markets):
                 should_exit = True
                 exit_reason = ExitReason.EDGE_EXHAUSTED
 
-            # 2. EDGE REVERSED - Exit if edge turned negative (requires temp data)
-            elif has_temp_data and current_edge < 0:
+            # 2. EDGE REVERSED - Exit if edge turned negative by threshold (requires temp data)
+            elif has_temp_data and current_edge < TradingDefaults.EDGE_REVERSED_THRESHOLD:
                 should_exit = True
                 exit_reason = ExitReason.EDGE_REVERSED
 
-            # 3. STOP LOSS - Exit if loss > 30% (always applies)
+            # 3. STOP LOSS - Exit if loss exceeds threshold (default -25%)
             elif unrealized_pnl < 0:
                 pnl_pct = unrealized_pnl / size if size > 0 else 0
-                if pnl_pct < -0.30:
+                if pnl_pct < TradingDefaults.STOP_LOSS_PCT:
                     should_exit = True
                     exit_reason = ExitReason.STOP_LOSS
 
-            # 4. TRAILING STOP - Exit if gave back 20%+ of peak profit (always applies)
+            # 4. TRAILING STOP - Exit if drawdown exceeds threshold (default 18%)
             elif peak_pnl > 0 and unrealized_pnl > 0:
                 drawdown = (peak_pnl - unrealized_pnl) / peak_pnl
-                if drawdown > 0.20:
+                if drawdown > TradingDefaults.TRAILING_STOP_PCT:
                     should_exit = True
                     exit_reason = ExitReason.TRAILING_STOP
 
@@ -2346,17 +2433,30 @@ def close_position_smart(position_id: str, current_price: float, exit_reason: Ex
                         # This prevents the 1-cent order bug when current_price is 0 or stale
                         yes_bid, yes_ask, mid_price = get_fresh_market_price(ticker)
 
-                        fill_offset = st.session_state.get("fill_offset_cents", 2)
+                        # URGENCY-BASED PRICING: More aggressive for stop loss/trailing stop
+                        # Goal: GET OUT. Accept slippage to ensure fill.
+                        if exit_reason in (ExitReason.STOP_LOSS, ExitReason.TRAILING_STOP):
+                            # Urgent exits: Price aggressively (BID - 5 cents)
+                            exit_offset = TradingDefaults.EXIT_OFFSET_URGENT
+                            urgency = "urgent"
+                        elif exit_reason == ExitReason.EDGE_REVERSED:
+                            # Edge reversed: Moderately aggressive (BID - 4 cents)
+                            exit_offset = 4
+                            urgency = "moderate"
+                        else:
+                            # Normal exits (edge exhausted, manual): Standard pricing (BID - 3 cents)
+                            exit_offset = TradingDefaults.EXIT_OFFSET_NORMAL
+                            urgency = "normal"
 
                         if yes_bid > 0:
-                            # Use fresh bid price minus offset for faster fill
-                            price_cents = max(1, min(99, int(yes_bid * 100) - fill_offset))
+                            # Use fresh bid price minus urgency-based offset
+                            price_cents = max(1, min(99, int(yes_bid * 100) - exit_offset))
                         elif mid_price > 0:
-                            # Fallback to mid price
-                            price_cents = max(1, min(99, int(mid_price * 100) - fill_offset))
+                            # Fallback to mid price with larger offset
+                            price_cents = max(1, min(99, int(mid_price * 100) - exit_offset - 2))
                         elif current_price > 0.05:
                             # Only use passed current_price if it's reasonable (> 5 cents)
-                            price_cents = max(1, min(99, int(current_price * 100) - fill_offset))
+                            price_cents = max(1, min(99, int(current_price * 100) - exit_offset))
                         else:
                             # Don't place order at unreasonable prices
                             add_alert(f"Skipping exit for {ticker}: no valid price (bid={yes_bid:.2f})", "warning")
@@ -2377,7 +2477,7 @@ def close_position_smart(position_id: str, current_price: float, exit_reason: Ex
 
                             if result.success:
                                 exit_order_submitted = True
-                                add_alert(f"SELL order submitted: {ticker} x{shares} @ {price_cents}c ({exit_reason.value})", "success")
+                                add_alert(f"SELL order ({urgency}): {ticker} x{shares} @ {price_cents}c ({exit_reason.value})", "success")
                                 # Mark as CLOSING - don't remove until order fills
                                 pos["status"] = "CLOSING"
                                 pos["exit_reason_pending"] = exit_reason.value
@@ -2820,22 +2920,11 @@ def main():
 
     st.sidebar.markdown("---")
 
-    # Fill aggressiveness setting
+    # Fill aggressiveness setting (now mainly informational - urgency-based pricing handles most cases)
     st.sidebar.markdown("### 📊 Order Settings")
-    fill_offset = st.sidebar.slider(
-        "Fill Offset (cents)",
-        min_value=0,
-        max_value=10,
-        value=2,
-        help="Add cents to limit price to improve fill rate. 0=exact price, 5=aggressive"
-    )
-    st.session_state.fill_offset_cents = fill_offset
-    if fill_offset == 0:
-        st.sidebar.caption("Orders at exact fair value (may not fill)")
-    elif fill_offset <= 2:
-        st.sidebar.caption("Conservative: small premium for fills")
-    else:
-        st.sidebar.caption("Aggressive: pays more for faster fills")
+    st.sidebar.caption("**Smart Pricing Active:**")
+    st.sidebar.caption(f"• Entry: MID+{TradingDefaults.ENTRY_OFFSET_NORMAL}¢ (normal) / ASK (strong edge)")
+    st.sidebar.caption(f"• Exit: BID-{TradingDefaults.EXIT_OFFSET_NORMAL}¢ (normal) / BID-{TradingDefaults.EXIT_OFFSET_URGENT}¢ (stop loss)")
 
     # Exit settings
     st.sidebar.markdown("### 🚪 Exit Settings")
@@ -2843,11 +2932,11 @@ def main():
         "Min Edge to Hold (%)",
         min_value=1,
         max_value=15,
-        value=5,
-        help="Exit position when edge falls below this percentage"
+        value=int(TradingDefaults.MIN_EDGE_EXIT * 100),
+        help="Exit position when edge falls below this percentage (take profit)"
     )
     st.session_state.min_edge_exit_pct = min_edge_exit / 100.0
-    st.sidebar.caption(f"Exit when edge < {min_edge_exit}%")
+    st.sidebar.caption(f"Exit when edge < {min_edge_exit}% (take profit)")
 
     st.sidebar.markdown("---")
 
@@ -2886,9 +2975,10 @@ def main():
 
     # Risk settings
     st.sidebar.markdown("### ⚙️ Risk Settings")
-    kelly_fraction = st.sidebar.slider("Kelly Fraction", 0.1, 1.0, 0.25, 0.05)
-    max_position = st.sidebar.slider("Max Position (%)", 1, 20, 5)
-    min_edge = st.sidebar.slider("Min Edge (%)", 1, 20, 5) / 100
+    kelly_fraction = st.sidebar.slider("Kelly Fraction", 0.1, 1.0, TradingDefaults.KELLY_FRACTION, 0.05)
+    max_position = st.sidebar.slider("Max Position (%)", 1, 20, int(TradingDefaults.MAX_POSITION_PCT * 100))
+    min_edge = st.sidebar.slider("Min Edge (%)", 1, 20, int(TradingDefaults.MIN_EDGE_ENTRY * 100)) / 100
+    st.sidebar.caption(f"Refresh: {TradingDefaults.REFRESH_CYCLE_SECONDS // 60}min | Stop: {int(TradingDefaults.STOP_LOSS_PCT * -100)}% | Trail: {int(TradingDefaults.TRAILING_STOP_PCT * 100)}%")
 
     st.sidebar.markdown("---")
 
@@ -3931,7 +4021,7 @@ def main():
     market_status = "Demo Markets" if use_demo else ("Live Markets" if markets else "No Markets")
     open_pos_count = len(st.session_state.open_positions)
     st.markdown(
-        f"*Weather Trader v0.4.2 (Smart Trading Engine)* | "
+        f"*Weather Trader v0.5.0 (Balanced Strategy - 4min cycle)* | "
         f"*{market_status}* | "
         f"*{len(forecasts)} cities • {len(signals)} signals • {open_pos_count} positions* | "
         f"*Auto-Trade: {'🟢 ON' if auto_trade else 'OFF'}* | "
@@ -3940,7 +4030,8 @@ def main():
 
     # Auto-refresh with Kalshi sync
     if auto_refresh:
-        time.sleep(60)
+        # Use configured refresh cycle (default 4 minutes)
+        time.sleep(TradingDefaults.REFRESH_CYCLE_SECONDS)
 
         # Auto-sync with Kalshi on each refresh (if live trading)
         if is_live and st.session_state.kalshi_client is not None:
@@ -3951,8 +4042,8 @@ def main():
                 # 2. Check and update pending order status
                 check_pending_orders()
 
-                # 3. Cancel and reprice orders pending > 5 minutes
-                cancelled, repriced = cancel_and_reprice_stale_orders(5)
+                # 3. Cancel and reprice stale orders (using configured timeout)
+                cancelled, repriced = cancel_and_reprice_stale_orders(TradingDefaults.ORDER_STALE_MINUTES)
                 if cancelled > 0 or repriced > 0:
                     add_alert(f"Auto-processed stale orders: {cancelled} cancelled, {repriced} repriced", "info")
 
