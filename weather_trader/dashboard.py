@@ -508,6 +508,30 @@ def sync_positions_from_kalshi():
             except:
                 pass
 
+        # Parse temperature bracket from ticker
+        # Format: KXHIGHNY-26JAN28-B52 (below 52) or -T52 (52 or higher) or -B45-50 (range 45-50)
+        temp_low = None
+        temp_high = None
+        bracket_part = ticker.split("-")[-1] if "-" in ticker else ""
+        bracket_match = re.match(r'([BT])(\d+(?:\.\d+)?)', bracket_part)
+        if bracket_match:
+            bracket_type = bracket_match.group(1)
+            temp_val = float(bracket_match.group(2))
+            if bracket_type == "B":
+                # Below X: temp_high = X-1 (or X-0.5 for inclusive)
+                temp_high = temp_val - 1
+                temp_low = None  # "or below"
+            elif bracket_type == "T":
+                # X or higher: temp_low = X
+                temp_low = temp_val
+                temp_high = None  # "or above"
+        else:
+            # Try range format like "45-50"
+            range_match = re.match(r'(\d+(?:\.\d+)?)-(\d+(?:\.\d+)?)', bracket_part)
+            if range_match:
+                temp_low = float(range_match.group(1))
+                temp_high = float(range_match.group(2))
+
         entry_price = avg_price / 100.0
 
         legacy_position = {
@@ -519,8 +543,8 @@ def sync_positions_from_kalshi():
             "size": shares * entry_price,
             "entry_price": entry_price,
             "current_price": entry_price,
-            "edge_at_entry": 0.0,  # Unknown for synced positions
-            "forecast_prob": 0.5,
+            "edge_at_entry": 0.0,  # Will be calculated from current forecast
+            "forecast_prob": entry_price,  # Initial estimate, will be recalculated
             "market_prob_at_entry": entry_price,
             "status": "OPEN",
             "mode": "LIVE (synced)",
@@ -532,6 +556,9 @@ def sync_positions_from_kalshi():
             "position_obj": None,
             "exchange_order_id": None,
             "shares": shares,
+            "temp_low": temp_low,  # For edge calculation
+            "temp_high": temp_high,  # For edge calculation
+            "peak_pnl": 0.0,  # Initialize peak P/L for trailing stop
         }
 
         st.session_state.open_positions.append(legacy_position)
@@ -1253,6 +1280,7 @@ def execute_trade(signal, size, is_live=False):
         "outcome": outcome,
         "side": side,
         "size": size,
+        "shares": shares,  # Store shares for accurate tracking
         "entry_price": entry_price,
         "current_price": entry_price,
         "edge_at_entry": signal["edge"],
@@ -1262,10 +1290,14 @@ def execute_trade(signal, size, is_live=False):
         "mode": "LIVE" if is_live else "SIMULATED",
         "is_demo": signal.get("is_demo", False),
         "condition_id": signal.get("condition_id", ""),
+        "ticker": signal.get("ticker", "") or signal.get("condition_id", ""),
         "target_date": target_date,
         "unrealized_pnl": 0.0,
+        "peak_pnl": 0.0,  # Initialize for trailing stop
         "position_obj": position,  # Link to actual Position object
         "exchange_order_id": exchange_order_id,
+        "temp_low": signal.get("temp_low"),  # For edge recalculation
+        "temp_high": signal.get("temp_high"),  # For edge recalculation
     }
 
     st.session_state.open_positions.insert(0, legacy_position)
@@ -1320,7 +1352,7 @@ def check_smart_exits(forecasts, markets):
         current_price = market_prices.get(cid, legacy_pos.get("current_price", 0.5))
         legacy_pos["current_price"] = current_price
 
-        # Get current forecast probability
+        # Get current forecast probability - recalculate from latest forecast data
         target_date = legacy_pos.get("target_date")
         if target_date and hasattr(target_date, 'isoformat'):
             date_key = f"{city_key}_{target_date.isoformat()}"
@@ -1330,8 +1362,16 @@ def check_smart_exits(forecasts, markets):
 
         forecast_prob = legacy_pos.get("forecast_prob", 0.5)
         if fc:
-            # Recalculate probability based on current forecast
-            forecast_prob = legacy_pos.get("forecast_prob", 0.5)
+            # Recalculate probability using current forecast and position's temp bracket
+            temp_low = legacy_pos.get("temp_low")
+            temp_high = legacy_pos.get("temp_high")
+            if temp_low is not None or temp_high is not None:
+                forecast_mean = fc.get("high_mean", 50)
+                forecast_std = max(fc.get("high_std", 3.0), 2.0)
+                recalc_prob = calc_outcome_probability(temp_low, temp_high, forecast_mean, forecast_std)
+                if recalc_prob is not None:
+                    forecast_prob = recalc_prob
+                    legacy_pos["forecast_prob"] = forecast_prob  # Update stored value
 
         # Calculate current edge
         side = legacy_pos.get("side", "YES")
@@ -1373,25 +1413,27 @@ def check_smart_exits(forecasts, markets):
         else:
             entry_price = legacy_pos.get("entry_price", 0.5)
             size = legacy_pos.get("size", 1)
+            # Only apply edge-based exits if we have temp bracket data to calculate edge
+            has_temp_data = legacy_pos.get("temp_low") is not None or legacy_pos.get("temp_high") is not None
 
-            # 1. EDGE TOO LOW - Exit if edge below threshold
-            if abs(current_edge) < min_edge_exit:
+            # 1. EDGE TOO LOW - Exit if edge below threshold (requires temp data)
+            if has_temp_data and abs(current_edge) < min_edge_exit:
                 should_exit = True
                 exit_reason = ExitReason.EDGE_EXHAUSTED
 
-            # 2. EDGE REVERSED - Exit if edge turned negative
-            elif current_edge < 0:
+            # 2. EDGE REVERSED - Exit if edge turned negative (requires temp data)
+            elif has_temp_data and current_edge < 0:
                 should_exit = True
                 exit_reason = ExitReason.EDGE_REVERSED
 
-            # 3. STOP LOSS - Exit if loss > 30%
+            # 3. STOP LOSS - Exit if loss > 30% (always applies)
             elif unrealized_pnl < 0:
                 pnl_pct = unrealized_pnl / size if size > 0 else 0
                 if pnl_pct < -0.30:
                     should_exit = True
                     exit_reason = ExitReason.STOP_LOSS
 
-            # 4. TRAILING STOP - Exit if gave back 30%+ of peak profit
+            # 4. TRAILING STOP - Exit if gave back 30%+ of peak profit (always applies)
             elif peak_pnl > 0 and unrealized_pnl > 0:
                 drawdown = (peak_pnl - unrealized_pnl) / peak_pnl
                 if drawdown > 0.30:
