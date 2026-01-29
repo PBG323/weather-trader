@@ -166,7 +166,7 @@ def check_pending_orders():
 
     auth = KalshiAuth()
     if not auth.is_configured:
-        return
+        return {"filled": 0, "pending": 0, "cancelled": 0, "pending_orders": []}
 
     async def _fetch_orders():
         client = KalshiClient(auth)
@@ -177,7 +177,7 @@ def check_pending_orders():
         orders = run_async(_fetch_orders())
     except Exception as e:
         add_alert(f"Error checking orders: {e}", "warning")
-        return
+        return {"filled": 0, "pending": 0, "cancelled": 0, "pending_orders": []}
 
     # Filter to weather orders
     weather_orders = [o for o in orders if "KXHIGH" in o.get("ticker", "")]
@@ -267,19 +267,28 @@ def get_live_kalshi_data():
 def update_position_prices():
     """Update all position prices from live Kalshi data."""
     from weather_trader.kalshi import KalshiAuth, KalshiClient
+    import asyncio
 
     auth = KalshiAuth()
     if not auth.is_configured:
-        return
+        return 0
 
     async def _update_prices():
         client = KalshiClient(auth)
         updated = 0
 
-        for pos in st.session_state.open_positions:
-            ticker = pos.get("ticker") or pos.get("condition_id", "")
-            if not ticker or ticker.startswith("demo_"):
-                continue
+        # Get list of tickers to update (avoid modifying list during iteration)
+        positions_to_update = [
+            (i, pos.get("ticker") or pos.get("condition_id", ""))
+            for i, pos in enumerate(st.session_state.open_positions)
+            if (pos.get("ticker") or pos.get("condition_id", "")) and not (pos.get("ticker") or pos.get("condition_id", "")).startswith("demo_")
+        ]
+
+        for idx, ticker in positions_to_update:
+            if idx >= len(st.session_state.open_positions):
+                continue  # Position was removed
+
+            pos = st.session_state.open_positions[idx]
 
             try:
                 market_data = await client._request("GET", f"/markets/{ticker}")
@@ -304,20 +313,26 @@ def update_position_prices():
                     pos["unrealized_pnl"] = (entry - yes_mid) * shares
 
                 updated += 1
-            except:
+
+                # Rate limit: small delay between API calls
+                await asyncio.sleep(0.2)
+
+            except Exception as e:
+                # Log but continue with other positions
                 pass
 
         return updated
 
     try:
         return run_async(_update_prices())
-    except:
+    except Exception as e:
         return 0
 
 
 def check_settled_markets():
     """Check if any positions are in settled markets and close them."""
     from weather_trader.kalshi import KalshiAuth, KalshiClient
+    import asyncio
 
     auth = KalshiAuth()
     if not auth.is_configured:
@@ -325,13 +340,16 @@ def check_settled_markets():
 
     async def _check_settlements():
         client = KalshiClient(auth)
-        settled = 0
+        settled_positions = []
 
-        for pos in list(st.session_state.open_positions):
-            ticker = pos.get("ticker") or pos.get("condition_id", "")
-            if not ticker or ticker.startswith("demo_"):
-                continue
+        # Build list of positions to check (copy to avoid modification during iteration)
+        positions_to_check = [
+            (pos["id"], pos.get("ticker") or pos.get("condition_id", ""))
+            for pos in st.session_state.open_positions
+            if (pos.get("ticker") or pos.get("condition_id", "")) and not (pos.get("ticker") or pos.get("condition_id", "")).startswith("demo_")
+        ]
 
+        for pos_id, ticker in positions_to_check:
             try:
                 market_data = await client._request("GET", f"/markets/{ticker}")
                 market = market_data if "ticker" in market_data else market_data.get("market", {})
@@ -340,25 +358,31 @@ def check_settled_markets():
                 if status in ("settled", "closed", "finalized"):
                     result = market.get("result", "")
                     settlement_price = 1.0 if result == "yes" else 0.0 if result == "no" else 0.5
+                    settled_positions.append((pos_id, settlement_price))
 
-                    # Close the position at settlement price
-                    close_position_smart(pos["id"], settlement_price, ExitReason.SETTLEMENT)
-                    settled += 1
-            except:
+                # Rate limit
+                await asyncio.sleep(0.2)
+
+            except Exception as e:
                 pass
 
-        return settled
+        return settled_positions
 
     try:
-        return run_async(_check_settlements())
-    except:
+        settled_positions = run_async(_check_settlements())
+        # Close positions outside of async context
+        for pos_id, settlement_price in settled_positions:
+            close_position_smart(pos_id, settlement_price, ExitReason.SETTLEMENT)
+        return len(settled_positions)
+    except Exception as e:
         return 0
 
 
-def cancel_stale_orders(max_age_minutes: int = 30):
-    """Cancel orders that have been pending too long."""
+def cancel_stale_orders(max_age_minutes: int = 5):
+    """Cancel orders that have been pending too long (default 5 minutes)."""
     from weather_trader.kalshi import KalshiAuth, KalshiClient
-    from datetime import datetime, timedelta
+    from datetime import datetime, timedelta, timezone
+    import asyncio
 
     auth = KalshiAuth()
     if not auth.is_configured:
@@ -370,7 +394,7 @@ def cancel_stale_orders(max_age_minutes: int = 30):
         orders = data.get("orders", [])
 
         cancelled = 0
-        cutoff = datetime.utcnow() - timedelta(minutes=max_age_minutes)
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=max_age_minutes)
 
         for order in orders:
             if order.get("status") not in ("open", "pending"):
@@ -384,13 +408,26 @@ def cancel_stale_orders(max_age_minutes: int = 30):
             created = order.get("created_time", "")
             if created:
                 try:
-                    order_time = datetime.fromisoformat(created.replace("Z", "+00:00"))
-                    if order_time.replace(tzinfo=None) < cutoff:
+                    # Handle ISO format with Z suffix
+                    if created.endswith("Z"):
+                        order_time = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                    else:
+                        order_time = datetime.fromisoformat(created)
+
+                    # Ensure timezone aware comparison
+                    if order_time.tzinfo is None:
+                        order_time = order_time.replace(tzinfo=timezone.utc)
+
+                    if order_time < cutoff:
                         order_id = order.get("order_id", "")
                         if order_id:
-                            await client.cancel_order(order_id)
-                            cancelled += 1
-                except:
+                            success = await client.cancel_order(order_id)
+                            if success:
+                                cancelled += 1
+                            # Rate limit between cancels
+                            await asyncio.sleep(0.2)
+                except Exception as e:
+                    # Continue with other orders
                     pass
 
         return cancelled
