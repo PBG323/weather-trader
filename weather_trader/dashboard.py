@@ -1191,7 +1191,10 @@ def calculate_signals(forecasts, markets, show_all_outcomes=False):
     for market in markets:
         city_key = market["city"].lower()
         target_date = market.get("target_date", today_est())
-        group_key = f"{city_key}_{target_date}"
+        # Normalize to date object (in case it's a datetime)
+        if hasattr(target_date, 'date'):
+            target_date = target_date.date()
+        group_key = f"{city_key}_{target_date.isoformat()}"
         if group_key not in market_groups:
             market_groups[group_key] = []
         market_groups[group_key].append(market)
@@ -1202,6 +1205,9 @@ def calculate_signals(forecasts, markets, show_all_outcomes=False):
 
         city_key = group_markets[0]["city"].lower()
         target_date = group_markets[0].get("target_date", today_est())
+        # Normalize to date object (in case it's a datetime)
+        if hasattr(target_date, 'date'):
+            target_date = target_date.date()
         is_same_day = target_date == today_est()
 
         # For same-day markets, we now allow trading IF there's genuine uncertainty
@@ -1211,7 +1217,15 @@ def calculate_signals(forecasts, markets, show_all_outcomes=False):
 
         date_key = f"{city_key}_{target_date.isoformat()}"
 
-        fc = forecasts.get(date_key) or forecasts.get(city_key)
+        # CRITICAL: Use date-specific forecast ONLY - never fall back to wrong day
+        fc = forecasts.get(date_key)
+        if not fc:
+            # Try city-only key but VERIFY the date matches
+            fc = forecasts.get(city_key)
+            if fc and fc.get("date") != target_date:
+                # Wrong date - do NOT use this forecast
+                print(f"WARNING: Skipping {city_key} {target_date} - forecast date mismatch (have {fc.get('date')})")
+                continue
         if not fc:
             continue
         forecast_temp_f = fc["high_mean"]  # Forecast is always in Fahrenheit
