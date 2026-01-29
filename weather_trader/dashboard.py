@@ -213,6 +213,148 @@ def check_pending_orders():
     }
 
 
+def get_live_kalshi_data():
+    """Fetch comprehensive live data from Kalshi."""
+    from weather_trader.kalshi import KalshiAuth, KalshiClient
+
+    auth = KalshiAuth()
+    if not auth.is_configured:
+        return None
+
+    async def _fetch_all():
+        client = KalshiClient(auth)
+
+        # Get balance
+        balance = await client.get_balance()
+
+        # Get positions with current prices
+        positions = await client.get_positions()
+
+        # Get pending orders
+        orders_data = await client._request("GET", "/portfolio/orders")
+        orders = orders_data.get("orders", [])
+
+        # Calculate totals
+        weather_positions = [p for p in positions if "KXHIGH" in p.get("ticker", "")]
+        total_position_value = sum(
+            abs(p.get("position", 0)) * (p.get("market_price", 50) / 100.0)
+            for p in weather_positions
+        )
+
+        pending_orders = [
+            o for o in orders
+            if o.get("status") in ("open", "pending")
+            and o.get("remaining_count", 0) > 0
+            and "KXHIGH" in o.get("ticker", "")
+        ]
+
+        return {
+            "balance": balance,
+            "positions": weather_positions,
+            "position_count": len(weather_positions),
+            "total_position_value": total_position_value,
+            "pending_orders": pending_orders,
+            "pending_count": len(pending_orders),
+        }
+
+    try:
+        return run_async(_fetch_all())
+    except Exception as e:
+        add_alert(f"Error fetching Kalshi data: {e}", "warning")
+        return None
+
+
+def update_position_prices():
+    """Update all position prices from live Kalshi data."""
+    from weather_trader.kalshi import KalshiAuth, KalshiClient
+
+    auth = KalshiAuth()
+    if not auth.is_configured:
+        return
+
+    async def _update_prices():
+        client = KalshiClient(auth)
+        updated = 0
+
+        for pos in st.session_state.open_positions:
+            ticker = pos.get("ticker") or pos.get("condition_id", "")
+            if not ticker or ticker.startswith("demo_"):
+                continue
+
+            try:
+                market_data = await client._request("GET", f"/markets/{ticker}")
+                market = market_data if "ticker" in market_data else market_data.get("market", {})
+
+                yes_bid = (market.get("yes_bid", 0) or 0) / 100.0
+                yes_ask = (market.get("yes_ask", 0) or 0) / 100.0
+                yes_mid = (yes_bid + yes_ask) / 2 if (yes_bid and yes_ask) else yes_bid or yes_ask or pos.get("current_price", 0.5)
+
+                pos["current_price"] = yes_mid
+                pos["yes_bid"] = yes_bid
+                pos["yes_ask"] = yes_ask
+                pos["spread"] = yes_ask - yes_bid
+
+                # Update P/L
+                entry = pos.get("entry_price", yes_mid)
+                shares = pos.get("shares", 1)
+                side = pos.get("side", "YES")
+                if side == "YES":
+                    pos["unrealized_pnl"] = (yes_mid - entry) * shares
+                else:
+                    pos["unrealized_pnl"] = (entry - yes_mid) * shares
+
+                updated += 1
+            except:
+                pass
+
+        return updated
+
+    try:
+        return run_async(_update_prices())
+    except:
+        return 0
+
+
+def check_settled_markets():
+    """Check if any positions are in settled markets and close them."""
+    from weather_trader.kalshi import KalshiAuth, KalshiClient
+
+    auth = KalshiAuth()
+    if not auth.is_configured:
+        return 0
+
+    async def _check_settlements():
+        client = KalshiClient(auth)
+        settled = 0
+
+        for pos in list(st.session_state.open_positions):
+            ticker = pos.get("ticker") or pos.get("condition_id", "")
+            if not ticker or ticker.startswith("demo_"):
+                continue
+
+            try:
+                market_data = await client._request("GET", f"/markets/{ticker}")
+                market = market_data if "ticker" in market_data else market_data.get("market", {})
+
+                status = market.get("status", "")
+                if status in ("settled", "closed", "finalized"):
+                    result = market.get("result", "")
+                    settlement_price = 1.0 if result == "yes" else 0.0 if result == "no" else 0.5
+
+                    # Close the position at settlement price
+                    close_position_smart(pos["id"], settlement_price, ExitReason.SETTLEMENT)
+                    settled += 1
+            except:
+                pass
+
+        return settled
+
+    try:
+        return run_async(_check_settlements())
+    except:
+        return 0
+
+
 def cancel_stale_orders(max_age_minutes: int = 30):
     """Cancel orders that have been pending too long."""
     from weather_trader.kalshi import KalshiAuth, KalshiClient
@@ -1553,6 +1695,21 @@ def main():
                         add_alert("No new positions to sync", "info")
                     st.rerun()
 
+                # Live Kalshi stats
+                st.sidebar.markdown("---")
+                st.sidebar.markdown("**💰 Kalshi Account**")
+                if 'kalshi_balance' not in st.session_state:
+                    # Fetch initial balance
+                    kalshi_data = get_live_kalshi_data()
+                    if kalshi_data:
+                        st.session_state.kalshi_balance = kalshi_data["balance"]
+                        st.session_state.kalshi_position_count = kalshi_data["position_count"]
+
+                if 'kalshi_balance' in st.session_state:
+                    st.sidebar.metric("Balance", f"${st.session_state.kalshi_balance:.2f}")
+                    open_count = len([p for p in st.session_state.open_positions if p.get("mode", "").startswith("LIVE")])
+                    st.sidebar.caption(f"{open_count} tracked positions")
+
                 # Pending orders section
                 st.sidebar.markdown("---")
                 st.sidebar.markdown("**📋 Pending Orders**")
@@ -2670,18 +2827,33 @@ def main():
         # Auto-sync with Kalshi on each refresh (if live trading)
         if is_live and st.session_state.kalshi_client is not None:
             try:
-                # Check and update order status
+                # 1. Update live position prices from Kalshi
+                update_position_prices()
+
+                # 2. Check and update pending order status
                 check_pending_orders()
 
-                # Cancel orders pending > 5 minutes
+                # 3. Cancel orders pending > 5 minutes
                 cancelled = cancel_stale_orders(5)
                 if cancelled > 0:
                     add_alert(f"Auto-cancelled {cancelled} stale orders (>5min)", "info")
 
-                # Sync any new positions from Kalshi
+                # 4. Check for settled markets and close positions
+                settled = check_settled_markets()
+                if settled > 0:
+                    add_alert(f"Auto-closed {settled} settled positions", "success")
+
+                # 5. Sync any new positions from Kalshi
                 synced = sync_positions_from_kalshi()
                 if synced > 0:
                     add_alert(f"Auto-synced {synced} new positions", "info")
+
+                # 6. Get latest balance
+                kalshi_data = get_live_kalshi_data()
+                if kalshi_data:
+                    st.session_state.kalshi_balance = kalshi_data["balance"]
+                    st.session_state.kalshi_position_count = kalshi_data["position_count"]
+
             except Exception as e:
                 add_alert(f"Auto-sync error: {e}", "warning")
 
