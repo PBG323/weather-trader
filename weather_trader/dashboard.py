@@ -122,6 +122,10 @@ class TradingDefaults:
     MAX_SPREAD_CENTS = 12        # Don't enter if spread > 12 cents
     MIN_TIME_TO_SETTLEMENT_HOURS = 4  # Don't enter within 4 hours of settlement
 
+    # === PRICE LIMITS (avoid extreme tail bets) ===
+    MIN_ENTRY_PRICE_CENTS = 5    # Don't buy below 5¢ (too risky, 20:1 odds)
+    MAX_ENTRY_PRICE_CENTS = 95   # Don't buy above 95¢ (too risky, 1:20 odds)
+
     # === POSITION SIZING ===
     KELLY_FRACTION = 0.30        # 30% Kelly (up from 25%)
     MAX_POSITION_DOLLARS = 50    # Cap per position
@@ -2170,22 +2174,43 @@ def execute_trade(signal, size, is_live=False):
                 # FETCH FRESH MARKET PRICES for smart entry pricing
                 yes_bid, yes_ask, mid_price = get_fresh_market_price(ticker)
 
+                # Calculate prices for the side we're buying
+                # YES: use yes prices directly
+                # NO: convert (NO price = 100 - YES price)
+                if side == "YES":
+                    side_bid = yes_bid
+                    side_ask = yes_ask
+                    side_mid = mid_price
+                else:
+                    # For NO: bid/ask are inverted from YES
+                    side_bid = 1 - yes_ask if yes_ask > 0 else 0  # NO bid = 100 - YES ask
+                    side_ask = 1 - yes_bid if yes_bid > 0 else 0  # NO ask = 100 - YES bid
+                    side_mid = 1 - mid_price if mid_price > 0 else 0
+
                 # ENTRY PRICING: Cross the spread based on edge strength
                 # Strong edge (>12%): Pay up to ask to get filled immediately
-                # Normal edge (8-12%): Price at mid + 3 cents
-                if edge > 0.12 and yes_ask > 0:
+                # Normal edge (8-12%): Price at mid + offset
+                if edge > 0.12 and side_ask > 0:
                     # Strong conviction: Pay up to get in
-                    price_cents = max(1, min(99, int(yes_ask * 100)))
+                    price_cents = max(1, min(99, int(side_ask * 100)))
                     entry_urgency = "strong"
-                elif mid_price > 0:
+                elif side_mid > 0:
                     # Normal entry: Cross the spread slightly
-                    price_cents = max(1, min(99, int(mid_price * 100) + TradingDefaults.ENTRY_OFFSET_NORMAL))
+                    price_cents = max(1, min(99, int(side_mid * 100) + TradingDefaults.ENTRY_OFFSET_NORMAL))
                     entry_urgency = "normal"
                 else:
                     # Fallback to original pricing
                     base_price = int(round(actual_cost_per_share * 100))
                     price_cents = max(1, min(99, base_price + TradingDefaults.ENTRY_OFFSET_NORMAL))
                     entry_urgency = "fallback"
+
+                # PRICE LIMITS: Avoid extreme tail bets (too risky)
+                if price_cents < TradingDefaults.MIN_ENTRY_PRICE_CENTS:
+                    add_alert(f"Skipping {ticker}: price {price_cents}¢ below minimum {TradingDefaults.MIN_ENTRY_PRICE_CENTS}¢ (too risky)", "warning")
+                    return None
+                if price_cents > TradingDefaults.MAX_ENTRY_PRICE_CENTS:
+                    add_alert(f"Skipping {ticker}: price {price_cents}¢ above maximum {TradingDefaults.MAX_ENTRY_PRICE_CENTS}¢ (too risky)", "warning")
+                    return None
 
                 async def _place_order():
                     async with st.session_state.kalshi_client as client:
@@ -2201,7 +2226,7 @@ def execute_trade(signal, size, is_live=False):
 
                 if result.success:
                     exchange_order_id = result.order_id
-                    add_alert(f"BUY order ({entry_urgency}): {ticker} x{count} @ {price_cents}c (edge: {edge:.1%})", "success")
+                    add_alert(f"BUY {side} ({entry_urgency}): {ticker} x{count} @ {price_cents}c (edge: {edge:.1%})", "success")
                 else:
                     add_alert(f"Live order failed: {result.message}", "warning")
 
