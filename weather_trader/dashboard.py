@@ -1565,8 +1565,8 @@ def main():
                 pending_count = len(st.session_state.pending_orders)
                 if pending_count > 0:
                     st.sidebar.warning(f"⏳ {pending_count} orders waiting to fill")
-                    if st.sidebar.button("❌ Cancel Stale Orders (>30min)"):
-                        cancelled = cancel_stale_orders(30)
+                    if st.sidebar.button("❌ Cancel Stale Orders (>5min)"):
+                        cancelled = cancel_stale_orders(5)
                         if cancelled > 0:
                             add_alert(f"Cancelled {cancelled} stale orders", "info")
                         else:
@@ -1574,6 +1574,7 @@ def main():
                         st.rerun()
                 else:
                     st.sidebar.caption("No pending orders")
+                st.sidebar.caption("Orders >5min auto-cancelled on refresh")
 
     # Demo mode toggle
     st.sidebar.markdown("---")
@@ -2662,9 +2663,28 @@ def main():
         f"*{format_est_time()}*"
     )
 
-    # Auto-refresh
+    # Auto-refresh with Kalshi sync
     if auto_refresh:
         time.sleep(60)
+
+        # Auto-sync with Kalshi on each refresh (if live trading)
+        if is_live and st.session_state.kalshi_client is not None:
+            try:
+                # Check and update order status
+                check_pending_orders()
+
+                # Cancel orders pending > 5 minutes
+                cancelled = cancel_stale_orders(5)
+                if cancelled > 0:
+                    add_alert(f"Auto-cancelled {cancelled} stale orders (>5min)", "info")
+
+                # Sync any new positions from Kalshi
+                synced = sync_positions_from_kalshi()
+                if synced > 0:
+                    add_alert(f"Auto-synced {synced} new positions", "info")
+            except Exception as e:
+                add_alert(f"Auto-sync error: {e}", "warning")
+
         st.cache_data.clear()
         st.rerun()
 
