@@ -1027,16 +1027,17 @@ def check_smart_exits(forecasts, markets):
     # Get forecast probabilities
     positions_to_close = []
 
+    # Edge exit threshold from session state or default
+    min_edge_exit = st.session_state.get("min_edge_exit_pct", 0.05)
+
     for legacy_pos in st.session_state.open_positions:
         position = legacy_pos.get("position_obj")
-        if not position or position.status != PositionStatus.OPEN:
-            continue
-
-        cid = legacy_pos.get("condition_id", "")
+        cid = legacy_pos.get("condition_id", "") or legacy_pos.get("ticker", "")
         city_key = legacy_pos.get("city", "").lower()
 
         # Get current market price
-        current_price = market_prices.get(cid, legacy_pos["current_price"])
+        current_price = market_prices.get(cid, legacy_pos.get("current_price", 0.5))
+        legacy_pos["current_price"] = current_price
 
         # Get current forecast probability
         target_date = legacy_pos.get("target_date")
@@ -1045,24 +1046,78 @@ def check_smart_exits(forecasts, markets):
             fc = forecasts.get(date_key) or forecasts.get(city_key, {})
         else:
             fc = forecasts.get(city_key, {})
-        forecast_prob = legacy_pos.get("forecast_prob", 0.5)
 
+        forecast_prob = legacy_pos.get("forecast_prob", 0.5)
         if fc:
             # Recalculate probability based on current forecast
-            # (simplified - using stored probability for now)
             forecast_prob = legacy_pos.get("forecast_prob", 0.5)
 
-        # Update position with current data
-        st.session_state.position_manager.update_position(
-            position.position_id,
-            market_price=current_price,
-            forecast_prob=forecast_prob
-        )
+        # Calculate current edge
+        side = legacy_pos.get("side", "YES")
+        if side == "YES":
+            current_edge = forecast_prob - current_price
+        else:
+            current_edge = (1 - forecast_prob) - (1 - current_price)
 
-        # Check for exit signals
-        should_exit, exit_reason = st.session_state.position_manager.should_exit_position(position)
+        legacy_pos["current_edge"] = current_edge
 
-        if should_exit:
+        # Calculate unrealized P/L
+        entry_price = legacy_pos.get("entry_price", current_price)
+        shares = legacy_pos.get("shares", 1)
+        if side == "YES":
+            unrealized_pnl = (current_price - entry_price) * shares
+        else:
+            unrealized_pnl = (entry_price - current_price) * shares
+        legacy_pos["unrealized_pnl"] = unrealized_pnl
+
+        # Track peak P/L for trailing stop
+        peak_pnl = legacy_pos.get("peak_pnl", unrealized_pnl)
+        if unrealized_pnl > peak_pnl:
+            legacy_pos["peak_pnl"] = unrealized_pnl
+            peak_pnl = unrealized_pnl
+
+        should_exit = False
+        exit_reason = None
+
+        # For positions with Position objects, use full exit logic
+        if position and position.status == PositionStatus.OPEN:
+            st.session_state.position_manager.update_position(
+                position.position_id,
+                market_price=current_price,
+                forecast_prob=forecast_prob
+            )
+            should_exit, exit_reason = st.session_state.position_manager.should_exit_position(position)
+
+        # For synced positions (no Position object), use simplified exit logic
+        else:
+            entry_price = legacy_pos.get("entry_price", 0.5)
+            size = legacy_pos.get("size", 1)
+
+            # 1. EDGE TOO LOW - Exit if edge below threshold
+            if abs(current_edge) < min_edge_exit:
+                should_exit = True
+                exit_reason = ExitReason.EDGE_EXHAUSTED
+
+            # 2. EDGE REVERSED - Exit if edge turned negative
+            elif current_edge < 0:
+                should_exit = True
+                exit_reason = ExitReason.EDGE_REVERSED
+
+            # 3. STOP LOSS - Exit if loss > 30%
+            elif unrealized_pnl < 0:
+                pnl_pct = unrealized_pnl / size if size > 0 else 0
+                if pnl_pct < -0.30:
+                    should_exit = True
+                    exit_reason = ExitReason.STOP_LOSS
+
+            # 4. TRAILING STOP - Exit if gave back 30%+ of peak profit
+            elif peak_pnl > 0 and unrealized_pnl > 0:
+                drawdown = (peak_pnl - unrealized_pnl) / peak_pnl
+                if drawdown > 0.30:
+                    should_exit = True
+                    exit_reason = ExitReason.TRAILING_STOP
+
+        if should_exit and exit_reason:
             positions_to_close.append((legacy_pos, position, exit_reason, current_price))
 
     # Close positions that triggered exit signals
@@ -1456,6 +1511,18 @@ def main():
         st.sidebar.caption("Conservative: small premium for fills")
     else:
         st.sidebar.caption("Aggressive: pays more for faster fills")
+
+    # Exit settings
+    st.sidebar.markdown("### 🚪 Exit Settings")
+    min_edge_exit = st.sidebar.slider(
+        "Min Edge to Hold (%)",
+        min_value=1,
+        max_value=15,
+        value=5,
+        help="Exit position when edge falls below this percentage"
+    )
+    st.session_state.min_edge_exit_pct = min_edge_exit / 100.0
+    st.sidebar.caption(f"Exit when edge < {min_edge_exit}%")
 
     st.sidebar.markdown("---")
 
