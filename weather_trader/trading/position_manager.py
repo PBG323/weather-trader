@@ -11,6 +11,8 @@ from enum import Enum
 from typing import Optional
 from collections import deque
 import numpy as np
+import json
+import os
 
 from .config import TradingConfig, default_config
 
@@ -507,3 +509,104 @@ class PositionManager:
             "hours_until_settlement": round(position.hours_until_settlement, 1),
             "status": position.status.value,
         }
+
+    # Bug #12 fix: Add persistence methods for positions
+    def save_positions(self, filepath: str = None) -> None:
+        """
+        Save all positions to disk for persistence across restarts.
+
+        Args:
+            filepath: Path to save file (default: data/positions.json)
+        """
+        if filepath is None:
+            data_dir = os.path.join(os.getcwd(), "data")
+            os.makedirs(data_dir, exist_ok=True)
+            filepath = os.path.join(data_dir, "positions.json")
+
+        positions_data = []
+        for pos in self.positions.values():
+            pos_dict = {
+                "position_id": pos.position_id,
+                "market_id": pos.market_id,
+                "condition_id": pos.condition_id,
+                "city": pos.city,
+                "outcome_description": pos.outcome_description,
+                "settlement_date": pos.settlement_date.isoformat(),
+                "side": pos.side,
+                "entry_price": pos.entry_price,
+                "shares": pos.shares,
+                "entry_time": pos.entry_time.isoformat(),
+                "entry_edge": pos.entry_edge,
+                "entry_forecast_prob": pos.entry_forecast_prob,
+                "status": pos.status.value,
+                "current_price": pos.current_price,
+                "current_forecast_prob": pos.current_forecast_prob,
+                "peak_unrealized_pnl": pos.peak_unrealized_pnl,
+                "peak_edge": pos.peak_edge,
+                "exit_price": pos.exit_price,
+                "exit_time": pos.exit_time.isoformat() if pos.exit_time else None,
+                "exit_reason": pos.exit_reason.value if pos.exit_reason else None,
+                "realized_pnl": pos.realized_pnl,
+            }
+            positions_data.append(pos_dict)
+
+        with open(filepath, "w") as f:
+            json.dump({
+                "positions": positions_data,
+                "counter": self._position_counter,
+                "saved_at": datetime.now().isoformat(),
+            }, f, indent=2)
+
+    def load_positions(self, filepath: str = None) -> int:
+        """
+        Load positions from disk.
+
+        Args:
+            filepath: Path to load file (default: data/positions.json)
+
+        Returns:
+            Number of positions loaded
+        """
+        if filepath is None:
+            filepath = os.path.join(os.getcwd(), "data", "positions.json")
+
+        if not os.path.exists(filepath):
+            return 0
+
+        try:
+            with open(filepath, "r") as f:
+                data = json.load(f)
+
+            self._position_counter = data.get("counter", 0)
+            positions_data = data.get("positions", [])
+
+            for pos_dict in positions_data:
+                position = Position(
+                    position_id=pos_dict["position_id"],
+                    market_id=pos_dict["market_id"],
+                    condition_id=pos_dict["condition_id"],
+                    city=pos_dict["city"],
+                    outcome_description=pos_dict["outcome_description"],
+                    settlement_date=datetime.fromisoformat(pos_dict["settlement_date"]),
+                    side=pos_dict["side"],
+                    entry_price=pos_dict["entry_price"],
+                    shares=pos_dict["shares"],
+                    entry_time=datetime.fromisoformat(pos_dict["entry_time"]),
+                    entry_edge=pos_dict["entry_edge"],
+                    entry_forecast_prob=pos_dict["entry_forecast_prob"],
+                    status=PositionStatus(pos_dict["status"]),
+                    current_price=pos_dict["current_price"],
+                    current_forecast_prob=pos_dict["current_forecast_prob"],
+                    peak_unrealized_pnl=pos_dict.get("peak_unrealized_pnl", 0.0),
+                    peak_edge=pos_dict.get("peak_edge", 0.0),
+                    exit_price=pos_dict.get("exit_price"),
+                    exit_time=datetime.fromisoformat(pos_dict["exit_time"]) if pos_dict.get("exit_time") else None,
+                    exit_reason=ExitReason(pos_dict["exit_reason"]) if pos_dict.get("exit_reason") else None,
+                    realized_pnl=pos_dict.get("realized_pnl"),
+                )
+                self.positions[position.position_id] = position
+
+            return len(positions_data)
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            print(f"Error loading positions from {filepath}: {e}")
+            return 0

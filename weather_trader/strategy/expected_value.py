@@ -196,9 +196,18 @@ class ExpectedValueCalculator:
         Returns:
             List of TradeSignal objects, sorted by edge strength
         """
+        from datetime import datetime
         signals = []
 
         for market in markets:
+            # Bug #5 fix: Skip inactive/expired markets
+            if not market.is_active:
+                continue
+
+            # Check if market has closed (close_time in the past)
+            if market.close_time and market.close_time < datetime.now():
+                continue
+
             # Find matching forecast
             city_key = market.city.lower()
             forecast = forecasts.get(city_key)
@@ -206,8 +215,16 @@ class ExpectedValueCalculator:
             if not forecast:
                 continue
 
-            # Check dates match
-            if forecast.date != market.target_date:
+            # Bug #10 fix: Check dates match with timezone awareness
+            # Both forecast.date and market.target_date should be date objects
+            # Normalize both to date objects for comparison (handles datetime vs date)
+            forecast_date = forecast.date
+            market_date = market.target_date
+            if hasattr(forecast_date, 'date'):
+                forecast_date = forecast_date.date()
+            if hasattr(market_date, 'date'):
+                market_date = market_date.date()
+            if forecast_date != market_date:
                 continue
 
             # Evaluate each bracket independently

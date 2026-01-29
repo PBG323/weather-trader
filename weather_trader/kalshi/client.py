@@ -144,6 +144,21 @@ class KalshiClient:
         Returns:
             OrderResult with fill details.
         """
+        # Validate price is within valid range (1-99 cents)
+        if order_type == "limit":
+            if not (1 <= price_cents <= 99):
+                return OrderResult(
+                    success=False,
+                    message=f"Invalid price: {price_cents} cents. Must be between 1 and 99.",
+                )
+
+        # Validate count is positive
+        if count <= 0:
+            return OrderResult(
+                success=False,
+                message=f"Invalid count: {count}. Must be positive.",
+            )
+
         body = {
             "ticker": ticker,
             "action": action,
@@ -221,6 +236,60 @@ class KalshiClient:
         data = await self._request("GET", "/portfolio/positions")
         positions = data.get("market_positions", [])
         return positions
+
+    async def get_fills(self, ticker: str = None, limit: int = 100) -> list[dict]:
+        """Get trade fills (executed orders) with actual prices.
+
+        Args:
+            ticker: Optional ticker to filter fills
+            limit: Max number of fills to return
+
+        Returns:
+            List of fill dicts with 'ticker', 'price', 'count', 'side', etc.
+        """
+        params = {"limit": limit}
+        if ticker:
+            params["ticker"] = ticker
+        data = await self._request("GET", "/portfolio/fills", params=params)
+        return data.get("fills", [])
+
+    async def get_average_entry_price(self, ticker: str) -> float:
+        """Calculate average entry price for a position from fills.
+
+        Returns price in cents (1-99).
+        """
+        fills = await self.get_fills(ticker=ticker)
+        if not fills:
+            return 50  # Default
+
+        # Calculate weighted average of buy fills
+        # Kalshi fields: ticker, side (yes/no), action (buy/sell),
+        # yes_price, no_price, count
+        total_cost = 0
+        total_count = 0
+        for fill in fills:
+            # Filter to buys for this ticker
+            action = fill.get("action", "").lower()
+            if action != "buy":
+                continue
+
+            count = fill.get("count", 0)
+            if count <= 0:
+                continue
+
+            # Get price - try multiple field names
+            side = fill.get("side", "yes").lower()
+            if side == "yes":
+                price = fill.get("yes_price") or fill.get("price", 50)
+            else:
+                price = fill.get("no_price") or fill.get("price", 50)
+
+            total_cost += price * count
+            total_count += count
+
+        if total_count > 0:
+            return total_cost / total_count
+        return 50  # Default if no buy fills found
 
     async def cancel_order(self, order_id: str) -> bool:
         """Cancel a pending order."""

@@ -136,8 +136,7 @@ class PnLTracker:
             entry_edge=position.entry_edge,
             exit_reason=position.exit_reason or ExitReason.MANUAL,
             realized_pnl=position.realized_pnl or 0.0,
-            realized_pnl_pct=((position.exit_price - position.entry_price) / position.entry_price)
-                            if position.entry_price > 0 else 0.0,
+            realized_pnl_pct=self._calculate_pnl_pct(position),
             hold_duration_hours=hold_duration,
             forecast_prob_at_entry=position.entry_forecast_prob,
             forecast_prob_at_exit=position.current_forecast_prob
@@ -147,6 +146,29 @@ class PnLTracker:
         self._save_trade(trade)
 
         return trade
+
+    def _calculate_pnl_pct(self, position) -> float:
+        """Calculate P/L percentage correctly for both YES and NO positions.
+
+        For YES: bought at entry_price, sold at exit_price
+            Cost basis = entry_price, Return = (exit - entry) / entry
+        For NO: bought at (1 - entry_price), sold at (1 - exit_price)
+            Cost basis = (1 - entry_price), Return = ((1-exit) - (1-entry)) / (1-entry)
+            Simplified: (entry - exit) / (1 - entry)
+        """
+        entry = position.entry_price
+        exit_p = position.exit_price
+
+        if position.side == "YES":
+            if entry > 0:
+                return (exit_p - entry) / entry
+            return 0.0
+        else:  # NO position
+            cost_basis = 1 - entry  # What we paid per share
+            if cost_basis > 0:
+                exit_value = 1 - exit_p  # What we receive per share
+                return (exit_value - cost_basis) / cost_basis
+            return 0.0
 
     def update_equity(self, current_equity: float) -> None:
         """

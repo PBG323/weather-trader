@@ -10,12 +10,27 @@ Free API with no key required.
 """
 
 import httpx
+import asyncio
 from dataclasses import dataclass
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Optional
 from enum import Enum
 
 from ..config import config, CityConfig
+
+
+# Rate limiting state
+_rate_limit_until: Optional[datetime] = None
+_consecutive_failures: int = 0
+MAX_RETRIES = 3
+BASE_BACKOFF = 2.0  # seconds
+
+
+def reset_rate_limit():
+    """Reset the rate limit state to allow fresh API calls."""
+    global _rate_limit_until, _consecutive_failures
+    _rate_limit_until = None
+    _consecutive_failures = 0
 
 
 class WeatherModel(Enum):
@@ -69,6 +84,50 @@ class OpenMeteoClient:
         """Convert Celsius to Fahrenheit."""
         return (celsius * 9/5) + 32
 
+    async def _request_with_retry(self, endpoint: str, params: dict) -> dict:
+        """Make a request with retry logic and exponential backoff."""
+        global _rate_limit_until, _consecutive_failures
+
+        # Check if we're in a rate limit cooldown
+        if _rate_limit_until and datetime.now() < _rate_limit_until:
+            wait_seconds = (_rate_limit_until - datetime.now()).total_seconds()
+            print(f"[Open-Meteo] Rate limited, waiting {wait_seconds:.0f}s...")
+            raise Exception(f"Rate limited - retry after {wait_seconds:.0f}s")
+
+        last_error = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = await self.client.get(endpoint, params=params)
+
+                if response.status_code == 429:
+                    # Rate limited - set cooldown
+                    _consecutive_failures += 1
+                    cooldown = min(300, BASE_BACKOFF ** (_consecutive_failures + 2))  # Max 5 min
+                    _rate_limit_until = datetime.now() + timedelta(seconds=cooldown)
+                    print(f"[Open-Meteo] Rate limited (429). Cooldown: {cooldown}s")
+                    raise Exception(f"Rate limited - cooldown {cooldown}s")
+
+                response.raise_for_status()
+                _consecutive_failures = 0  # Reset on success
+                return response.json()
+
+            except httpx.HTTPStatusError as e:
+                last_error = e
+                if e.response.status_code == 429:
+                    raise  # Don't retry 429s, let the cooldown handle it
+                # Other errors - retry with backoff
+                if attempt < MAX_RETRIES - 1:
+                    wait = BASE_BACKOFF ** attempt
+                    print(f"[Open-Meteo] Request failed, retrying in {wait}s...")
+                    await asyncio.sleep(wait)
+            except Exception as e:
+                last_error = e
+                if attempt < MAX_RETRIES - 1:
+                    wait = BASE_BACKOFF ** attempt
+                    await asyncio.sleep(wait)
+
+        raise last_error or Exception("Request failed after retries")
+
     async def get_daily_forecast(
         self,
         city_config: CityConfig,
@@ -117,9 +176,8 @@ class OpenMeteoClient:
         if model == WeatherModel.HRRR:
             params["models"] = "hrrr_conus"
 
-        response = await self.client.get(endpoint, params=params)
-        response.raise_for_status()
-        data = response.json()
+        # Use retry logic for rate limiting
+        data = await self._request_with_retry(endpoint, params)
 
         forecasts = []
         daily = data.get("daily", {})
@@ -174,9 +232,8 @@ class OpenMeteoClient:
             "forecast_hours": hours,
         }
 
-        response = await self.client.get(endpoint, params=params)
-        response.raise_for_status()
-        data = response.json()
+        # Use retry logic for rate limiting
+        data = await self._request_with_retry(endpoint, params)
 
         forecasts = []
         hourly = data.get("hourly", {})
@@ -256,9 +313,8 @@ class OpenMeteoClient:
             "timezone": city_config.timezone,
         }
 
-        response = await self.client.get(endpoint, params=params)
-        response.raise_for_status()
-        data = response.json()
+        # Use retry logic for rate limiting
+        data = await self._request_with_retry(endpoint, params)
 
         results = []
         daily = data.get("daily", {})

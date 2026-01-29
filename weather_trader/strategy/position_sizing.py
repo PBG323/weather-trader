@@ -134,6 +134,22 @@ class PositionSizer:
             lose_amount = entry_price
             win_prob = 1 - signal.forecast_probability
 
+        # Bug #6 fix: Validate entry price is in valid range (0 < price < 1)
+        # Invalid prices would produce negative or infinite Kelly fractions
+        if entry_price <= 0 or entry_price >= 1:
+            return PositionRecommendation(
+                signal=signal,
+                kelly_fraction=0.0,
+                adjusted_kelly=0.0,
+                recommended_size=0.0,
+                recommended_shares=0.0,
+                max_loss=0.0,
+                expected_profit=0.0,
+                risk_reward_ratio=0.0,
+                position_capped=False,
+                bankroll_limited=True,
+            )
+
         # Calculate Kelly fraction
         kelly = self.calculate_kelly(win_prob, win_amount, lose_amount)
 

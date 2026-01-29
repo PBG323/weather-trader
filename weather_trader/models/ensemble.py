@@ -221,17 +221,31 @@ class EnsembleForecaster:
         # Outlier dampening: reduce weight of models that deviate from
         # the unweighted median. Uses a Gaussian kernel so moderate
         # disagreement is tolerated but extreme outliers are suppressed.
+        #
+        # OUTLIER_DAMPENING_SCALE = 4.0°F
+        # This is the "characteristic distance" in the Gaussian kernel.
+        # - At 4°F deviation from median: weight drops to ~61% (e^-0.5)
+        # - At 6°F deviation: weight drops to ~32%
+        # - At 8°F deviation: weight drops to ~14%
+        # Chosen based on typical forecast spread: 4°F disagreement is common
+        # and acceptable; 8°F+ indicates a problematic outlier model.
+        OUTLIER_DAMPENING_SCALE = 4.0  # degrees F
+
         if len(highs) >= 3:
             median_high = np.median(highs)
             deviations = np.abs(highs - median_high)
-            # Dampening scale: 3°F deviation → 75% weight, 6°F → 32% weight
-            dampening = np.exp(-0.5 * (deviations / 4.0) ** 2)
+            dampening = np.exp(-0.5 * (deviations / OUTLIER_DAMPENING_SCALE) ** 2)
             weights = raw_weights * dampening
         else:
             weights = raw_weights
 
-        # Normalize weights
-        weights = weights / weights.sum()
+        # Normalize weights (guard against division by zero if all weights are zero)
+        weight_sum = weights.sum()
+        if weight_sum > 0:
+            weights = weights / weight_sum
+        else:
+            # Fallback to equal weights if all dampened weights are zero
+            weights = np.ones(len(weights)) / len(weights)
 
         # Weighted statistics
         high_mean = np.average(highs, weights=weights)
@@ -242,20 +256,41 @@ class EnsembleForecaster:
         low_var = np.average((lows - low_mean) ** 2, weights=weights)
 
         # Add inherent forecast uncertainty (minimum std of ~2F)
-        min_std = 2.0
-        high_std = max(np.sqrt(high_var), min_std)
-        low_std = max(np.sqrt(low_var), min_std)
+        #
+        # MIN_FORECAST_UNCERTAINTY = 2.0°F
+        # Even when all models perfectly agree, weather has irreducible uncertainty.
+        # 2°F std represents ~95% confidence interval of ±4°F, which matches
+        # typical NWS forecast accuracy for 1-3 day predictions.
+        # This prevents overconfident predictions when models happen to align.
+        MIN_FORECAST_UNCERTAINTY = 2.0  # degrees F
+
+        high_std = max(np.sqrt(high_var), MIN_FORECAST_UNCERTAINTY)
+        low_std = max(np.sqrt(low_var), MIN_FORECAST_UNCERTAINTY)
 
         # Model disagreement increases uncertainty, but cap the amplification
         # so a single outlier model can't blow up the std.
-        # Old: spread_factor = 1 + (np.std(highs) / 5)  — uncapped
-        # New: use IQR-based spread (robust to outliers), capped at 1.5x
+        #
+        # UNCERTAINTY AMPLIFICATION CONSTANTS:
+        # - IQR_HIGH_DISAGREEMENT = 8°F: When IQR reaches 8°F, models strongly
+        #   disagree and we apply maximum uncertainty amplification.
+        # - STD_HIGH_DISAGREEMENT = 5°F: For <4 models, 5°F std dev indicates
+        #   high disagreement (fallback metric, less robust than IQR).
+        # - MAX_SPREAD_AMPLIFICATION = 0.5: Maximum 50% increase to base std.
+        #   spread_factor ranges from 1.0 (perfect agreement) to 1.5 (high disagreement).
+        #   Caps prevent a single outlier from making uncertainty unrealistically large.
+        #
+        # Example: If IQR=4°F → spread_factor=1.25 (25% uncertainty boost)
+        #          If IQR=8°F → spread_factor=1.5 (50% max boost)
+        IQR_HIGH_DISAGREEMENT = 8.0      # degrees F
+        STD_HIGH_DISAGREEMENT = 5.0      # degrees F
+        MAX_SPREAD_AMPLIFICATION = 0.5   # 50% max increase
+
         if len(highs) >= 4:
             iqr = np.percentile(highs, 75) - np.percentile(highs, 25)
-            spread_factor = 1 + min(iqr / 8, 0.5)  # caps at 1.5x
+            spread_factor = 1 + min(iqr / IQR_HIGH_DISAGREEMENT, MAX_SPREAD_AMPLIFICATION)
         else:
             raw_spread = np.std(highs)
-            spread_factor = 1 + min(raw_spread / 5, 0.5)  # caps at 1.5x
+            spread_factor = 1 + min(raw_spread / STD_HIGH_DISAGREEMENT, MAX_SPREAD_AMPLIFICATION)
 
         high_std *= spread_factor
         low_std *= spread_factor

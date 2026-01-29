@@ -266,22 +266,36 @@ class KalshiMarketFinder:
         return markets
 
     async def _fetch_events(self, series_ticker: str, active_only: bool = True) -> list[dict]:
-        """Fetch events for a series ticker."""
+        """Fetch events for a series ticker.
+
+        Bug #11 fix: Added error handling for network/API failures.
+        """
         params = {"series_ticker": series_ticker}
         if active_only:
             params["status"] = "open"
 
-        resp = await self._client.get("/events", params=params)
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("events", [])
+        try:
+            resp = await self._client.get("/events", params=params)
+            resp.raise_for_status()
+            data = resp.json()
+            return data.get("events", [])
+        except Exception as e:
+            print(f"[KalshiMarketFinder] Error fetching events for {series_ticker}: {e}")
+            return []
 
     async def _fetch_brackets(self, event_ticker: str) -> list[dict]:
-        """Fetch all bracket markets for an event."""
-        resp = await self._client.get("/markets", params={"event_ticker": event_ticker})
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("markets", [])
+        """Fetch all bracket markets for an event.
+
+        Bug #11 fix: Added error handling for network/API failures.
+        """
+        try:
+            resp = await self._client.get("/markets", params={"event_ticker": event_ticker})
+            resp.raise_for_status()
+            data = resp.json()
+            return data.get("markets", [])
+        except Exception as e:
+            print(f"[KalshiMarketFinder] Error fetching brackets for {event_ticker}: {e}")
+            return []
 
     def _extract_date_from_ticker(self, event_ticker: str) -> Optional[date]:
         """Parse date from event ticker like 'KXHIGHNY-26JAN28' → date(2026, 1, 28).
@@ -434,7 +448,7 @@ class SameDayTradingChecker:
         """
         from ..apis.nws import NWSClient
 
-        cache_key = city_config.key
+        cache_key = city_config.name.lower().replace(" ", "_")
         now = datetime.now(EST)
 
         # Check cache

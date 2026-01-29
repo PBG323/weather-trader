@@ -264,7 +264,7 @@ def get_live_kalshi_data():
         return None
 
 
-def update_position_prices():
+def update_position_prices_from_kalshi():
     """Update all position prices from live Kalshi data."""
     from weather_trader.kalshi import KalshiAuth, KalshiClient
     import asyncio
@@ -294,23 +294,30 @@ def update_position_prices():
                 market_data = await client._request("GET", f"/markets/{ticker}")
                 market = market_data if "ticker" in market_data else market_data.get("market", {})
 
+                # Debug: log market data fields
                 yes_bid = (market.get("yes_bid", 0) or 0) / 100.0
                 yes_ask = (market.get("yes_ask", 0) or 0) / 100.0
-                yes_mid = (yes_bid + yes_ask) / 2 if (yes_bid and yes_ask) else yes_bid or yes_ask or pos.get("current_price", 0.5)
+                last_price = (market.get("last_price", 0) or 0) / 100.0
+                previous_yes_bid = (market.get("previous_yes_bid", 0) or 0) / 100.0
 
-                pos["current_price"] = yes_mid
+                add_alert(f"DEBUG {ticker}: bid={yes_bid:.2f} ask={yes_ask:.2f} last={last_price:.2f}", "info")
+
+                # Use last_price if available (matches Kalshi display), else yes_bid
+                current_price = last_price if last_price > 0 else yes_bid if yes_bid > 0 else yes_ask if yes_ask > 0 else pos.get("current_price", 0.5)
+
+                pos["current_price"] = current_price
                 pos["yes_bid"] = yes_bid
                 pos["yes_ask"] = yes_ask
                 pos["spread"] = yes_ask - yes_bid
 
-                # Update P/L
-                entry = pos.get("entry_price", yes_mid)
+                # Update P/L using current price
+                entry = pos.get("entry_price", current_price)
                 shares = pos.get("shares", 1)
                 side = pos.get("side", "YES")
                 if side == "YES":
-                    pos["unrealized_pnl"] = (yes_mid - entry) * shares
+                    pos["unrealized_pnl"] = (current_price - entry) * shares
                 else:
-                    pos["unrealized_pnl"] = (entry - yes_mid) * shares
+                    pos["unrealized_pnl"] = (entry - current_price) * shares
 
                 updated += 1
 
@@ -319,7 +326,7 @@ def update_position_prices():
 
             except Exception as e:
                 # Log but continue with other positions
-                pass
+                add_alert(f"Price update error for {ticker}: {e}", "warning")
 
         return updated
 
@@ -511,7 +518,8 @@ def sync_positions_from_kalshi():
                 month = months.get(date_match.group(2), 1)
                 day = int(date_match.group(3))
                 target_date = dt_date(year, month, day)
-            except:
+            except (ValueError, TypeError) as e:
+                print(f"[Sync] Date parsing error for ticker {ticker}: {e}")
                 pass
 
         # Parse temperature bracket from ticker
@@ -572,6 +580,282 @@ def sync_positions_from_kalshi():
 
     st.session_state.positions_synced = True
     return synced
+
+
+def reconcile_positions_with_kalshi():
+    """
+    Full reconciliation of positions between dashboard and Kalshi.
+
+    This function:
+    1. Fetches ALL positions from Kalshi
+    2. Removes dashboard positions that no longer exist in Kalshi
+    3. Adds new positions from Kalshi that aren't in dashboard
+    4. Updates share counts and prices for existing positions
+
+    Returns: tuple (added, removed, updated)
+    """
+    from weather_trader.kalshi import KalshiAuth, KalshiClient
+    from datetime import datetime
+    import re
+
+    auth = KalshiAuth()
+    if not auth.is_configured:
+        add_alert("Cannot reconcile: Kalshi not configured", "warning")
+        return 0, 0, 0
+
+    async def _fetch_positions():
+        client = KalshiClient(auth)
+        return await client.get_positions()
+
+    try:
+        kalshi_positions = run_async(_fetch_positions())
+    except Exception as e:
+        add_alert(f"Reconciliation failed: {e}", "error")
+        return 0, 0, 0
+
+    # Filter to weather positions with non-zero holdings
+    kalshi_weather = {
+        p.get("ticker", ""): p for p in kalshi_positions
+        if "KXHIGH" in p.get("ticker", "") and p.get("position", 0) != 0
+    }
+
+    added = 0
+    removed = 0
+    updated = 0
+
+    # Get dashboard position tickers
+    dashboard_tickers = {}
+    for pos in st.session_state.open_positions:
+        ticker = pos.get("ticker") or pos.get("condition_id", "")
+        if ticker and "KXHIGH" in ticker:
+            dashboard_tickers[ticker] = pos
+
+    # 1. REMOVE positions from dashboard that are no longer in Kalshi
+    positions_to_remove = []
+    for ticker, pos in dashboard_tickers.items():
+        if ticker not in kalshi_weather:
+            # Position was closed in Kalshi - mark for removal
+            positions_to_remove.append(pos["id"])
+            add_alert(f"Position {ticker} closed in Kalshi - removing from dashboard", "info")
+
+    for pos_id in positions_to_remove:
+        for i, pos in enumerate(st.session_state.open_positions):
+            if pos["id"] == pos_id:
+                # Move to closed positions with zero P/L (already settled in Kalshi)
+                closed = {
+                    **pos,
+                    "close_time": datetime.now(),
+                    "close_price": pos.get("current_price", pos.get("entry_price", 0.5)),
+                    "status": "CLOSED",
+                    "exit_reason": "Closed in Kalshi",
+                    "realized_pnl": 0,  # Already realized in Kalshi
+                }
+                st.session_state.closed_positions.insert(0, closed)
+                st.session_state.open_positions.pop(i)
+                removed += 1
+                break
+
+    # 2. UPDATE existing positions with latest Kalshi data
+    # Also check for old-format bracket descriptions that need fixing
+    positions_to_refresh = []
+
+    for ticker, kalshi_pos in kalshi_weather.items():
+        if ticker in dashboard_tickers:
+            dash_pos = dashboard_tickers[ticker]
+            kalshi_shares = abs(kalshi_pos.get("position", 0))
+            dash_shares = dash_pos.get("shares", 0)
+
+            # Update if share count changed (handles partial fills)
+            if kalshi_shares != dash_shares:
+                dash_pos["shares"] = kalshi_shares
+
+                # Bug #8 fix: Recalculate entry price from Kalshi data for partial fills
+                # market_exposure is the total cost in cents, so avg price = exposure / shares
+                market_exposure = kalshi_pos.get("market_exposure", 0) or 0
+                if market_exposure > 0 and kalshi_shares > 0:
+                    new_entry_price = (market_exposure / kalshi_shares) / 100.0
+                    dash_pos["entry_price"] = new_entry_price
+                    dash_pos["size"] = kalshi_shares * new_entry_price
+                    add_alert(f"Updated {ticker}: {dash_shares}->{kalshi_shares} shares @ ${new_entry_price:.3f}", "info")
+                else:
+                    dash_pos["size"] = kalshi_shares * dash_pos.get("entry_price", 0.5)
+                    add_alert(f"Updated {ticker}: shares {dash_shares} -> {kalshi_shares}", "info")
+                updated += 1
+
+            # Update market price if available
+            market_price = kalshi_pos.get("market_price")
+            if market_price:
+                dash_pos["current_price"] = market_price / 100.0
+
+            # Check if bracket description is in old format (T##, B##.#, etc.)
+            outcome_desc = dash_pos.get("outcome_desc", "")
+            if re.match(r'^[TB]\d', outcome_desc):
+                # Old format detected - mark for refresh
+                positions_to_refresh.append(dash_pos["id"])
+
+    # Remove positions with old format so they get re-added with correct descriptions
+    for pos_id in positions_to_refresh:
+        for i, pos in enumerate(st.session_state.open_positions):
+            if pos["id"] == pos_id:
+                ticker = pos.get("ticker") or pos.get("condition_id", "")
+                add_alert(f"Refreshing {ticker} with correct bracket description", "info")
+                st.session_state.open_positions.pop(i)
+                # Remove from dashboard_tickers so it gets re-added in step 3
+                if ticker in dashboard_tickers:
+                    del dashboard_tickers[ticker]
+                break
+
+    # 3. ADD new positions from Kalshi that aren't in dashboard
+    # Need to fetch market data to get correct bracket info
+    async def _fetch_market_data(client, ticker):
+        try:
+            data = await client._request("GET", f"/markets/{ticker}")
+            return data.get("market", data)
+        except Exception as e:
+            print(f"[Sync] Failed to fetch market data for {ticker}: {e}")
+            return None
+
+    async def _add_new_positions():
+        nonlocal added
+        client = KalshiClient(auth)
+
+        for ticker, kalshi_pos in kalshi_weather.items():
+            if ticker in dashboard_tickers:
+                continue
+
+            position_count = kalshi_pos.get("position", 0)
+
+            # Calculate entry price from Kalshi position data
+            # Key field: market_exposure (cost in cents) / position (shares)
+            market_exposure = kalshi_pos.get("market_exposure", 0) or 0
+
+            if market_exposure > 0 and abs(position_count) > 0:
+                # market_exposure is total cost in cents, divide by shares
+                avg_price = market_exposure / abs(position_count)
+            else:
+                # Fallback: try to fetch from fills
+                try:
+                    avg_price = await client.get_average_entry_price(ticker)
+                except Exception as e:
+                    print(f"[Sync] Failed to get entry price for {ticker}: {e}")
+                    avg_price = 50  # Default to 50 cents
+
+            # Sanity check - ensure avg_price is reasonable (1-99 cents)
+            if avg_price is None or avg_price < 1 or avg_price > 99:
+                avg_price = 50
+
+            if position_count > 0:
+                side = "YES"
+                shares = position_count
+            else:
+                side = "NO"
+                shares = abs(position_count)
+
+            # Parse city from ticker
+            city_map = {"NY": "nyc", "CHI": "chicago", "MIA": "miami", "AUS": "austin",
+                       "LA": "la", "DEN": "denver", "PHL": "philadelphia"}
+            city = "unknown"
+            for code, city_key in city_map.items():
+                if f"KXHIGH{code}" in ticker:
+                    city = city_key
+                    break
+
+            # Parse date from ticker
+            date_match = re.search(r'-(\d{2})([A-Z]{3})(\d{2})', ticker)
+            target_date = None
+            if date_match:
+                months = {"JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+                          "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12}
+                try:
+                    from datetime import date as dt_date
+                    year = 2000 + int(date_match.group(1))
+                    month = months.get(date_match.group(2), 1)
+                    day = int(date_match.group(3))
+                    target_date = dt_date(year, month, day)
+                except (ValueError, TypeError) as e:
+                    print(f"[Sync] Date parsing error for {ticker}: {e}")
+                    pass
+
+            # FETCH ACTUAL MARKET DATA for correct bracket info
+            temp_low = None
+            temp_high = None
+            outcome_desc = ticker.split("-")[-1] if "-" in ticker else ticker
+            market_price_cents = kalshi_pos.get("market_price", avg_price)
+
+            market_data = await _fetch_market_data(client, ticker)
+            if market_data:
+                floor_strike = market_data.get("floor_strike")
+                cap_strike = market_data.get("cap_strike")
+                title = market_data.get("title", "")
+                subtitle = market_data.get("subtitle", "")
+
+                # Determine bracket type from floor/cap strikes
+                if floor_strike is not None and cap_strike is not None:
+                    # Range bracket (e.g., 63-64)
+                    temp_low = floor_strike
+                    temp_high = cap_strike
+                    outcome_desc = f"{int(floor_strike)}-{int(cap_strike)}F"
+                elif cap_strike is not None and floor_strike is None:
+                    # Below bracket (e.g., <45 means 44 or below)
+                    temp_high = cap_strike - 1
+                    temp_low = None
+                    outcome_desc = f"<={int(temp_high)}F"
+                elif floor_strike is not None and cap_strike is None:
+                    # Above bracket (e.g., >70 means 71 or above)
+                    temp_low = floor_strike + 1
+                    temp_high = None
+                    outcome_desc = f">={int(temp_low)}F"
+
+                # Get live price from market data - use yes_bid (sell price) to match Kalshi display
+                yes_bid = market_data.get("yes_bid", 0) or 0
+                yes_ask = market_data.get("yes_ask", 0) or 0
+                # Use yes_bid as current price (what you can sell at)
+                market_price_cents = yes_bid if yes_bid > 0 else yes_ask
+
+            entry_price = avg_price / 100.0 if avg_price else 0.5
+            current_price = market_price_cents / 100.0 if market_price_cents else entry_price
+
+            legacy_position = {
+                "id": f"sync_{ticker}_{datetime.now().timestamp()}",
+                "open_time": datetime.now(),
+                "city": city,
+                "outcome": outcome_desc,
+                "side": side,
+                "size": shares * entry_price,
+                "entry_price": entry_price,
+                "current_price": current_price,
+                "edge_at_entry": 0.0,
+                "forecast_prob": entry_price,
+                "market_prob_at_entry": entry_price,
+                "status": "OPEN",
+                "mode": "LIVE (synced)",
+                "is_demo": False,
+                "condition_id": ticker,
+                "ticker": ticker,
+                "target_date": target_date,
+                "unrealized_pnl": 0.0,
+                "position_obj": None,
+                "exchange_order_id": None,
+                "shares": shares,
+                "temp_low": temp_low,
+                "temp_high": temp_high,
+                "peak_pnl": 0.0,
+            }
+
+            st.session_state.open_positions.append(legacy_position)
+            added += 1
+            cost = shares * entry_price
+            add_alert(f"Added: {city.upper()} {outcome_desc} | {shares} {side} @ ${entry_price:.2f} = ${cost:.2f}", "success")
+
+    # Run the async add function
+    if any(ticker not in dashboard_tickers for ticker in kalshi_weather):
+        try:
+            run_async(_add_new_positions())
+        except Exception as e:
+            add_alert(f"Error adding positions: {e}", "warning")
+
+    st.session_state.positions_synced = True
+    return added, removed, updated
 
 
 # ========================
@@ -665,6 +949,41 @@ def record_price(market_id: str, price: float):
     })
 
 
+def _simulate_price_movement(base_price: float, condition_id: str) -> float:
+    """
+    Bug #13 fix: Simulate realistic price movements for demo mode.
+
+    Uses mean reversion + random walk to create realistic price dynamics.
+    Prices tend to drift toward fair value but with noise.
+    """
+    # Get previous price if exists, otherwise use base
+    price_history = st.session_state.get("price_history", {})
+    prev_price = price_history.get(condition_id, base_price)
+
+    # Mean reversion factor (pull toward fair value)
+    mean_reversion = 0.1 * (base_price - prev_price)
+
+    # Random walk component (market noise)
+    random_walk = random.gauss(0, 0.02)  # 2% std dev
+
+    # Momentum component (slight trend continuation)
+    momentum = 0.3 * (prev_price - price_history.get(f"{condition_id}_prev", prev_price))
+
+    # Calculate new price
+    new_price = prev_price + mean_reversion + random_walk + momentum
+
+    # Clamp to valid range
+    new_price = max(0.01, min(0.99, new_price))
+
+    # Store for next iteration
+    if "price_history" not in st.session_state:
+        st.session_state.price_history = {}
+    st.session_state.price_history[f"{condition_id}_prev"] = prev_price
+    st.session_state.price_history[condition_id] = new_price
+
+    return new_price
+
+
 def generate_demo_markets(forecasts):
     """Generate demo markets based on real forecasts for testing."""
     markets = []
@@ -703,11 +1022,10 @@ def generate_demo_markets(forecasts):
                 fair_prob = prob_high - prob_low
                 outcome_desc = f"{temp_low}-{temp_high}°F"
 
-            # Add market inefficiency
-            market_noise = random.uniform(-0.10, 0.10)
-            market_prob = max(0.01, min(0.99, fair_prob + market_noise))
-
             condition_id = f"demo_{city_key}_{target_date}_{temp_low}_{temp_high}"
+
+            # Bug #13 fix: Use dynamic price simulation instead of static noise
+            market_prob = _simulate_price_movement(fair_prob, condition_id)
 
             markets.append({
                 "city": city_key,
@@ -731,6 +1049,7 @@ def generate_demo_markets(forecasts):
                 "is_demo": True,
                 "is_same_day": False,  # Demo markets are always for tomorrow
                 "city_config": city_config,
+                "fair_value": fair_prob,  # Store fair value for reference
             })
 
             record_price(condition_id, market_prob)
@@ -772,6 +1091,7 @@ async def _fetch_multi_day():
 
 
 @st.cache_data(ttl=600)
+@st.cache_data(ttl=600)  # Cache for 10 minutes to avoid rate limiting
 def fetch_model_comparison():
     """Fetch forecasts from different models for comparison."""
     return run_async(_fetch_model_comparison())
@@ -820,15 +1140,18 @@ async def _fetch_model_comparison():
                                 "high": f.temperature_high,
                                 "low": f.temperature_low
                             }
+                    # Small delay to avoid rate limiting
+                    await asyncio.sleep(0.3)
                 except Exception as e:
                     print(f"Model comparison error for {city_key}/{model.value}: {e}")
+                    # Continue with other models even if one fails
 
             comparisons[city_key] = city_data
 
     return comparisons
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=300)  # 5 minutes - increased to reduce API calls
 def fetch_real_markets():
     """Fetch real Kalshi markets."""
     return run_async(_fetch_real_markets())
@@ -885,10 +1208,17 @@ async def _fetch_real_markets():
     return markets
 
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=300)  # 5 min cache (reduced from 10)
 def fetch_forecasts_with_models():
     """Fetch forecasts with individual model data."""
-    return run_async(_fetch_forecasts_with_models())
+    try:
+        result = run_async(_fetch_forecasts_with_models())
+        if not result:
+            add_alert("Warning: No forecasts returned from API - may be rate limited", "warning")
+        return result
+    except Exception as e:
+        add_alert(f"Forecast fetch error: {e}", "error")
+        return {}
 
 
 # Tomorrow.io API rate limiting - Module-level variables
@@ -1170,9 +1500,16 @@ async def _check_same_day_uncertainty_async(markets, ensemble_forecasts=None):
         blend_reason = "evening (NWS only)"
 
     # Group same-day markets by city to batch the NWS calls
+    # CRITICAL: Compute is_same_day dynamically from target_date, not cached flag
+    # This ensures consistency with calculate_signals() which also computes dynamically
     same_day_by_city = {}
     for market in markets:
-        if market.get("is_same_day", False):
+        target_date = market.get("target_date", today_est())
+        if hasattr(target_date, 'date'):
+            target_date = target_date.date()
+        is_same_day = target_date == today_est()
+
+        if is_same_day:
             city_key = market["city"].lower()
             if city_key not in same_day_by_city:
                 same_day_by_city[city_key] = []
@@ -1366,16 +1703,29 @@ def calculate_signals(forecasts, markets, show_all_outcomes=False):
         # FOR SAME-DAY MARKETS: Use NWS observations-based forecast (more accurate)
         if is_same_day and city_key in same_day_forecasts:
             fc = same_day_forecasts[city_key]
-            print(f"Using NWS same-day forecast for {city_key}: {fc['high_mean']:.1f}°F (std: {fc['high_std']:.1f})")
+            print(f"[Signal] Using blended same-day forecast for {city_key}: {fc['high_mean']:.1f}°F (std: {fc['high_std']:.1f})")
+        elif is_same_day:
+            # Same-day market but NWS forecast not available - try date-specific ensemble
+            fc = forecasts.get(date_key)
+            if fc:
+                print(f"[Signal] Using date-specific ensemble for same-day {city_key}: {fc['high_mean']:.1f}°F (date: {fc.get('date')})")
+            else:
+                # No today forecast - try city key but verify date
+                fc = forecasts.get(city_key)
+                if fc and fc.get("date") != target_date:
+                    print(f"[Signal] SKIPPING same-day {city_key} - no today forecast, city_key has {fc.get('date')}")
+                    continue
+                elif fc:
+                    print(f"[Signal] Using city-key forecast for same-day {city_key}: {fc['high_mean']:.1f}°F")
         else:
-            # CRITICAL: Use date-specific forecast ONLY - never fall back to wrong day
+            # Future market - use date-specific forecast
             fc = forecasts.get(date_key)
             if not fc:
                 # Try city-only key but VERIFY the date matches
                 fc = forecasts.get(city_key)
                 if fc and fc.get("date") != target_date:
                     # Wrong date - do NOT use this forecast
-                    print(f"WARNING: Skipping {city_key} {target_date} - forecast date mismatch (have {fc.get('date')})")
+                    print(f"[Signal] SKIPPING {city_key} {target_date} - forecast date mismatch (have {fc.get('date')})")
                     continue
         if not fc:
             continue
@@ -1698,12 +2048,20 @@ def check_smart_exits(forecasts, markets):
         legacy_pos["current_edge"] = current_edge
 
         # Calculate unrealized P/L
+        # Bug #7 fix: Handle NO positions correctly
+        # For synced positions from Kalshi, entry_price is stored as the actual cost paid:
+        # - YES: entry_price = YES price paid
+        # - NO: entry_price = NO price paid (= 1 - YES price at entry)
         entry_price = legacy_pos.get("entry_price", current_price)
         shares = legacy_pos.get("shares", 1)
         if side == "YES":
+            # YES: bought at entry_price, current value is current_price
             unrealized_pnl = (current_price - entry_price) * shares
         else:
-            unrealized_pnl = (entry_price - current_price) * shares
+            # NO: bought at entry_price (NO cost), current value is (1 - current_price)
+            # For synced positions, entry_price is the NO price we paid
+            current_no_value = 1 - current_price
+            unrealized_pnl = (current_no_value - entry_price) * shares
         legacy_pos["unrealized_pnl"] = unrealized_pnl
 
         # Track peak P/L for trailing stop
@@ -1900,14 +2258,40 @@ def update_position_prices(markets, forecasts=None):
                 # Use Position object's P/L calculation (handles YES/NO correctly)
                 pos["unrealized_pnl"] = position.unrealized_pnl
             else:
-                # Fallback legacy calculation
+                # Fallback legacy calculation - use shares not size
+                shares = pos.get("shares", 1)
+                entry_price = pos.get("entry_price", 0.5)
                 if pos["side"] == "YES":
-                    pos["unrealized_pnl"] = pos["size"] * (new_price - pos["entry_price"])
+                    pos["unrealized_pnl"] = (new_price - entry_price) * shares
                 else:
-                    # For NO: use proper shares calculation
-                    no_price_at_entry = 1 - pos["entry_price"]
-                    shares = pos["size"] / no_price_at_entry if no_price_at_entry > 0 else 0
-                    pos["unrealized_pnl"] = (pos["entry_price"] - new_price) * shares
+                    pos["unrealized_pnl"] = (entry_price - new_price) * shares
+
+                # Calculate edge for synced positions (no position_obj)
+                if forecasts:
+                    city_key = pos.get("city", "").lower()
+                    target_date = pos.get("target_date")
+                    temp_low = pos.get("temp_low")
+                    temp_high = pos.get("temp_high")
+
+                    # Try to find matching forecast
+                    fc = None
+                    if target_date:
+                        date_key = f"{city_key}_{target_date.isoformat() if hasattr(target_date, 'isoformat') else target_date}"
+                        fc = forecasts.get(date_key) or forecasts.get(city_key)
+                    else:
+                        fc = forecasts.get(city_key)
+
+                    if fc and (temp_low is not None or temp_high is not None):
+                        forecast_mean = fc.get("high_mean", 50)
+                        forecast_std = max(fc.get("high_std", 3), 2.0)
+                        forecast_prob = calc_outcome_probability(temp_low, temp_high, forecast_mean, forecast_std)
+
+                        if forecast_prob is not None:
+                            pos["forecast_prob"] = forecast_prob
+                            if pos["side"] == "YES":
+                                pos["current_edge"] = forecast_prob - new_price
+                            else:
+                                pos["current_edge"] = (1 - forecast_prob) - (1 - new_price)
 
     # Update risk manager equity
     st.session_state.risk_manager.update_equity()
@@ -2074,19 +2458,33 @@ def main():
             if is_live:
                 st.sidebar.error("⚠️ LIVE TRADING ENABLED - Real orders will be submitted")
 
-                # Auto-sync positions on first live connection
+                # Auto-sync positions on first live connection (use full reconciliation)
                 if not st.session_state.positions_synced:
-                    synced = sync_positions_from_kalshi()
-                    if synced > 0:
-                        add_alert(f"Synced {synced} positions from Kalshi", "success")
+                    added, removed, updated = reconcile_positions_with_kalshi()
+                    total_synced = added + updated
+                    if total_synced > 0 or removed > 0:
+                        add_alert(f"Synced positions: +{added} added, ~{updated} updated, -{removed} removed", "success")
+                    st.session_state.positions_synced = True
 
-                # Manual sync button
+                # Manual sync button - full reconciliation
                 if st.sidebar.button("🔄 Sync Positions from Kalshi"):
-                    synced = sync_positions_from_kalshi()
-                    if synced > 0:
-                        add_alert(f"Synced {synced} new positions", "success")
+                    added, removed, updated = reconcile_positions_with_kalshi()
+                    if added > 0 or removed > 0 or updated > 0:
+                        add_alert(f"Kalshi sync: +{added} added, -{removed} removed, ~{updated} updated", "success")
                     else:
-                        add_alert("No new positions to sync", "info")
+                        add_alert("Positions already in sync with Kalshi", "info")
+                    st.rerun()
+
+                # Clear cache button - forces fresh API calls
+                if st.sidebar.button("🗑️ Clear Cache & Refresh"):
+                    st.cache_data.clear()
+                    # Bug #9 fix: Reset ALL API states, not just Open-Meteo
+                    from weather_trader.apis import reset_all_api_state
+                    reset_all_api_state()
+                    # Also clear session state forecast data that might be stale
+                    if 'forecast_history' in st.session_state:
+                        st.session_state.forecast_history = []
+                    add_alert("Cache cleared & all API states reset - fetching fresh data", "info")
                     st.rerun()
 
                 # Live Kalshi stats
@@ -2697,10 +3095,25 @@ def main():
                     # Show all outcomes as a table with calculation details
                     outcome_data = []
                     city_key = group["city_key"].lower()
-                    fc = forecasts.get(city_key)
+                    target_date = group.get("target_date", today_est())
+
+                    # CRITICAL: Use date-specific key for forecast lookup
+                    # For same-day markets, we need today's forecast, not tomorrow's
+                    if hasattr(target_date, 'date'):
+                        target_date = target_date.date()
+                    date_key = f"{city_key}_{target_date.isoformat()}"
+                    fc = forecasts.get(date_key)
+
+                    # Fallback to city_key only if it matches the target date
+                    if not fc:
+                        fc = forecasts.get(city_key)
+                        if fc and fc.get("date") != target_date:
+                            # Wrong date - don't use tomorrow's forecast for today's market
+                            print(f"[Markets] Skipping wrong-date forecast for {city_key}: have {fc.get('date')}, need {target_date}")
+                            fc = None
 
                     if not fc:
-                        print(f"[Markets] No forecast for '{city_key}' - available keys: {list(forecasts.keys())}")
+                        print(f"[Markets] No forecast for '{date_key}' - available keys: {[k for k in forecasts.keys() if city_key in k]}")
 
                     # Get forecast in market's unit
                     market_unit = group["outcomes"][0].get("temp_unit", "F") if group["outcomes"] else "F"
@@ -2771,7 +3184,13 @@ def main():
 
                     # Show forecast context
                     if fc:
-                        st.caption(f"📊 Forecast: {forecast_high:.1f}°{market_unit} (±{forecast_std:.1f}°) | Mean={forecast_high:.1f}, StdDev={forecast_std:.1f}")
+                        fc_date = fc.get("date", "unknown")
+                        fc_source = fc.get("source", "ensemble")
+                        is_same_day_market = target_date == today_est()
+                        day_label = "TODAY" if is_same_day_market else f"{target_date}"
+                        st.caption(f"📊 Forecast for {day_label}: {forecast_high:.1f}°{market_unit} (±{forecast_std:.1f}°) | Source: {fc_source} | Date: {fc_date}")
+                    else:
+                        st.warning(f"⚠️ No forecast available for {target_date} - calculations may be incorrect")
 
                     # Calculation verification
                     with st.expander("🔍 Verify Calculations"):
@@ -2983,7 +3402,7 @@ def main():
             header_cols = st.columns([2, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 1, 1])
             header_cols[0].markdown("**Position**")
             header_cols[1].markdown("**Side**")
-            header_cols[2].markdown("**Size**")
+            header_cols[2].markdown("**Qty/Cost**")
             header_cols[3].markdown("**Entry**")
             header_cols[4].markdown("**Current**")
             header_cols[5].markdown("**Edge**")
@@ -2996,9 +3415,13 @@ def main():
                 with st.container():
                     cols = st.columns([2, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 1, 1])
 
-                    cols[0].markdown(f"**{pos['city']}**\n{pos['outcome']}")
+                    # Escape > to prevent markdown blockquote interpretation
+                    outcome_display = pos['outcome'].replace(">", "\\>")
+                    cols[0].markdown(f"**{pos['city']}**\n{outcome_display}")
                     cols[1].markdown(f"**{pos['side']}**")
-                    cols[2].markdown(f"${pos['size']:.2f}")
+                    shares = pos.get('shares', int(pos['size'] / max(pos['entry_price'], 0.01)))
+                    cost = shares * pos['entry_price']
+                    cols[2].markdown(f"{shares}\n${cost:.2f}")
                     cols[3].markdown(f"{pos['entry_price']:.2f}")
                     cols[4].markdown(f"{pos['current_price']:.2f}")
 
@@ -3013,8 +3436,10 @@ def main():
                         trend_arrow = "↗️" if edge_trend > 0.005 else "↘️" if edge_trend < -0.005 else "→"
                         cols[5].markdown(f":{edge_color}[{current_edge:+.1%}] {trend_arrow}")
                     else:
-                        entry_edge = pos.get('edge_at_entry', 0)
-                        cols[5].markdown(f"{entry_edge:+.1%}")
+                        # For synced positions, use current_edge if available, else edge_at_entry
+                        current_edge = pos.get('current_edge', pos.get('edge_at_entry', 0))
+                        edge_color = "green" if current_edge > 0 else "red"
+                        cols[5].markdown(f":{edge_color}[{current_edge:+.1%}]")
 
                     pnl = pos.get('unrealized_pnl', 0)
                     pnl_color = "green" if pnl >= 0 else "red"
@@ -3274,7 +3699,7 @@ def main():
         if is_live and st.session_state.kalshi_client is not None:
             try:
                 # 1. Update live position prices from Kalshi
-                update_position_prices()
+                update_position_prices_from_kalshi()
 
                 # 2. Check and update pending order status
                 check_pending_orders()
@@ -3289,12 +3714,16 @@ def main():
                 if settled > 0:
                     add_alert(f"Auto-closed {settled} settled positions", "success")
 
-                # 5. Sync any new positions from Kalshi
-                synced = sync_positions_from_kalshi()
-                if synced > 0:
-                    add_alert(f"Auto-synced {synced} new positions", "info")
+                # 5. Full reconciliation with Kalshi (add, remove, update)
+                added, removed, updated = reconcile_positions_with_kalshi()
+                if added > 0 or removed > 0 or updated > 0:
+                    add_alert(f"Kalshi sync: +{added} added, -{removed} removed, ~{updated} updated", "info")
 
-                # 6. Get latest balance
+                # 6. Check smart exits on all positions (if auto-trade enabled)
+                if st.session_state.auto_trade_enabled and forecasts and markets:
+                    check_smart_exits(forecasts, markets)
+
+                # 7. Get latest balance
                 kalshi_data = get_live_kalshi_data()
                 if kalshi_data:
                     st.session_state.kalshi_balance = kalshi_data["balance"]
