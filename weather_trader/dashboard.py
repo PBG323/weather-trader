@@ -311,13 +311,18 @@ def update_position_prices_from_kalshi():
                 pos["spread"] = yes_ask - yes_bid
 
                 # Update P/L using current price
+                # For synced positions, entry_price is what we actually paid:
+                # - YES: entry_price = YES price paid
+                # - NO: entry_price = NO price paid
                 entry = pos.get("entry_price", current_price)
                 shares = pos.get("shares", 1)
                 side = pos.get("side", "YES")
                 if side == "YES":
                     pos["unrealized_pnl"] = (current_price - entry) * shares
                 else:
-                    pos["unrealized_pnl"] = (entry - current_price) * shares
+                    # NO: bought at entry (NO price), current value is (1 - current_price)
+                    current_no_value = 1 - current_price
+                    pos["unrealized_pnl"] = (current_no_value - entry) * shares
 
                 updated += 1
 
@@ -2240,14 +2245,22 @@ def update_position_prices(markets, forecasts=None):
     """Update current prices for all open positions based on market data."""
     market_prices = {}
     for m in markets:
-        key = m.get("condition_id", "")
-        if key:
-            market_prices[key] = m.get("yes_price", 0.5)
+        # Index by both condition_id and ticker for flexible lookup
+        cid = m.get("condition_id", "")
+        ticker = m.get("ticker", "")
+        price = m.get("yes_price", 0.5)
+        if cid:
+            market_prices[cid] = price
+        if ticker and ticker != cid:
+            market_prices[ticker] = price
 
     for pos in st.session_state.open_positions:
-        cid = pos.get("condition_id", "")
-        if cid in market_prices:
-            new_price = market_prices[cid]
+        # Check both condition_id and ticker for position lookup
+        cid = pos.get("condition_id", "") or pos.get("ticker", "")
+        ticker = pos.get("ticker", "") or pos.get("condition_id", "")
+
+        new_price = market_prices.get(cid) or market_prices.get(ticker)
+        if new_price is not None:
             pos["current_price"] = new_price
 
             # Update Position object with edge snapshot and get accurate P/L
@@ -2259,12 +2272,18 @@ def update_position_prices(markets, forecasts=None):
                 pos["unrealized_pnl"] = position.unrealized_pnl
             else:
                 # Fallback legacy calculation - use shares not size
+                # For synced positions from Kalshi, entry_price is the actual cost paid:
+                # - YES: entry_price = YES price paid
+                # - NO: entry_price = NO price paid (what we actually paid per share)
                 shares = pos.get("shares", 1)
                 entry_price = pos.get("entry_price", 0.5)
                 if pos["side"] == "YES":
+                    # YES: bought at entry_price, current value is new_price
                     pos["unrealized_pnl"] = (new_price - entry_price) * shares
                 else:
-                    pos["unrealized_pnl"] = (entry_price - new_price) * shares
+                    # NO: bought at entry_price (NO cost), current value is (1 - new_price)
+                    current_no_value = 1 - new_price
+                    pos["unrealized_pnl"] = (current_no_value - entry_price) * shares
 
                 # Calculate edge for synced positions (no position_obj)
                 if forecasts:
@@ -2292,6 +2311,16 @@ def update_position_prices(markets, forecasts=None):
                                 pos["current_edge"] = forecast_prob - new_price
                             else:
                                 pos["current_edge"] = (1 - forecast_prob) - (1 - new_price)
+        else:
+            # No market match found - still calculate P/L using stored current_price
+            current_price = pos.get("current_price", pos.get("entry_price", 0.5))
+            shares = pos.get("shares", 1)
+            entry_price = pos.get("entry_price", 0.5)
+            if pos.get("side", "YES") == "YES":
+                pos["unrealized_pnl"] = (current_price - entry_price) * shares
+            else:
+                current_no_value = 1 - current_price
+                pos["unrealized_pnl"] = (current_no_value - entry_price) * shares
 
     # Update risk manager equity
     st.session_state.risk_manager.update_equity()
