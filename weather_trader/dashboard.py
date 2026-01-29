@@ -1094,17 +1094,28 @@ def check_same_day_uncertainty(markets):
     """
     Check same-day markets for genuine remaining uncertainty.
 
-    Returns a dict mapping ticker -> SameDayUncertainty assessment.
-    Only same-day markets are checked; future markets are not included.
+    Returns a tuple of:
+    - uncertainty_map: dict mapping ticker -> SameDayUncertainty assessment
+    - same_day_forecasts: dict mapping city_key -> NWS-based forecast for today
+
+    The same_day_forecasts uses actual NWS observations (current high so far)
+    plus remaining hourly forecast to construct a reliable same-day forecast.
     """
     return run_async(_check_same_day_uncertainty_async(markets))
 
 
 async def _check_same_day_uncertainty_async(markets):
-    """Async implementation of same-day uncertainty checking."""
+    """Async implementation of same-day uncertainty checking.
+
+    Returns:
+        Tuple of (uncertainty_map, same_day_forecasts)
+        - uncertainty_map: ticker -> SameDayUncertainty
+        - same_day_forecasts: city_key -> dict with NWS-based forecast for today
+    """
     from weather_trader.kalshi.markets import TemperatureBracket
 
     uncertainty_map = {}
+    same_day_forecasts = {}  # NEW: Store NWS-based forecasts for same-day
     checker = SameDayTradingChecker()
 
     # Group same-day markets by city to batch the NWS calls
@@ -1117,7 +1128,7 @@ async def _check_same_day_uncertainty_async(markets):
             same_day_by_city[city_key].append(market)
 
     if not same_day_by_city:
-        return uncertainty_map
+        return uncertainty_map, same_day_forecasts
 
     # Process each city
     for city_key, city_markets in same_day_by_city.items():
@@ -1128,6 +1139,39 @@ async def _check_same_day_uncertainty_async(markets):
 
             # Fetch current conditions once per city
             current_high, remaining_high = await checker.get_current_conditions(city_config)
+
+            # BUILD NWS-BASED FORECAST FOR SAME-DAY TRADING
+            # The expected high is MAX(current observed, remaining forecast)
+            if current_high is not None:
+                if remaining_high is not None:
+                    expected_high = max(current_high, remaining_high)
+                    # Uncertainty is low late in day - use small std
+                    # If remaining temps are close to current, very low uncertainty
+                    uncertainty_range = abs(remaining_high - current_high)
+                    forecast_std = max(1.5, min(3.0, uncertainty_range / 2))
+                else:
+                    # No remaining forecast - day is over, use current high
+                    expected_high = current_high
+                    forecast_std = 1.0  # Very low uncertainty
+
+                same_day_forecasts[city_key] = {
+                    "city": city_config.name,
+                    "high_mean": expected_high,
+                    "high_std": forecast_std,
+                    "low_mean": expected_high - 10,  # Rough estimate
+                    "low_std": 3.0,
+                    "confidence": 0.85,  # High confidence for NWS observations
+                    "model_count": 1,
+                    "date": today_est(),
+                    "source": "NWS_observations",
+                    "current_high": current_high,
+                    "remaining_high": remaining_high,
+                }
+                add_alert(
+                    f"Same-day forecast for {city_key}: {expected_high:.0f}°F "
+                    f"(current: {current_high:.0f}°F, remaining: {remaining_high}°F, std: {forecast_std:.1f})",
+                    "info"
+                )
 
             for market in city_markets:
                 ticker = market.get("ticker", market.get("condition_id", ""))
@@ -1164,7 +1208,7 @@ async def _check_same_day_uncertainty_async(markets):
         except Exception as e:
             add_alert(f"Error checking same-day uncertainty for {city_key}: {e}", "warning")
 
-    return uncertainty_map
+    return uncertainty_map, same_day_forecasts
 
 
 def calculate_signals(forecasts, markets, show_all_outcomes=False):
@@ -1179,12 +1223,13 @@ def calculate_signals(forecasts, markets, show_all_outcomes=False):
     - Markets where the outcome is already determined are skipped
     - Markets with genuine remaining uncertainty can be traded
     - Confidence is adjusted based on the uncertainty level
+    - Same-day forecasts use NWS observations (more accurate than weather models)
     """
     signals = []
 
     # Pre-check same-day market uncertainty
-    # This fetches current observations and forecasts from NWS
-    same_day_uncertainty = check_same_day_uncertainty(markets)
+    # This fetches current NWS observations and builds same-day forecasts
+    same_day_uncertainty, same_day_forecasts = check_same_day_uncertainty(markets)
 
     # Group markets by city and date
     market_groups = {}
@@ -1217,15 +1262,20 @@ def calculate_signals(forecasts, markets, show_all_outcomes=False):
 
         date_key = f"{city_key}_{target_date.isoformat()}"
 
-        # CRITICAL: Use date-specific forecast ONLY - never fall back to wrong day
-        fc = forecasts.get(date_key)
-        if not fc:
-            # Try city-only key but VERIFY the date matches
-            fc = forecasts.get(city_key)
-            if fc and fc.get("date") != target_date:
-                # Wrong date - do NOT use this forecast
-                print(f"WARNING: Skipping {city_key} {target_date} - forecast date mismatch (have {fc.get('date')})")
-                continue
+        # FOR SAME-DAY MARKETS: Use NWS observations-based forecast (more accurate)
+        if is_same_day and city_key in same_day_forecasts:
+            fc = same_day_forecasts[city_key]
+            print(f"Using NWS same-day forecast for {city_key}: {fc['high_mean']:.1f}°F (std: {fc['high_std']:.1f})")
+        else:
+            # CRITICAL: Use date-specific forecast ONLY - never fall back to wrong day
+            fc = forecasts.get(date_key)
+            if not fc:
+                # Try city-only key but VERIFY the date matches
+                fc = forecasts.get(city_key)
+                if fc and fc.get("date") != target_date:
+                    # Wrong date - do NOT use this forecast
+                    print(f"WARNING: Skipping {city_key} {target_date} - forecast date mismatch (have {fc.get('date')})")
+                    continue
         if not fc:
             continue
         forecast_temp_f = fc["high_mean"]  # Forecast is always in Fahrenheit
