@@ -2992,10 +2992,19 @@ def main():
                     kalshi_data = get_live_kalshi_data()
                     if kalshi_data:
                         st.session_state.kalshi_balance = kalshi_data["balance"]
+                        st.session_state.kalshi_portfolio_value = kalshi_data["total_position_value"]
                         st.session_state.kalshi_position_count = kalshi_data["position_count"]
 
                 if 'kalshi_balance' in st.session_state:
-                    st.sidebar.metric("Balance", f"${st.session_state.kalshi_balance:.2f}")
+                    cash = st.session_state.kalshi_balance
+                    portfolio = st.session_state.get('kalshi_portfolio_value', 0)
+                    total = cash + portfolio
+
+                    col1, col2 = st.sidebar.columns(2)
+                    col1.metric("Cash", f"${cash:.2f}")
+                    col2.metric("Portfolio", f"${portfolio:.2f}")
+                    st.sidebar.metric("Total Value", f"${total:.2f}")
+
                     open_count = len([p for p in st.session_state.open_positions if p.get("mode", "").startswith("LIVE")])
                     st.sidebar.caption(f"{open_count} tracked positions")
 
@@ -3123,6 +3132,7 @@ def main():
             kalshi_data = get_live_kalshi_data()
             if kalshi_data:
                 st.session_state.kalshi_balance = kalshi_data["balance"]
+                st.session_state.kalshi_portfolio_value = kalshi_data["total_position_value"]
                 st.session_state.user_bankroll = kalshi_data["balance"]
                 bankroll = kalshi_data["balance"]
                 add_alert(f"Balance synced: ${kalshi_data['balance']:.2f}", "success")
@@ -4234,6 +4244,7 @@ def main():
                 kalshi_data = get_live_kalshi_data()
                 if kalshi_data:
                     st.session_state.kalshi_balance = kalshi_data["balance"]
+                    st.session_state.kalshi_portfolio_value = kalshi_data["total_position_value"]
                     st.session_state.kalshi_position_count = kalshi_data["position_count"]
 
             except Exception as e:
