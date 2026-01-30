@@ -2536,6 +2536,13 @@ def close_position_smart(position_id: str, current_price: float, exit_reason: Ex
                             price_cents = 0
 
                         if price_cents > 0:
+                            # Check if position is at minimum price (1-2¢) - no liquidity possible
+                            if price_cents <= 2:
+                                add_alert(f"ILLIQUID: {ticker} @ {price_cents}c - no buyers exist, will expire", "warning")
+                                pos["status"] = "ILLIQUID"
+                                pos["illiquid_reason"] = "No buyers at minimum price"
+                                return 0  # Don't try to exit, let it expire
+
                             # IOC exit with escalating retry if no fill
                             async def _sell_order_ioc(p_cents):
                                 async with st.session_state.kalshi_client as client:
@@ -2569,17 +2576,23 @@ def close_position_smart(position_id: str, current_price: float, exit_reason: Ex
                                     pos["status"] = "CLOSING"
                                 else:
                                     # IOC cancelled - no fill, retry at more aggressive price
-                                    retry_price = max(1, price_cents - 5)
-                                    add_alert(f"EXIT IOC cancelled @ {price_cents}c - retrying @ {retry_price}c", "warning")
-                                    result2 = run_async(_sell_order_ioc(retry_price))
-                                    if result2.success and result2.filled_count > 0:
-                                        exit_order_submitted = True
-                                        add_alert(f"EXIT RETRY FILLED: {ticker} x{result2.filled_count} @ {retry_price}c", "success")
-                                        pos["status"] = "CLOSING"
-                                        pos["exit_reason_pending"] = exit_reason.value
+                                    retry_price = max(3, price_cents - 5)  # Don't go below 3¢ (no liquidity there)
+                                    if retry_price < price_cents:
+                                        add_alert(f"EXIT IOC cancelled @ {price_cents}c - retrying @ {retry_price}c", "warning")
+                                        result2 = run_async(_sell_order_ioc(retry_price))
+                                        if result2.success and result2.filled_count > 0:
+                                            exit_order_submitted = True
+                                            add_alert(f"EXIT RETRY FILLED: {ticker} x{result2.filled_count} @ {retry_price}c", "success")
+                                            pos["status"] = "CLOSING"
+                                            pos["exit_reason_pending"] = exit_reason.value
+                                        else:
+                                            # Still no fill - mark for next cycle
+                                            pos["exit_retry_price"] = retry_price - 2  # Track lower price for next attempt
+                                            add_alert(f"EXIT pending for {ticker} - will retry next cycle @ lower price", "warning")
                                     else:
-                                        # Still no fill - will try again next cycle at even lower price
-                                        add_alert(f"EXIT still pending for {ticker} - will retry next cycle", "warning")
+                                        # Already at minimum tradeable price, mark as illiquid
+                                        add_alert(f"ILLIQUID: {ticker} - no buyers above 2c, will expire", "warning")
+                                        pos["status"] = "ILLIQUID"
                             else:
                                 add_alert(f"SELL order issue: {result.message}", "warning")
 
@@ -2590,6 +2603,11 @@ def close_position_smart(position_id: str, current_price: float, exit_reason: Ex
                 # The reconcile_positions_with_kalshi() function will handle removal when position is gone from Kalshi
                 if exit_order_submitted:
                     return 0  # Don't close in dashboard yet - wait for Kalshi confirmation
+
+                # For LIVE positions where exit failed/pending, don't close in dashboard
+                # Position is still open on Kalshi - reconciliation will handle it
+                if pos.get("mode", "").startswith("LIVE") and not exit_order_submitted:
+                    return 0  # Keep position open in dashboard
 
             # Get Position object for accurate P/L calculation
             position = pos.get("position_obj")
