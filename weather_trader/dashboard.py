@@ -950,8 +950,19 @@ def reconcile_positions_with_kalshi():
     for ticker, kalshi_pos in kalshi_weather.items():
         if ticker in dashboard_tickers:
             dash_pos = dashboard_tickers[ticker]
-            kalshi_shares = abs(kalshi_pos.get("position", 0))
+            kalshi_position = kalshi_pos.get("position", 0)
+            kalshi_shares = abs(kalshi_position)
+            kalshi_side = "YES" if kalshi_position > 0 else "NO"
             dash_shares = dash_pos.get("shares", 0)
+            dash_side = dash_pos.get("side", "YES")
+
+            # CRITICAL: Check if side matches - if not, delete and re-add
+            if kalshi_side != dash_side:
+                add_alert(f"SIDE MISMATCH {ticker}: Kalshi={kalshi_side}, Trader={dash_side} - will re-sync", "warning")
+                # Remove from dashboard_tickers so it gets re-added in step 3
+                positions_to_remove.append(dash_pos["id"])
+                del dashboard_tickers[ticker]
+                continue
 
             # Update if share count changed (handles partial fills)
             if kalshi_shares != dash_shares:
@@ -991,6 +1002,17 @@ def reconcile_positions_with_kalshi():
                 # Remove from dashboard_tickers so it gets re-added in step 3
                 if ticker in dashboard_tickers:
                     del dashboard_tickers[ticker]
+                break
+
+    # Remove side-mismatched positions (added to positions_to_remove in step 2)
+    # These need a second pass since the first removal loop already ran
+    for pos_id in positions_to_remove:
+        for i, pos in enumerate(st.session_state.open_positions):
+            if pos["id"] == pos_id:
+                ticker = pos.get("ticker") or pos.get("condition_id", "")
+                add_alert(f"Removing side-mismatched position {ticker}", "info")
+                st.session_state.open_positions.pop(i)
+                removed += 1
                 break
 
     # 3. ADD new positions from Kalshi that aren't in dashboard
