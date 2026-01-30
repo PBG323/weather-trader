@@ -292,12 +292,44 @@ def get_live_kalshi_data():
         orders_data = await client._request("GET", "/portfolio/orders")
         orders = orders_data.get("orders", [])
 
-        # Calculate totals
+        # Calculate totals - need to fetch current prices for accurate portfolio value
         weather_positions = [p for p in positions if "KXHIGH" in p.get("ticker", "")]
-        total_position_value = sum(
-            abs(p.get("position", 0)) * (p.get("market_price", 50) / 100.0)
-            for p in weather_positions
-        )
+
+        # Fetch current market prices for portfolio valuation
+        total_position_value = 0.0
+        for pos in weather_positions:
+            ticker = pos.get("ticker", "")
+            position_count = pos.get("position", 0)
+            shares = abs(position_count)
+
+            if shares == 0:
+                continue
+
+            # Determine side from position sign
+            is_yes = position_count > 0
+
+            # Try to get price from position data first
+            # Kalshi may return different field names
+            yes_price = pos.get("market_price") or pos.get("yes_bid") or pos.get("last_price")
+
+            # If no price in position data, fetch from market
+            if not yes_price:
+                try:
+                    market_data = await client._request("GET", f"/markets/{ticker}")
+                    market = market_data.get("market", market_data)
+                    yes_price = market.get("yes_bid") or market.get("last_price") or 50
+                except:
+                    yes_price = 50  # Fallback
+
+            # Calculate value based on side
+            # YES position value = shares * yes_price
+            # NO position value = shares * (100 - yes_price)
+            if is_yes:
+                value = shares * (yes_price / 100.0)
+            else:
+                value = shares * ((100 - yes_price) / 100.0)
+
+            total_position_value += value
 
         pending_orders = [
             o for o in orders
