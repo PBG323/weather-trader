@@ -3149,9 +3149,9 @@ def main():
 
     bankroll = st.sidebar.number_input(
         "Bankroll ($)",
-        min_value=10.0,
+        min_value=0.0,
         max_value=100000.0,
-        value=st.session_state.user_bankroll,
+        value=max(0.0, st.session_state.user_bankroll),
         step=100.0,
         help="In live mode, this syncs with your Kalshi balance"
     )
