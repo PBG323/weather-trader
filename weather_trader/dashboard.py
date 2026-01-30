@@ -113,8 +113,9 @@ class TradingDefaults:
     """Centralized trading configuration defaults."""
 
     # === TIMING ===
-    REFRESH_CYCLE_SECONDS = 240  # 4 minutes between cycles
-    ORDER_STALE_MINUTES = 4      # Cancel/reprice orders older than this
+    REFRESH_CYCLE_SECONDS = 240  # 4 minutes between cycles (normal)
+    REFRESH_CYCLE_PENDING = 60   # 1 minute when orders are pending (faster order management)
+    ORDER_STALE_MINUTES = 3      # Cancel/reprice orders older than 3 minutes
 
     # === ENTRY CRITERIA ===
     MIN_EDGE_ENTRY = 0.08        # 8% minimum edge to enter (up from 5%)
@@ -561,9 +562,11 @@ def cancel_and_reprice_stale_orders(max_age_minutes: int = 4):
     1. Finds orders older than max_age_minutes
     2. Cancels them
     3. Reprices with ESCALATING URGENCY based on age:
-       - First reprice (4-6 min old): BID - 5 cents (urgent)
-       - Second reprice (6-8 min old): BID - 10 cents (emergency)
-       - Third+ reprice (8+ min old): BID - 15 cents (distressed)
+       - First reprice (4-6 min old): Cross spread slightly
+       - Second reprice (6-8 min old): Cross spread more aggressively
+       - Third+ reprice (8+ min old): Take any price (just fill it!)
+
+    Handles both BUY and SELL orders, and correctly prices YES vs NO side.
 
     Returns: (cancelled_count, repriced_count)
     """
@@ -628,49 +631,79 @@ def cancel_and_reprice_stale_orders(max_age_minutes: int = 4):
 
                 # Reprice: fetch fresh market data and place new order
                 action = order.get("action", "buy")
-                side = order.get("side", "yes")
+                side = order.get("side", "yes").lower()
                 count = order.get("remaining_count", 0)
 
-                if action == "sell" and count > 0:
-                    # For sell orders, get fresh bid and apply ESCALATING urgency
-                    market_data = await client._request("GET", f"/markets/{ticker}")
-                    market = market_data.get("market", market_data)
-                    yes_bid = market.get("yes_bid", 0) or 0
+                if count <= 0:
+                    continue
 
-                    if yes_bid > 0:
-                        # ESCALATING URGENCY: Older orders get more aggressive pricing
-                        if age_minutes < 6:
-                            # First reprice: urgent
-                            offset = TradingDefaults.EXIT_OFFSET_URGENT
-                            urgency = "urgent"
-                        elif age_minutes < 8:
-                            # Second reprice: emergency
-                            offset = TradingDefaults.EXIT_OFFSET_EMERGENCY
-                            urgency = "emergency"
+                # Get fresh market data
+                market_data = await client._request("GET", f"/markets/{ticker}")
+                market = market_data.get("market", market_data)
+                yes_bid = market.get("yes_bid", 0) or 0
+                yes_ask = market.get("yes_ask", 0) or 0
+
+                # Calculate prices for the side we're trading
+                # YES: use yes prices directly
+                # NO: convert (NO price = 100 - YES price)
+                if side == "yes":
+                    side_bid = yes_bid
+                    side_ask = yes_ask
+                else:
+                    # NO bid = 100 - YES ask, NO ask = 100 - YES bid
+                    side_bid = 100 - yes_ask if yes_ask > 0 else 0
+                    side_ask = 100 - yes_bid if yes_bid > 0 else 0
+
+                # ESCALATING URGENCY: Older orders get more aggressive pricing
+                if age_minutes < 6:
+                    urgency = "urgent"
+                    offset = 5  # Cross 5 cents
+                elif age_minutes < 8:
+                    urgency = "emergency"
+                    offset = 10  # Cross 10 cents
+                else:
+                    urgency = "DISTRESSED"
+                    offset = 20  # Just get it done
+
+                if action == "sell":
+                    # SELL: We need a buyer. Price BELOW current bid to attract buyers.
+                    # In distressed mode, go as low as 1 cent to guarantee fill.
+                    if urgency == "DISTRESSED":
+                        new_price = max(1, min(side_bid, 5))  # Floor at 1, cap at 5 to get out
+                    else:
+                        new_price = max(1, side_bid - offset)
+
+                elif action == "buy":
+                    # BUY: We need a seller. Price ABOVE current ask to attract sellers.
+                    if side_ask > 0:
+                        if urgency == "DISTRESSED":
+                            new_price = min(99, max(side_ask, 95))  # Cap at 99, floor at 95 to get in
                         else:
-                            # Third+ reprice: distressed (just get out!)
-                            offset = TradingDefaults.EXIT_OFFSET_DISTRESSED
-                            urgency = "DISTRESSED"
+                            new_price = min(99, side_ask + offset)
+                    else:
+                        # No ask, can't reprice buy order sensibly
+                        add_alert(f"Cannot reprice BUY {ticker}: no ask available", "warning")
+                        continue
+                else:
+                    continue  # Unknown action
 
-                        new_price = max(1, yes_bid - offset)
+                result = await client.place_order(
+                    ticker=ticker,
+                    action=action,
+                    side=side,
+                    count=count,
+                    price_cents=new_price,
+                )
 
-                        result = await client.place_order(
-                            ticker=ticker,
-                            action="sell",
-                            side=side,
-                            count=count,
-                            price_cents=new_price,
-                        )
+                if result.success:
+                    repriced += 1
+                    add_alert(f"Repriced ({urgency}) {action.upper()} {side.upper()} {ticker}: {count}x @ {new_price}c (was {age_minutes:.0f}min old)", "info")
 
-                        if result.success:
-                            repriced += 1
-                            add_alert(f"Repriced ({urgency}) {ticker}: {count}x @ {new_price}c (was {age_minutes:.0f}min old)", "info")
-
-                        await asyncio.sleep(0.2)  # Rate limit
+                await asyncio.sleep(0.2)  # Rate limit
 
             except Exception as e:
                 # Continue with other orders
-                pass
+                add_alert(f"Error repricing {ticker}: {e}", "warning")
 
         return cancelled, repriced
 
@@ -2937,11 +2970,17 @@ def main():
         st.sidebar.markdown('</div>', unsafe_allow_html=True)
 
     # Auto-refresh for auto-trading
-    refresh_mins = TradingDefaults.REFRESH_CYCLE_SECONDS // 60
+    has_pending = len(st.session_state.get('pending_orders', [])) > 0
+    if has_pending:
+        refresh_secs = TradingDefaults.REFRESH_CYCLE_PENDING
+        refresh_label = f"Auto-refresh (1 min - orders pending)"
+    else:
+        refresh_secs = TradingDefaults.REFRESH_CYCLE_SECONDS
+        refresh_label = f"Auto-refresh ({refresh_secs // 60} min)"
     auto_refresh = st.sidebar.checkbox(
-        f"Auto-refresh ({refresh_mins} min)",
+        refresh_label,
         value=auto_trade,
-        help=f"Automatically refresh data every {refresh_mins} minutes for auto-trading"
+        help="Refreshes every 1 min when orders pending, 4 min otherwise"
     )
 
     st.sidebar.markdown("---")
@@ -4056,8 +4095,13 @@ def main():
 
     # Auto-refresh with Kalshi sync
     if auto_refresh:
-        # Use configured refresh cycle (default 4 minutes)
-        time.sleep(TradingDefaults.REFRESH_CYCLE_SECONDS)
+        # Use faster refresh cycle when orders are pending (need active management)
+        has_pending = len(st.session_state.get('pending_orders', [])) > 0
+        if has_pending:
+            refresh_seconds = TradingDefaults.REFRESH_CYCLE_PENDING
+        else:
+            refresh_seconds = TradingDefaults.REFRESH_CYCLE_SECONDS
+        time.sleep(refresh_seconds)
 
         # Auto-sync with Kalshi on each refresh (if live trading)
         if is_live and st.session_state.kalshi_client is not None:
