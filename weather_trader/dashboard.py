@@ -2938,6 +2938,17 @@ def main():
                         add_alert("Positions already in sync with Kalshi", "info")
                     st.rerun()
 
+                # Reset positions and resync from Kalshi (fixes corrupted positions)
+                if st.sidebar.button("🔥 Reset & Resync from Kalshi"):
+                    # Clear all trader positions
+                    st.session_state.open_positions = []
+                    st.session_state.positions_synced = False
+                    add_alert("Cleared all trader positions - resyncing from Kalshi...", "warning")
+                    # Now sync fresh from Kalshi
+                    added, removed, updated = reconcile_positions_with_kalshi()
+                    add_alert(f"Fresh sync: {added} positions loaded from Kalshi", "success")
+                    st.rerun()
+
                 # Clear cache button - forces fresh API calls
                 if st.sidebar.button("🗑️ Clear Cache & Refresh"):
                     st.cache_data.clear()
