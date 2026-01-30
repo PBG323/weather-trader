@@ -130,6 +130,7 @@ class KalshiClient:
         count: int,
         price_cents: int,
         order_type: str = "limit",
+        time_in_force: str = "immediate_or_cancel",
     ) -> OrderResult:
         """Place an order on Kalshi.
 
@@ -140,6 +141,8 @@ class KalshiClient:
             count: Number of contracts
             price_cents: Limit price in cents (1-99)
             order_type: "limit" or "market"
+            time_in_force: "immediate_or_cancel" (IOC), "good_till_canceled" (GTC),
+                          or "fill_or_kill" (FOK). Default is IOC for instant feedback.
 
         Returns:
             OrderResult with fill details.
@@ -165,6 +168,7 @@ class KalshiClient:
             "side": side,
             "count": count,
             "type": order_type,
+            "time_in_force": time_in_force,
         }
 
         if order_type == "limit":

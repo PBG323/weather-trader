@@ -2253,15 +2253,30 @@ def execute_trade(signal, size, is_live=False):
                             side=kalshi_side,
                             count=count,
                             price_cents=price_cents,
+                            # Default is IOC - fills immediately or cancels
                         )
 
                 result = run_async(_place_order())
 
                 if result.success:
                     exchange_order_id = result.order_id
-                    add_alert(f"BUY {side} ({entry_urgency}): {ticker} x{count} @ {price_cents}c (edge: {edge:.1%})", "success")
+                    filled = result.filled_count
+                    remaining = result.remaining_count
+
+                    if filled == 0:
+                        # IOC cancelled - no fill at this price
+                        add_alert(f"IOC cancelled (no fill): {ticker} @ {price_cents}c - will retry next cycle at better price", "warning")
+                        return None  # Don't create position, retry next cycle
+                    elif filled < count:
+                        # Partial fill - update position with actual amount
+                        shares = filled
+                        add_alert(f"PARTIAL FILL: {ticker} {filled}/{count} @ {price_cents}c (edge: {edge:.1%})", "info")
+                    else:
+                        # Full fill
+                        add_alert(f"FILLED: BUY {side} {ticker} x{count} @ {price_cents}c (edge: {edge:.1%})", "success")
                 else:
                     add_alert(f"Live order failed: {result.message}", "warning")
+                    return None  # Don't create position on failure
 
             except Exception as e:
                 add_alert(f"Live order failed (position still tracked): {e}", "warning")
@@ -2521,25 +2536,50 @@ def close_position_smart(position_id: str, current_price: float, exit_reason: Ex
                             price_cents = 0
 
                         if price_cents > 0:
-                            async def _sell_order():
+                            # IOC exit with escalating retry if no fill
+                            async def _sell_order_ioc(p_cents):
                                 async with st.session_state.kalshi_client as client:
                                     return await client.place_order(
                                         ticker=ticker,
                                         action="sell",
                                         side=kalshi_side,
                                         count=shares,
-                                        price_cents=price_cents,
+                                        price_cents=p_cents,
+                                        # Default is IOC - fills immediately or cancels
                                     )
 
-                            result = run_async(_sell_order())
+                            result = run_async(_sell_order_ioc(price_cents))
 
                             if result.success:
-                                exit_order_submitted = True
-                                add_alert(f"SELL order ({urgency}): {ticker} x{shares} @ {price_cents}c ({exit_reason.value})", "success")
-                                # Mark as CLOSING - don't remove until order fills
-                                pos["status"] = "CLOSING"
-                                pos["exit_reason_pending"] = exit_reason.value
-                                pos["exit_order_id"] = result.order_id
+                                filled = result.filled_count
+                                remaining = result.remaining_count
+
+                                if filled == shares:
+                                    # Full fill
+                                    exit_order_submitted = True
+                                    add_alert(f"EXIT FILLED: {ticker} x{shares} @ {price_cents}c ({exit_reason.value})", "success")
+                                    pos["status"] = "CLOSING"
+                                    pos["exit_reason_pending"] = exit_reason.value
+                                    pos["exit_order_id"] = result.order_id
+                                elif filled > 0:
+                                    # Partial fill - mark remaining for retry
+                                    exit_order_submitted = True
+                                    add_alert(f"EXIT PARTIAL: {ticker} {filled}/{shares} @ {price_cents}c - remaining will retry", "info")
+                                    pos["shares"] = shares - filled  # Track remaining
+                                    pos["status"] = "CLOSING"
+                                else:
+                                    # IOC cancelled - no fill, retry at more aggressive price
+                                    retry_price = max(1, price_cents - 5)
+                                    add_alert(f"EXIT IOC cancelled @ {price_cents}c - retrying @ {retry_price}c", "warning")
+                                    result2 = run_async(_sell_order_ioc(retry_price))
+                                    if result2.success and result2.filled_count > 0:
+                                        exit_order_submitted = True
+                                        add_alert(f"EXIT RETRY FILLED: {ticker} x{result2.filled_count} @ {retry_price}c", "success")
+                                        pos["status"] = "CLOSING"
+                                        pos["exit_reason_pending"] = exit_reason.value
+                                    else:
+                                        # Still no fill - will try again next cycle at even lower price
+                                        add_alert(f"EXIT still pending for {ticker} - will retry next cycle", "warning")
                             else:
                                 add_alert(f"SELL order issue: {result.message}", "warning")
 
