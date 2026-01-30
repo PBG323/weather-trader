@@ -222,14 +222,13 @@ class EnsembleForecaster:
         # the unweighted median. Uses a Gaussian kernel so moderate
         # disagreement is tolerated but extreme outliers are suppressed.
         #
-        # OUTLIER_DAMPENING_SCALE = 4.0°F
+        # OUTLIER_DAMPENING_SCALE = 2.0°F (aggressive)
         # This is the "characteristic distance" in the Gaussian kernel.
-        # - At 4°F deviation from median: weight drops to ~61% (e^-0.5)
-        # - At 6°F deviation: weight drops to ~32%
-        # - At 8°F deviation: weight drops to ~14%
-        # Chosen based on typical forecast spread: 4°F disagreement is common
-        # and acceptable; 8°F+ indicates a problematic outlier model.
-        OUTLIER_DAMPENING_SCALE = 4.0  # degrees F
+        # - At 2°F deviation from median: weight drops to ~61% (e^-0.5)
+        # - At 4°F deviation: weight drops to ~14%
+        # - At 6°F deviation: weight drops to ~1%
+        # Aggressive setting: outliers nearly ignored, consensus dominates.
+        OUTLIER_DAMPENING_SCALE = 2.0  # degrees F
 
         if len(highs) >= 3:
             median_high = np.median(highs)
