@@ -2940,10 +2940,11 @@ def main():
 
                 # Reset positions and resync from Kalshi (fixes corrupted positions)
                 if st.sidebar.button("🔥 Reset & Resync from Kalshi"):
-                    # Clear all trader positions
+                    # Clear ALL trader position storage
                     st.session_state.open_positions = []
+                    st.session_state.position_manager.positions = {}  # Clear PositionManager too
                     st.session_state.positions_synced = False
-                    add_alert("Cleared all trader positions - resyncing from Kalshi...", "warning")
+                    add_alert("Cleared ALL trader positions - resyncing from Kalshi...", "warning")
                     # Now sync fresh from Kalshi
                     added, removed, updated = reconcile_positions_with_kalshi()
                     add_alert(f"Fresh sync: {added} positions loaded from Kalshi", "success")
@@ -3094,10 +3095,17 @@ def main():
     st.session_state.user_bankroll = bankroll
 
     # Sync with Kalshi balance button in live mode
-    if is_live and 'kalshi_balance' in st.session_state:
+    if is_live:
         if st.sidebar.button("🔄 Sync Bankroll with Kalshi"):
-            st.session_state.user_bankroll = st.session_state.kalshi_balance
-            bankroll = st.session_state.kalshi_balance
+            # Fetch fresh balance from Kalshi
+            kalshi_data = get_live_kalshi_data()
+            if kalshi_data:
+                st.session_state.kalshi_balance = kalshi_data["balance"]
+                st.session_state.user_bankroll = kalshi_data["balance"]
+                bankroll = kalshi_data["balance"]
+                add_alert(f"Balance synced: ${kalshi_data['balance']:.2f}", "success")
+            else:
+                add_alert("Failed to fetch Kalshi balance", "warning")
             st.rerun()
 
     # Sync bankroll with risk manager
