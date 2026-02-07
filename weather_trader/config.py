@@ -24,6 +24,14 @@ class CityConfig:
     country: str
     temp_unit: str = "F"
     kalshi_series_ticker: str = ""  # Kalshi KXHIGH series ticker for this city
+    # Station bias: NWS station temp minus grid model temp (in Fahrenheit)
+    # Positive = station reads warmer than grid models
+    # This is added to grid forecasts to predict NWS settlement values
+    station_bias: float = 0.0
+    # Station bias standard deviation: How much the bias varies day-to-day
+    # Higher values mean less predictable station behavior (add to forecast uncertainty)
+    # Based on 180-day historical analysis of NOAA vs grid model data
+    station_bias_std: float = 2.0  # Default uncertainty if not specified
 
     @property
     def nws_station_id(self) -> str:
@@ -44,6 +52,8 @@ CITY_CONFIGS: dict[str, CityConfig] = {
         country="US",
         temp_unit="F",
         kalshi_series_ticker="KXHIGHNY",
+        station_bias=0.5,  # KNYC vs grid +0.74F (177 days, HIGH confidence)
+        station_bias_std=4.0,  # INCREASED from 2.09 - actual errors are larger
     ),
     "chicago": CityConfig(
         name="Chicago",
@@ -55,6 +65,8 @@ CITY_CONFIGS: dict[str, CityConfig] = {
         country="US",
         temp_unit="F",
         kalshi_series_ticker="KXHIGHCHI",
+        station_bias=1.5,  # KMDW vs grid +1.74F (175 days, HIGH confidence)
+        station_bias_std=3.5,  # INCREASED from 1.54 - be less confident
     ),
     "miami": CityConfig(
         name="Miami",
@@ -66,6 +78,8 @@ CITY_CONFIGS: dict[str, CityConfig] = {
         country="US",
         temp_unit="F",
         kalshi_series_ticker="KXHIGHMIA",
+        station_bias=2.0,  # KMIA vs grid +2.22F (177 days, HIGH confidence)
+        station_bias_std=3.5,  # INCREASED from 1.50 - be less confident
     ),
     "austin": CityConfig(
         name="Austin",
@@ -77,6 +91,8 @@ CITY_CONFIGS: dict[str, CityConfig] = {
         country="US",
         temp_unit="F",
         kalshi_series_ticker="KXHIGHAUS",
+        station_bias=2.0,  # KAUS vs grid +2.03F (172 days, HIGH confidence)
+        station_bias_std=3.5,  # INCREASED from 1.55 - be less confident
     ),
     "la": CityConfig(
         name="Los Angeles",
@@ -88,6 +104,8 @@ CITY_CONFIGS: dict[str, CityConfig] = {
         country="US",
         temp_unit="F",
         kalshi_series_ticker="KXHIGHLA",
+        station_bias=1.0,  # KLAX vs grid +0.95F (177 days, HIGH confidence)
+        station_bias_std=4.5,  # INCREASED from 2.82 - marine layer unpredictable
     ),
     "denver": CityConfig(
         name="Denver",
@@ -99,6 +117,8 @@ CITY_CONFIGS: dict[str, CityConfig] = {
         country="US",
         temp_unit="F",
         kalshi_series_ticker="KXHIGHDEN",
+        station_bias=0.5,  # KDEN vs grid +0.68F (172 days, HIGH confidence)
+        station_bias_std=4.5,  # INCREASED from 2.19 - mountain weather volatile
     ),
     "philadelphia": CityConfig(
         name="Philadelphia",
@@ -110,6 +130,8 @@ CITY_CONFIGS: dict[str, CityConfig] = {
         country="US",
         temp_unit="F",
         kalshi_series_ticker="KXHIGHPHL",
+        station_bias=2.0,  # KPHL vs grid +2.02F (177 days, HIGH confidence)
+        station_bias_std=3.5,  # INCREASED from 1.84 - be less confident
     ),
 }
 
@@ -120,6 +142,9 @@ class APIConfig:
     # Open-Meteo (no API key required)
     open_meteo_base_url: str = "https://api.open-meteo.com/v1"
     open_meteo_historical_url: str = "https://archive-api.open-meteo.com/v1"
+
+    # Visual Crossing (free tier: 1,000 records/day)
+    visual_crossing_api_key: str = field(default_factory=lambda: os.getenv("VISUAL_CROSSING_API_KEY", ""))
 
     # Tomorrow.io
     tomorrow_io_api_key: str = field(default_factory=lambda: os.getenv("TOMORROW_IO_API_KEY", ""))

@@ -2,14 +2,18 @@
 Weather API clients for forecast data collection.
 
 Supports:
-- Open-Meteo: Free access to ECMWF, GFS, HRRR models
+- Open-Meteo: Free access to ECMWF, ECMWF AIFS, GFS, GFS Ensemble, HRRR models
+- Visual Crossing: Backup/validation forecasts (free tier: 1,000/day)
 - Tomorrow.io: Proprietary hyperlocal forecasts
 - NWS: Official settlement source data
+- NOAA CDO: Historical climate data for bias analysis
 """
 
-from .open_meteo import OpenMeteoClient, reset_rate_limit as _reset_open_meteo
+from .open_meteo import OpenMeteoClient, WeatherModel, reset_rate_limit as _reset_open_meteo
+from .visual_crossing import VisualCrossingClient, reset_rate_limit as _reset_visual_crossing
 from .tomorrow_io import TomorrowIOClient
 from .nws import NWSClient
+from .noaa_cdo import NOAACDOClient
 
 
 def reset_all_api_state():
@@ -21,7 +25,17 @@ def reset_all_api_state():
     """
     # Reset Open-Meteo rate limiting state
     _reset_open_meteo()
+    # Reset Visual Crossing daily counter
+    _reset_visual_crossing()
     # Note: Tomorrow.io and NWS don't have module-level rate limit state
 
 
-__all__ = ["OpenMeteoClient", "TomorrowIOClient", "NWSClient", "reset_all_api_state"]
+__all__ = [
+    "OpenMeteoClient",
+    "WeatherModel",
+    "VisualCrossingClient",
+    "TomorrowIOClient",
+    "NWSClient",
+    "NOAACDOClient",
+    "reset_all_api_state",
+]

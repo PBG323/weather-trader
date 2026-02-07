@@ -35,10 +35,12 @@ def reset_rate_limit():
 
 class WeatherModel(Enum):
     """Available weather models on Open-Meteo."""
-    ECMWF = "ecmwf"
-    GFS = "gfs"
-    HRRR = "hrrr"
-    BEST_MATCH = "best_match"  # Auto-selects best model
+    ECMWF = "ecmwf"           # ECMWF IFS - 9km global, best overall
+    ECMWF_AIFS = "ecmwf_aifs"  # ECMWF AIFS - AI-powered, 25km, experimental
+    GFS = "gfs"               # NCEP GFS - 27km global, good US coverage
+    GFS_ENSEMBLE = "gfs_ensemble"  # GFS Ensemble - probabilistic, 31 members
+    HRRR = "hrrr"             # HRRR - 3km US, 0-48hr, 15-min updates
+    BEST_MATCH = "best_match"  # Auto-selects best model blend
 
 
 @dataclass
@@ -145,21 +147,33 @@ class OpenMeteoClient:
         Returns:
             List of ForecastPoint objects with daily high/low temperatures
         """
-        # Build endpoint based on model
+        # Build endpoint and params based on model
         # Open-Meteo API endpoints:
         # - /forecast: Auto-selects best model (blends multiple sources)
-        # - /ecmwf: ECMWF IFS model
-        # - /gfs: NCEP GFS model
-        # - /forecast with models=hrrr_conus: HRRR for US
+        # - /ecmwf: ECMWF IFS model (9km, best accuracy)
+        # - /gfs: NCEP GFS model (27km)
+        # - /ensemble: Probabilistic ensemble forecasts
+        # - /forecast with models=ecmwf_aifs025: ECMWF AIFS AI model
+        # - /forecast with models=hrrr_conus: HRRR for US (3km, 15-min updates)
+        model_param = None
+
         if model == WeatherModel.ECMWF:
             endpoint = f"{self.base_url}/ecmwf"
+        elif model == WeatherModel.ECMWF_AIFS:
+            endpoint = f"{self.base_url}/forecast"
+            model_param = "ecmwf_aifs025"
         elif model == WeatherModel.GFS:
             endpoint = f"{self.base_url}/gfs"
+        elif model == WeatherModel.GFS_ENSEMBLE:
+            # GFS Ensemble uses the ensemble endpoint
+            endpoint = f"{self.base_url}/ensemble"
+            model_param = "gfs_seamless"  # GFS ensemble member mean
         elif model == WeatherModel.HRRR:
-            # HRRR only available for US via forecast endpoint with model parameter
+            # HRRR only available for US via forecast endpoint
             if city_config.country != "US":
                 raise ValueError("HRRR model only available for US cities")
             endpoint = f"{self.base_url}/forecast"
+            model_param = "hrrr_conus"
         else:
             endpoint = f"{self.base_url}/forecast"
 
@@ -172,9 +186,9 @@ class OpenMeteoClient:
             "forecast_days": min(days, 16),
         }
 
-        # HRRR requires specifying the model explicitly
-        if model == WeatherModel.HRRR:
-            params["models"] = "hrrr_conus"
+        # Add model parameter if specified
+        if model_param:
+            params["models"] = model_param
 
         # Use retry logic for rate limiting
         data = await self._request_with_retry(endpoint, params)
@@ -216,10 +230,24 @@ class OpenMeteoClient:
         Returns:
             List of HourlyForecast objects
         """
+        model_param = None
+
         if model == WeatherModel.ECMWF:
             endpoint = f"{self.base_url}/ecmwf"
+        elif model == WeatherModel.ECMWF_AIFS:
+            endpoint = f"{self.base_url}/forecast"
+            model_param = "ecmwf_aifs025"
         elif model == WeatherModel.GFS:
             endpoint = f"{self.base_url}/gfs"
+        elif model == WeatherModel.GFS_ENSEMBLE:
+            endpoint = f"{self.base_url}/ensemble"
+            model_param = "gfs_seamless"
+        elif model == WeatherModel.HRRR:
+            if city_config.country != "US":
+                raise ValueError("HRRR model only available for US cities")
+            endpoint = f"{self.base_url}/forecast"
+            # Use 15-minutely HRRR for highest resolution when available
+            model_param = "hrrr_conus"
         else:
             endpoint = f"{self.base_url}/forecast"
 
@@ -231,6 +259,9 @@ class OpenMeteoClient:
             "timezone": city_config.timezone,
             "forecast_hours": hours,
         }
+
+        if model_param:
+            params["models"] = model_param
 
         # Use retry logic for rate limiting
         data = await self._request_with_retry(endpoint, params)
@@ -254,7 +285,8 @@ class OpenMeteoClient:
     async def get_ensemble_forecast(
         self,
         city_config: CityConfig,
-        days: int = 7
+        days: int = 7,
+        include_experimental: bool = True
     ) -> dict[str, list[ForecastPoint]]:
         """
         Get forecasts from multiple models for ensemble analysis.
@@ -262,17 +294,28 @@ class OpenMeteoClient:
         Args:
             city_config: City configuration with coordinates
             days: Number of forecast days
+            include_experimental: Include ECMWF AIFS (experimental AI model)
 
         Returns:
             Dictionary mapping model names to forecast lists
         """
         results = {}
 
-        # Models to fetch based on city location
-        models = [WeatherModel.ECMWF, WeatherModel.GFS]
+        # Core models - always included
+        # Note: HRRR only supports hourly data, not daily aggregates like temp_max
+        models = [
+            WeatherModel.ECMWF,       # Primary: ECMWF IFS 9km
+            WeatherModel.GFS,         # Secondary: GFS 27km
+            WeatherModel.GFS_ENSEMBLE,  # Probabilistic: GFS ensemble mean
+        ]
+
+        # US-specific models
         if city_config.country == "US":
-            models.append(WeatherModel.HRRR)  # Best for short-term US forecasts
-            models.append(WeatherModel.BEST_MATCH)  # Auto-blend model
+            models.append(WeatherModel.BEST_MATCH)  # Open-Meteo auto-blend
+
+        # Experimental models (can be disabled if causing issues)
+        if include_experimental:
+            models.append(WeatherModel.ECMWF_AIFS)  # AI-powered forecast
 
         for model in models:
             try:
@@ -283,6 +326,54 @@ class OpenMeteoClient:
                 print(f"Warning: Failed to fetch {model.value} forecast: {e}")
 
         return results
+
+    async def get_gfs_ensemble_members(
+        self,
+        city_config: CityConfig,
+        days: int = 7
+    ) -> dict:
+        """
+        Get all GFS ensemble member forecasts for probabilistic analysis.
+
+        The GFS ensemble has 31 members (1 control + 30 perturbed).
+        Returns spread information useful for confidence estimation.
+
+        Args:
+            city_config: City configuration with coordinates
+            days: Number of forecast days
+
+        Returns:
+            Dict with mean, min, max, spread for high/low temps
+        """
+        endpoint = f"{self.base_url}/ensemble"
+
+        params = {
+            "latitude": city_config.latitude,
+            "longitude": city_config.longitude,
+            "daily": "temperature_2m_max,temperature_2m_min",
+            "temperature_unit": "fahrenheit",
+            "timezone": city_config.timezone,
+            "forecast_days": min(days, 16),
+            "models": "gfs_seamless",
+        }
+
+        data = await self._request_with_retry(endpoint, params)
+
+        # Parse ensemble statistics
+        daily = data.get("daily", {})
+        dates = daily.get("time", [])
+
+        # GFS ensemble returns arrays - calculate statistics
+        highs = daily.get("temperature_2m_max", [])
+        lows = daily.get("temperature_2m_min", [])
+
+        return {
+            "dates": dates,
+            "high_temps": highs,
+            "low_temps": lows,
+            "city": city_config.name,
+            "model": "gfs_ensemble",
+        }
 
     async def get_historical_weather(
         self,
