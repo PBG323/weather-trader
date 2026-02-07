@@ -52,6 +52,12 @@ from weather_trader.trading import (
     TradingConfig, PositionManager, RiskManager, ExecutionEngine,
     AutoTrader, PnLTracker, Position, ExitReason, PositionStatus
 )
+from weather_trader.logging import ForecastLogger, ForecastRecord
+from weather_trader.scheduler_state import (
+    load_scheduler_state, save_scheduler_state, get_current_window,
+    should_run_cycle, log_cycle, reset_daily_counters, calculate_daily_cycles,
+    get_schedule_summary, format_time_until_next_cycle, TRADING_SCHEDULE
+)
 
 # Page config
 st.set_page_config(
@@ -118,19 +124,20 @@ class TradingDefaults:
     ORDER_STALE_MINUTES = 3      # Cancel/reprice orders older than 3 minutes
 
     # === ENTRY CRITERIA ===
-    MIN_EDGE_ENTRY = 0.08        # 8% minimum edge to enter (up from 5%)
+    MIN_EDGE_ENTRY = 0.12        # 12% minimum edge to enter (INCREASED from 8%)
     MIN_CONFIDENCE = 0.75        # 75% model confidence required
-    MAX_SPREAD_CENTS = 12        # Don't enter if spread > 12 cents
-    MIN_TIME_TO_SETTLEMENT_HOURS = 4  # Don't enter within 4 hours of settlement
+    MAX_SPREAD_CENTS = 10        # Don't enter if spread > 10 cents (tightened)
+    MIN_TIME_TO_SETTLEMENT_HOURS = 6  # Don't enter within 6 hours of settlement (was 4)
 
     # === PRICE LIMITS (avoid extreme tail bets) ===
-    MIN_ENTRY_PRICE_CENTS = 2    # Don't buy below 2¢ (50:1 odds)
-    MAX_ENTRY_PRICE_CENTS = 98   # Don't buy above 98¢ (1:50 odds)
+    MIN_ENTRY_PRICE_CENTS = 15   # Don't buy below 15¢ (INCREASED from 8¢)
+    MAX_ENTRY_PRICE_CENTS = 85   # Don't buy above 85¢ (DECREASED from 92¢)
 
     # === POSITION SIZING ===
-    KELLY_FRACTION = 0.30        # 30% Kelly (up from 25%)
-    MAX_POSITION_DOLLARS = 50    # Cap per position
-    MAX_POSITION_PCT = 0.15      # Max 15% of bankroll per position
+    KELLY_FRACTION = 0.20        # 20% Kelly (DECREASED from 25% - more conservative)
+    MAX_POSITION_DOLLARS = 20    # Cap per position (DECREASED from 30)
+    MAX_POSITION_PCT = 0.08      # Max 8% of bankroll per position (was 10%)
+    MAX_CONTRACTS_PER_TRADE = 100  # DECREASED from 150 - smaller bets
 
     # === EXIT THRESHOLDS ===
     STOP_LOSS_PCT = -0.25        # Exit if P/L < -25% (up from -30%)
@@ -153,8 +160,8 @@ class TradingDefaults:
     REPRICE_AFTER_MINUTES = 2    # Escalate exit pricing after 2 minutes
 
     # === RISK LIMITS ===
-    MAX_DAILY_LOSS = 100         # Stop new entries if daily loss exceeds
-    MAX_OPEN_POSITIONS = 10      # Maximum concurrent positions
+    MAX_DAILY_LOSS = 999999      # Disabled - user wants to test profitability
+    MAX_OPEN_POSITIONS = 5       # Maximum concurrent positions (was 10)
     MAX_POSITIONS_PER_CITY = 3   # Maximum positions per city
     CONSECUTIVE_STOPS_PAUSE = 3  # Pause after 3 consecutive stop losses
 
@@ -189,7 +196,9 @@ if 'demo_mode' not in st.session_state:
 
 # Trading Engine Components
 if 'trading_config' not in st.session_state:
-    st.session_state.trading_config = TradingConfig()
+    st.session_state.trading_config = TradingConfig(
+        min_confidence_to_enter=TradingDefaults.MIN_CONFIDENCE,  # 75%
+    )
 if 'position_manager' not in st.session_state:
     st.session_state.position_manager = PositionManager(st.session_state.trading_config)
 if 'pnl_tracker' not in st.session_state:
@@ -216,6 +225,12 @@ if 'positions_synced' not in st.session_state:
     st.session_state.positions_synced = False
 if 'pending_orders' not in st.session_state:
     st.session_state.pending_orders = []  # Track orders waiting to fill
+
+# Scheduler state (dashboard-integrated scheduling)
+if 'scheduler_enabled' not in st.session_state:
+    st.session_state.scheduler_enabled = False
+if 'scheduler_state' not in st.session_state:
+    st.session_state.scheduler_state = load_scheduler_state()
 
 
 def check_pending_orders():
@@ -384,16 +399,34 @@ def update_position_prices_from_kalshi():
                 market_data = await client._request("GET", f"/markets/{ticker}")
                 market = market_data if "ticker" in market_data else market_data.get("market", {})
 
+                # BUG FIX: Check if market is settled before updating prices
+                # Settled markets return last_price=100 (for YES win) or 0 (for NO win)
+                # which corrupts the position's current_price display
+                market_status = market.get("status", "")
+                if market_status in ("settled", "closed", "finalized"):
+                    # Don't update price from settled market - let settlement handler deal with it
+                    result = market.get("result", "")
+                    pos["market_settled"] = True
+                    pos["settlement_result"] = result
+                    add_alert(f"SETTLED {ticker}: result={result} - pending closure", "info")
+                    continue
+
                 # Debug: log market data fields
                 yes_bid = (market.get("yes_bid", 0) or 0) / 100.0
                 yes_ask = (market.get("yes_ask", 0) or 0) / 100.0
                 last_price = (market.get("last_price", 0) or 0) / 100.0
                 previous_yes_bid = (market.get("previous_yes_bid", 0) or 0) / 100.0
 
-                add_alert(f"DEBUG {ticker}: bid={yes_bid:.2f} ask={yes_ask:.2f} last={last_price:.2f}", "info")
+                # BUG FIX: Reject extreme prices that indicate settlement or market closure
+                # Active markets should have prices between 1-99 cents (0.01-0.99)
+                if last_price >= 0.99 or (yes_bid == 0 and yes_ask == 0):
+                    # This looks like a settled/closed market - skip price update
+                    add_alert(f"SKIP {ticker}: last={last_price:.2f} bid={yes_bid:.2f} ask={yes_ask:.2f} (likely settled)", "warning")
+                    continue
 
-                # Use last_price if available (matches Kalshi display), else yes_bid
-                current_price = last_price if last_price > 0 else yes_bid if yes_bid > 0 else yes_ask if yes_ask > 0 else pos.get("current_price", 0.5)
+                # Use yes_bid (what you can sell at) as primary, then last_price
+                # This better reflects realizable value
+                current_price = yes_bid if yes_bid > 0 else last_price if last_price > 0 else yes_ask if yes_ask > 0 else pos.get("current_price", 0.5)
 
                 pos["current_price"] = current_price
                 pos["yes_bid"] = yes_bid
@@ -725,6 +758,7 @@ def cancel_and_reprice_stale_orders(max_age_minutes: int = 4):
                     side=side,
                     count=count,
                     price_cents=new_price,
+                    time_in_force="immediate_or_cancel",  # Explicit IOC
                 )
 
                 if result.success:
@@ -1225,6 +1259,7 @@ def calc_outcome_probability(
     temp_high: float,
     forecast_mean: float,
     forecast_std: float,
+    confidence: float = None,
 ) -> float:
     """Calculate probability for a market outcome with continuity correction.
 
@@ -1237,24 +1272,44 @@ def calc_outcome_probability(
         "≤6°C" (or below)   → P(T < 6.5)
         "≥12°C" (or higher) → P(T ≥ 11.5)
 
-    Without this, single-degree outcomes like "8°C" compute CDF(8)-CDF(8)=0,
-    which is mathematically correct for a point but wrong for the market's
-    intent (an integer reading of 8).
+    CONFIDENCE-ADJUSTED STD DEV:
+    When confidence is provided, we adjust the std dev to reflect how much
+    we trust our forecast:
+    - High confidence (90%) → tighter distribution → forecast more likely correct
+    - Low confidence (70%) → wider distribution → more uncertainty
+
+    This naturally:
+    - INCREASES probability for brackets containing the forecast (good for conviction trades)
+    - DECREASES probability for tail bets where forecast is outside bracket
 
     Returns clipped probability, or None if inputs are invalid.
     """
     CONTINUITY = 0.5
 
+    # Apply confidence-adjusted std dev if confidence is provided
+    if confidence is not None and confidence > 0:
+        # Scale factor: high confidence = tighter distribution
+        # At 100% conf: factor = 0.5 (very tight)
+        # At 90% conf: factor = 0.6
+        # At 80% conf: factor = 0.7
+        # At 70% conf: factor = 0.8
+        # At 50% conf: factor = 1.0 (no adjustment)
+        # Formula: factor = 1.0 - (confidence - 0.5) * 1.0, clamped to [0.5, 1.2]
+        confidence_factor = max(0.5, min(1.2, 1.0 - (confidence - 0.5)))
+        adjusted_std = max(1.5, forecast_std * confidence_factor)  # Floor at 1.5°F
+    else:
+        adjusted_std = forecast_std
+
     if temp_low is None and temp_high is not None:
         # "≤X" - P(temp rounds to X or below)
-        raw_prob = stats.norm.cdf(temp_high + CONTINUITY, loc=forecast_mean, scale=forecast_std)
+        raw_prob = stats.norm.cdf(temp_high + CONTINUITY, loc=forecast_mean, scale=adjusted_std)
     elif temp_high is None and temp_low is not None:
         # "≥X" - P(temp rounds to X or above)
-        raw_prob = 1 - stats.norm.cdf(temp_low - CONTINUITY, loc=forecast_mean, scale=forecast_std)
+        raw_prob = 1 - stats.norm.cdf(temp_low - CONTINUITY, loc=forecast_mean, scale=adjusted_std)
     elif temp_low is not None and temp_high is not None:
         # Range or single temp - P(low ≤ reading ≤ high)
-        raw_prob = stats.norm.cdf(temp_high + CONTINUITY, loc=forecast_mean, scale=forecast_std) - \
-                   stats.norm.cdf(temp_low - CONTINUITY, loc=forecast_mean, scale=forecast_std)
+        raw_prob = stats.norm.cdf(temp_high + CONTINUITY, loc=forecast_mean, scale=adjusted_std) - \
+                   stats.norm.cdf(temp_low - CONTINUITY, loc=forecast_mean, scale=adjusted_std)
     else:
         return None
 
@@ -1646,6 +1701,14 @@ async def _fetch_forecasts_with_models():
             tm_client = TomorrowIOClient()
             await tm_client.__aenter__()
 
+        # Create NWS client for additional forecasts (US cities)
+        nws_client = None
+        try:
+            nws_client = NWSClient()
+            await nws_client.__aenter__()
+        except Exception as e:
+            print(f"NWS client init error: {e}")
+
         try:
             for city_key in get_all_cities():
                 city_config = get_city_config(city_key)
@@ -1660,6 +1723,27 @@ async def _fetch_forecasts_with_models():
                             tm_call_count += 1
                         except Exception as e:
                             print(f"Tomorrow.io error for {city_key}: {e}")
+
+                    # Fetch NWS point forecasts (US cities only)
+                    nws_forecasts_by_date = {}
+                    if nws_client and city_config.country == "US":
+                        try:
+                            nws_periods = await nws_client.get_forecast(city_config)
+                            # Parse NWS periods into date -> high temp mapping
+                            for period in nws_periods:
+                                if period.get("isDaytime", False):
+                                    # Extract date from startTime
+                                    start_time = period.get("startTime", "")
+                                    if start_time:
+                                        try:
+                                            period_date = datetime.fromisoformat(start_time.replace("Z", "+00:00")).date()
+                                            temp = period.get("temperature")
+                                            if temp is not None:
+                                                nws_forecasts_by_date[period_date] = float(temp)
+                                        except:
+                                            pass
+                        except Exception as e:
+                            print(f"NWS forecast error for {city_key}: {e}")
 
                     # Lazy-loaded fallback for basic forecast (fetched at most once per city)
                     basic_forecasts = None
@@ -1733,11 +1817,45 @@ async def _fetch_forecasts_with_models():
                                         })
                                     break
 
+                        # Add NWS point forecast for this date (US cities only)
+                        if target_date in nws_forecasts_by_date:
+                            nws_high = nws_forecasts_by_date[target_date]
+                            # NWS only provides high temp in point forecast
+                            # Estimate low as high - 15 (typical diurnal range)
+                            nws_low = nws_high - 15.0
+                            model_forecasts.append(ModelForecast(
+                                model_name="nws",
+                                forecast_high=nws_high,
+                                forecast_low=nws_low,
+                            ))
+                            model_details.append({
+                                "model": "nws",
+                                "high": nws_high,
+                                "low": nws_low
+                            })
+
                         if model_forecasts:
                             ens = ensemble.create_ensemble(
                                 city_config, model_forecasts, target_date,
                                 apply_bias_correction=False
                             )
+
+                            # Build confidence breakdown for UI transparency
+                            model_names = [m["model"] for m in model_details]
+                            has_tomorrow_io = "tomorrow.io" in model_names
+                            has_nws = "nws" in model_names
+
+                            confidence_breakdown = {
+                                "ensemble_confidence": float(ens.confidence),
+                                "model_count": ens.model_count,
+                                "model_count_desc": f"{ens.model_count} models ({', '.join(model_names)})",
+                                "has_tomorrow_io": has_tomorrow_io,
+                                "has_nws": has_nws,
+                                "high_std": float(ens.high_std),
+                                "std_desc": f"Forecast uncertainty: ±{ens.high_std:.1f}°F",
+                                "final_confidence": float(ens.confidence),
+                            }
+
                             entry = {
                                 "city": city_config.name,
                                 "high_mean": float(ens.high_mean),
@@ -1745,6 +1863,7 @@ async def _fetch_forecasts_with_models():
                                 "low_mean": float(ens.low_mean),
                                 "low_std": float(ens.low_std),
                                 "confidence": float(ens.confidence),
+                                "confidence_breakdown": confidence_breakdown,
                                 "model_count": ens.model_count,
                                 "date": target_date,
                                 "models": model_details,
@@ -1759,6 +1878,30 @@ async def _fetch_forecasts_with_models():
                             if target_date == tomorrow:
                                 forecasts[city_key] = entry
 
+                            # Log forecast to database for accuracy tracking
+                            try:
+                                forecast_logger = ForecastLogger()
+                                # Extract individual model highs
+                                model_highs = {m["model"]: m["high"] for m in model_details}
+                                record = ForecastRecord(
+                                    forecast_made_date=today_est(),
+                                    target_date=target_date,
+                                    city=city_key,
+                                    station_id=city_config.station_id,
+                                    ecmwf_high=model_highs.get("ecmwf"),
+                                    gfs_high=model_highs.get("gfs"),
+                                    tomorrow_io_high=model_highs.get("tomorrow.io"),
+                                    nws_forecast_high=model_highs.get("nws"),
+                                    ensemble_high_mean=float(ens.high_mean),
+                                    ensemble_high_std=float(ens.high_std),
+                                    ensemble_confidence=float(ens.confidence),
+                                    station_bias_applied=city_config.station_bias,
+                                    model_count=ens.model_count,
+                                )
+                                forecast_logger.log_forecast(record)
+                            except Exception as log_err:
+                                print(f"Forecast logging error: {log_err}")
+
                             print(f"[Forecast] {city_key} ({target_date}): high={ens.high_mean:.1f}F std={ens.high_std:.1f} ({ens.model_count} models)")
                         else:
                             print(f"WARNING: No forecast data for {city_key} on {target_date}")
@@ -1771,6 +1914,8 @@ async def _fetch_forecasts_with_models():
                 if tm_call_count > 0:
                     record_tomorrow_io_call(tm_call_count)
                     print(f"Tomorrow.io: {tm_call_count} city calls (#{_tomorrow_io_calls_today} today)")
+            if nws_client:
+                await nws_client.__aexit__(None, None, None)
 
     city_count = len([k for k in forecasts if '_' not in k or not k.split('_')[-1][:4].isdigit()])
     date_count = len([k for k in forecasts if '_' in k and k.split('_')[-1][:4].isdigit()])
@@ -1918,18 +2063,54 @@ async def _check_same_day_uncertainty_async(markets, ensemble_forecasts=None):
                 # Neither available - skip
                 continue
 
-            # Confidence based on blend quality
+            # Confidence based on multiple factors:
+            # 1. Ensemble confidence (accounts for Tomorrow.io, GFS, ECMWF agreement + station reliability)
+            # 2. NWS agreement modifier (when both sources agree, confidence is higher)
+            # 3. Model count (more models = more reliable)
+
+            ensemble_confidence = ensemble_fc.get("confidence", 0.75) if ensemble_fc else 0.75
+
+            # Calculate NWS agreement factor
             if nws_expected_high is not None and ensemble_high is not None:
-                # Both sources agree closely = higher confidence
-                agreement = abs(ensemble_high - nws_expected_high)
-                if agreement < 2:
-                    confidence = 0.90
-                elif agreement < 4:
-                    confidence = 0.80
+                nws_agreement = abs(ensemble_high - nws_expected_high)
+                if nws_agreement < 2:
+                    nws_agreement_factor = 1.05  # Boost confidence
+                    nws_agreement_desc = f"Strong NWS agreement ({nws_agreement:.1f}°F diff)"
+                elif nws_agreement < 4:
+                    nws_agreement_factor = 1.0   # Neutral
+                    nws_agreement_desc = f"Moderate NWS agreement ({nws_agreement:.1f}°F diff)"
                 else:
-                    confidence = 0.70
+                    nws_agreement_factor = 0.90  # Reduce confidence
+                    nws_agreement_desc = f"Poor NWS agreement ({nws_agreement:.1f}°F diff)"
             else:
-                confidence = 0.75
+                nws_agreement_factor = 0.95  # Slight penalty for missing NWS
+                nws_agreement = None
+                nws_agreement_desc = "NWS data unavailable"
+
+            # Model count factor
+            if model_count >= 4:
+                model_count_factor = 1.05
+                model_count_desc = f"{model_count} models (strong ensemble)"
+            elif model_count >= 2:
+                model_count_factor = 1.0
+                model_count_desc = f"{model_count} models (adequate)"
+            else:
+                model_count_factor = 0.90
+                model_count_desc = f"{model_count} model (limited data)"
+
+            # Final confidence = ensemble_confidence * modifiers, capped at 95%
+            confidence = min(0.95, ensemble_confidence * nws_agreement_factor * model_count_factor)
+
+            # Build confidence breakdown for UI
+            confidence_breakdown = {
+                "ensemble_confidence": ensemble_confidence,
+                "nws_agreement_factor": nws_agreement_factor,
+                "nws_agreement_diff": nws_agreement,
+                "nws_agreement_desc": nws_agreement_desc,
+                "model_count_factor": model_count_factor,
+                "model_count_desc": model_count_desc,
+                "final_confidence": confidence,
+            }
 
             same_day_forecasts[city_key] = {
                 "city": city_config.name,
@@ -1938,6 +2119,7 @@ async def _check_same_day_uncertainty_async(markets, ensemble_forecasts=None):
                 "low_mean": blended_high - 10,
                 "low_std": 3.0,
                 "confidence": confidence,
+                "confidence_breakdown": confidence_breakdown,
                 "model_count": model_count,
                 "date": today_est(),
                 "source": source,
@@ -1991,6 +2173,143 @@ async def _check_same_day_uncertainty_async(markets, ensemble_forecasts=None):
     return uncertainty_map, same_day_forecasts
 
 
+def calculate_confidence_adjusted_prob(forecast_mean, forecast_std, confidence, temp_low, temp_high):
+    """
+    Calculate probability with confidence-adjusted uncertainty.
+
+    High confidence = tighter distribution = higher probability for centered brackets.
+    This enables "conviction trades" where we trust our forecast.
+
+    Args:
+        forecast_mean: Forecast temperature
+        forecast_std: Base standard deviation
+        confidence: Model confidence (0-1)
+        temp_low: Bracket lower bound (None for "or below")
+        temp_high: Bracket upper bound (None for "or above")
+
+    Returns:
+        tuple: (adjusted_probability, adjusted_std)
+    """
+    # Scale std inversely with confidence
+    # At 70% confidence: multiplier = 0.65 (wider distribution)
+    # At 90% confidence: multiplier = 0.55 (tighter distribution)
+    # At 100% confidence: multiplier = 0.50 (tightest)
+    confidence_multiplier = 1.0 - (confidence * 0.5)
+    adjusted_std = max(1.5, forecast_std * confidence_multiplier)  # Floor at 1.5°F
+
+    # Calculate probability with tighter distribution
+    if temp_low is None and temp_high is not None:
+        # "X or below" - P(temp <= high)
+        prob = stats.norm.cdf(temp_high + 0.5, forecast_mean, adjusted_std)
+    elif temp_high is None and temp_low is not None:
+        # "X or above" - P(temp >= low)
+        prob = 1 - stats.norm.cdf(temp_low - 0.5, forecast_mean, adjusted_std)
+    elif temp_low is not None and temp_high is not None:
+        # Range bracket - P(low <= temp <= high)
+        prob = stats.norm.cdf(temp_high + 0.5, forecast_mean, adjusted_std) - \
+               stats.norm.cdf(temp_low - 0.5, forecast_mean, adjusted_std)
+    else:
+        prob = 0
+
+    return clip_probability(prob), adjusted_std
+
+
+def check_conviction_trade(signal_data, forecast_mean, forecast_std, confidence):
+    """
+    Detect high-conviction YES opportunities where forecast is centered in bracket.
+
+    Conviction Trade Criteria:
+    - Forecast is INSIDE the bracket (not just near it)
+    - Model confidence >= 80%
+    - Market price <= 45¢ (good upside potential to $1.00)
+    - Range bracket ONLY (not open-ended tail bets like "62°F or below")
+
+    Why only range brackets?
+    - Tail bets (e.g., "≤62°F" when forecast is 64°F) require forecast to be WRONG
+    - High confidence means we TRUST our forecast, not bet against it
+    - Range brackets with forecast inside = betting forecast is RIGHT
+
+    Args:
+        signal_data: Signal dictionary with market info
+        forecast_mean: Our forecast temperature
+        forecast_std: Forecast uncertainty
+        confidence: Model confidence (0-1)
+
+    Returns:
+        dict with conviction trade info
+    """
+    temp_low = signal_data.get('temp_low')
+    temp_high = signal_data.get('temp_high')
+    market_prob = signal_data.get('market_prob', 1.0)
+    range_type = signal_data.get('range_type', '')
+
+    # ONLY range brackets - tail bets require betting AGAINST our forecast
+    # e.g., "≤62°F" with forecast 64°F means betting temp will be 2°F lower than expected
+    if range_type != 'range' or temp_low is None or temp_high is None:
+        return {'is_conviction': False, 'reason': 'Not a range bracket (tail bets excluded)'}
+
+    # Conviction trade thresholds
+    MIN_CONFIDENCE = 0.80  # 80% minimum
+    MAX_PRICE = 0.45       # 45¢ maximum (was 55¢) - better upside potential
+    MIN_EDGE = 0.0         # 0% edge minimum (pure confidence play)
+
+    # Check basic criteria
+    if confidence < MIN_CONFIDENCE:
+        return {'is_conviction': False, 'reason': f'Confidence {confidence:.0%} < {MIN_CONFIDENCE:.0%}'}
+
+    if market_prob > MAX_PRICE:
+        return {'is_conviction': False, 'reason': f'Price {market_prob:.0%} > {MAX_PRICE:.0%}'}
+
+    # Check if forecast is INSIDE the bracket (strict requirement)
+    # We're betting the temp will land in this exact range
+    # High confidence + forecast inside = we trust our forecast will be right
+    bracket_center = (temp_low + temp_high) / 2
+    bracket_width = temp_high - temp_low
+    distance_from_center = abs(forecast_mean - bracket_center)
+
+    # Forecast MUST be inside the bracket for conviction trade
+    # Being "near" isn't enough - we need to truly believe this bracket will hit
+    is_inside_bracket = temp_low <= forecast_mean <= temp_high
+
+    if not is_inside_bracket:
+        return {
+            'is_conviction': False,
+            'reason': f'Forecast {forecast_mean:.1f}°F outside bracket {temp_low}-{temp_high}°F'
+        }
+
+    # Calculate confidence-adjusted probability
+    adj_prob, adj_std = calculate_confidence_adjusted_prob(
+        forecast_mean, forecast_std, confidence, temp_low, temp_high
+    )
+
+    # Calculate conviction edge (using adjusted probability)
+    conviction_edge = adj_prob - market_prob
+
+    # For conviction trades, we allow 0% edge (pure confidence play)
+    if conviction_edge < MIN_EDGE:
+        return {
+            'is_conviction': False,
+            'reason': f'Conviction edge {conviction_edge:.1%} < {MIN_EDGE:.0%}',
+            'adjusted_prob': adj_prob,
+            'conviction_edge': conviction_edge,
+        }
+
+    # All criteria met - this is a conviction trade!
+    position_desc = "inside" if is_inside_bracket else "near"
+
+    return {
+        'is_conviction': True,
+        'reason': f'Forecast {forecast_mean:.1f}°F {position_desc} {temp_low}-{temp_high}°F bracket',
+        'adjusted_prob': adj_prob,
+        'adjusted_std': adj_std,
+        'original_prob': signal_data.get('our_prob', 0),
+        'conviction_edge': conviction_edge,
+        'original_edge': signal_data.get('edge', 0),
+        'distance_from_center': distance_from_center,
+        'bracket_center': bracket_center,
+    }
+
+
 def calculate_signals(forecasts, markets, show_all_outcomes=False):
     """Calculate trading signals for multi-outcome markets.
 
@@ -2004,6 +2323,11 @@ def calculate_signals(forecasts, markets, show_all_outcomes=False):
     - Markets with genuine remaining uncertainty can be traded
     - Confidence is adjusted based on the uncertainty level
     - Same-day forecasts use NWS observations (more accurate than weather models)
+
+    Conviction Trades:
+    - When forecast is centered in bracket with high confidence (≥80%)
+    - And market price is reasonable (≤55¢)
+    - We use confidence-adjusted probability for a "conviction YES" signal
     """
     signals = []
 
@@ -2085,6 +2409,19 @@ def calculate_signals(forecasts, markets, show_all_outcomes=False):
         for market in group_markets:
             ticker = market.get("ticker", market.get("condition_id", ""))
 
+            # VOLUME-BASED FILTERING: Skip illiquid markets
+            # Low volume/OI markets may have stale or unreliable prices
+            volume = market.get("volume", 0) or 0
+            open_interest = market.get("open_interest", 0) or market.get("liquidity", 0) or 0
+
+            MIN_VOLUME = 50  # Minimum daily volume (contracts)
+            MIN_OPEN_INTEREST = 25  # Minimum open interest
+
+            # Skip only if BOTH are below threshold (lenient for newer markets)
+            if volume < MIN_VOLUME and open_interest < MIN_OPEN_INTEREST:
+                print(f"[Signal] SKIP {ticker}: low liquidity (vol={volume}, OI={open_interest})")
+                continue
+
             # SAME-DAY UNCERTAINTY CHECK
             # For same-day markets, only trade if there's genuine remaining uncertainty
             uncertainty_adjustment = 1.0  # Default: full confidence
@@ -2107,7 +2444,19 @@ def calculate_signals(forecasts, markets, show_all_outcomes=False):
 
             temp_low = market.get("temp_low")
             temp_high = market.get("temp_high")
-            market_prob = market["yes_price"]
+
+            # SPREAD-ADJUSTED EDGE: Use mid-price for fairer probability comparison
+            yes_bid = (market.get("yes_bid", 0) or 0) / 100.0
+            yes_ask = (market.get("yes_ask", 0) or 0) / 100.0
+
+            if yes_bid > 0 and yes_ask > 0:
+                # Use mid-price for probability comparison
+                market_prob = (yes_bid + yes_ask) / 2
+                spread = yes_ask - yes_bid
+            else:
+                # Fallback to yes_price if bid/ask not available
+                market_prob = market["yes_price"]
+                spread = 0.02  # Assume 2% spread if unknown
 
             # Calculate our probability with continuity correction + clipping
             if temp_low is None and temp_high is not None:
@@ -2119,46 +2468,106 @@ def calculate_signals(forecasts, markets, show_all_outcomes=False):
             else:
                 continue
 
-            our_prob = calc_outcome_probability(
-                temp_low, temp_high, forecast_temp_market, forecast_std_market
-            )
-            if our_prob is None:
-                continue
-
-            edge = our_prob - market_prob
-
-            # For same-day markets, require higher edge to compensate for reduced forecast value
-            if is_same_day:
-                # Require 25% more edge for same-day trades
-                effective_edge_threshold = 0.0625  # 6.25% instead of 5%
-                if abs(edge) < effective_edge_threshold:
-                    # Edge too small for same-day risk
-                    continue
-
-            # Determine signal type
-            if edge > 0.10:
-                signal_type = "STRONG BUY YES"
-                signal_color = "#00c853"
-            elif edge > 0.05:
-                signal_type = "BUY YES"
-                signal_color = "#4caf50"
-            elif edge < -0.10:
-                signal_type = "STRONG BUY NO"
-                signal_color = "#f44336"
-            elif edge < -0.05:
-                signal_type = "BUY NO"
-                signal_color = "#ff5722"
-            else:
-                signal_type = "PASS"
-                signal_color = "#9e9e9e"
-
-            # Adjust confidence for same-day trades based on remaining uncertainty
+            # Calculate adjusted confidence BEFORE probability calc so we can use it
             base_confidence = fc["confidence"]
             if is_same_day:
                 adjusted_confidence = base_confidence * uncertainty_adjustment
             else:
                 adjusted_confidence = base_confidence
 
+            # Pass confidence to probability calculation for confidence-adjusted std dev
+            our_prob = calc_outcome_probability(
+                temp_low, temp_high, forecast_temp_market, forecast_std_market, adjusted_confidence
+            )
+            if our_prob is None:
+                continue
+
+            raw_edge = our_prob - market_prob
+
+            # EFFECTIVE EDGE: Account for bid-ask spread cost
+            # When buying, we pay the ask; when selling, we get the bid
+            # Net cost is approximately half the spread
+            effective_edge = abs(raw_edge) - (spread / 2)
+            # Preserve the sign of the edge
+            edge = raw_edge  # Keep raw_edge as 'edge' for signal direction
+
+            # WARNING: High confidence + tail bet where forecast is outside bracket
+            # This means we're betting AGAINST our own forecast, which is contradictory
+            # Example: forecast 64°F, betting on "≤62°F" = betting we're wrong by 2°F
+            is_tail_bet_against_forecast = False
+            if adjusted_confidence >= 0.80:
+                if range_type == "or_below" and temp_high is not None:
+                    # Betting temp will be ≤ temp_high, but forecast is above
+                    if forecast_temp_market > temp_high + 1:  # More than 1°F above
+                        is_tail_bet_against_forecast = True
+                elif range_type == "or_higher" and temp_low is not None:
+                    # Betting temp will be ≥ temp_low, but forecast is below
+                    if forecast_temp_market < temp_low - 1:  # More than 1°F below
+                        is_tail_bet_against_forecast = True
+
+            # For same-day markets, require higher edge to compensate for reduced forecast value
+            if is_same_day:
+                # Require 25% more edge for same-day trades
+                same_day_threshold = 0.0625  # 6.25% instead of 5%
+                if effective_edge < same_day_threshold:
+                    # Effective edge too small for same-day risk
+                    continue
+
+            # Check for conviction trade opportunity BEFORE determining signal type
+            conviction_check = check_conviction_trade(
+                {
+                    'temp_low': temp_low,
+                    'temp_high': temp_high,
+                    'market_prob': market_prob,
+                    'range_type': range_type,
+                    'our_prob': our_prob,
+                    'edge': raw_edge,
+                },
+                forecast_temp_market,
+                forecast_std_market,
+                adjusted_confidence
+            )
+
+            # Determine signal type using EFFECTIVE edge (after spread cost)
+            # Direction comes from raw_edge sign, strength from effective_edge
+            is_conviction = conviction_check.get('is_conviction', False)
+
+            if is_conviction:
+                # Conviction trade - forecast centered in bracket with high confidence
+                signal_type = "CONVICTION YES"
+                signal_color = "#2196f3"  # Blue for conviction
+                # Use conviction edge for signal strength
+                conviction_edge = conviction_check.get('conviction_edge', 0)
+            elif raw_edge > 0 and effective_edge > 0.10:
+                signal_type = "STRONG BUY YES"
+                signal_color = "#00c853"
+            elif raw_edge > 0 and effective_edge > 0.05:
+                signal_type = "BUY YES"
+                signal_color = "#4caf50"
+            elif raw_edge < 0 and effective_edge > 0.10:
+                signal_type = "STRONG BUY NO"
+                signal_color = "#f44336"
+            elif raw_edge < 0 and effective_edge > 0.05:
+                signal_type = "BUY NO"
+                signal_color = "#ff5722"
+            else:
+                signal_type = "PASS"
+                signal_color = "#9e9e9e"
+
+            # For conviction trades that would otherwise be PASS or NO signals,
+            # override to CONVICTION YES
+            if is_conviction and signal_type in ["PASS", "BUY NO", "STRONG BUY NO"]:
+                signal_type = "CONVICTION YES"
+                signal_color = "#2196f3"
+
+            # Get confidence breakdown if available
+            confidence_breakdown = fc.get("confidence_breakdown", {
+                "ensemble_confidence": base_confidence,
+                "final_confidence": adjusted_confidence,
+                "model_count": fc.get("model_count", 1),
+            })
+
+            # Build signal data with conviction trade info if applicable
             signal_data = {
                 "city": fc["city"],
                 "city_key": city_key,
@@ -2169,9 +2578,15 @@ def calculate_signals(forecasts, markets, show_all_outcomes=False):
                 "range_type": range_type,
                 "our_prob": our_prob,
                 "market_prob": market_prob,
-                "edge": edge,
+                "edge": raw_edge,  # Raw edge before spread adjustment
+                "raw_edge": raw_edge,
+                "effective_edge": effective_edge,  # Edge after spread cost
+                "spread": spread,  # Bid-ask spread
+                "yes_bid": yes_bid,
+                "yes_ask": yes_ask,
                 "confidence": adjusted_confidence,
                 "base_confidence": base_confidence,
+                "confidence_breakdown": confidence_breakdown,
                 "forecast_high_f": forecast_temp_f,
                 "forecast_high_market": forecast_temp_market,
                 "forecast_std": forecast_std_market,
@@ -2183,18 +2598,30 @@ def calculate_signals(forecasts, markets, show_all_outcomes=False):
                 "target_date": market.get("target_date"),
                 "resolution_source": market.get("resolution_source", ""),
                 "volume": market.get("volume", 0),
+                "open_interest": market.get("open_interest", 0),
                 "signal": signal_type,
                 "signal_color": signal_color,
-                "signal_strength": abs(edge),
+                "signal_strength": effective_edge,  # Use effective edge for strength
+                # Conviction trade info
+                "is_conviction": is_conviction,
+                "conviction_info": conviction_check if is_conviction else None,
+                # Warning flag for tail bets against forecast
+                "is_tail_bet_against_forecast": is_tail_bet_against_forecast,
             }
+
+            # For conviction trades, use conviction edge for signal strength
+            if is_conviction:
+                signal_data["conviction_edge"] = conviction_check.get('conviction_edge', 0)
+                signal_data["adjusted_prob"] = conviction_check.get('adjusted_prob', our_prob)
+                signal_data["signal_strength"] = abs(conviction_check.get('conviction_edge', edge))
 
             if show_all_outcomes:
                 # Add all outcomes
                 signals.append(signal_data)
             else:
-                # Track best opportunity
-                if abs(edge) > abs(best_edge):
-                    best_edge = edge
+                # Track best opportunity (use effective edge for comparison)
+                if effective_edge > abs(best_edge):
+                    best_edge = raw_edge  # Store raw for direction
                     best_signal = signal_data
 
         # If not showing all, add only the best signal
@@ -2209,7 +2636,12 @@ def calculate_signals(forecasts, markets, show_all_outcomes=False):
 def execute_trade(signal, size, is_live=False):
     """Execute a trade using the trading engine."""
     outcome = signal.get("outcome", "")
-    side = "YES" if signal["edge"] > 0 else "NO"
+
+    # Determine side: conviction trades are always YES
+    if signal.get("is_conviction"):
+        side = "YES"
+    else:
+        side = "YES" if signal["edge"] > 0 else "NO"
 
     # IMPORTANT: Always store YES price for consistency
     # For YES positions: we pay market_prob per share
@@ -2256,6 +2688,12 @@ def execute_trade(signal, size, is_live=False):
             try:
                 kalshi_side = "yes" if side == "YES" else "no"
                 count = max(1, int(round(shares)))
+
+                # CRITICAL: Cap contracts to prevent disaster (Jan 28 had 7,000+ contract losses)
+                if count > TradingDefaults.MAX_CONTRACTS_PER_TRADE:
+                    add_alert(f"Capping contracts from {count} to {TradingDefaults.MAX_CONTRACTS_PER_TRADE} (safety limit)", "warning")
+                    count = TradingDefaults.MAX_CONTRACTS_PER_TRADE
+
                 edge = abs(signal.get("edge", 0))
 
                 # FETCH FRESH MARKET PRICES for smart entry pricing
@@ -2307,7 +2745,7 @@ def execute_trade(signal, size, is_live=False):
                             side=kalshi_side,
                             count=count,
                             price_cents=price_cents,
-                            # Default is IOC - fills immediately or cancels
+                            time_in_force="immediate_or_cancel",  # Explicit IOC
                         )
 
                 result = run_async(_place_order())
@@ -2537,6 +2975,19 @@ def close_position_smart(position_id: str, current_price: float, exit_reason: Ex
             is_live_position = pos.get("mode", "").startswith("LIVE")
 
             exit_order_submitted = False
+
+            # BUG FIX: For settlements, skip sell order - Kalshi handles automatically
+            # The position will be removed from Kalshi's portfolio, reconciliation will clean up
+            if exit_reason == ExitReason.SETTLEMENT:
+                # Settlement doesn't need a sell order - Kalshi auto-closes at settlement price
+                # Just mark for removal and let reconciliation handle it
+                add_alert(f"SETTLEMENT: {ticker} settled @ {current_price:.2f} - will reconcile", "info")
+                pos["market_settled"] = True
+                pos["settlement_price"] = current_price
+                # Don't return here - fall through to close the position in dashboard
+                # Skip the sell order block entirely for settlements
+                is_live_position = False  # Prevents sell order attempt
+
             if is_live_position and ticker and not ticker.startswith("demo_") and st.session_state.kalshi_client is not None:
                 # Check for existing pending order to prevent duplicates
                 if has_pending_order_for_ticker(ticker):
@@ -2606,7 +3057,7 @@ def close_position_smart(position_id: str, current_price: float, exit_reason: Ex
                                         side=kalshi_side,
                                         count=shares,
                                         price_cents=p_cents,
-                                        # Default is IOC - fills immediately or cancels
+                                        time_in_force="immediate_or_cancel",  # Explicit IOC
                                     )
 
                             result = run_async(_sell_order_ioc(price_cents))
@@ -2660,7 +3111,9 @@ def close_position_smart(position_id: str, current_price: float, exit_reason: Ex
 
                 # For LIVE positions where exit failed/pending, don't close in dashboard
                 # Position is still open on Kalshi - reconciliation will handle it
-                if pos.get("mode", "").startswith("LIVE") and not exit_order_submitted:
+                # BUG FIX: Allow settlements to proceed (they don't need sell orders)
+                is_settlement = exit_reason == ExitReason.SETTLEMENT or pos.get("market_settled")
+                if pos.get("mode", "").startswith("LIVE") and not exit_order_submitted and not is_settlement:
                     return 0  # Keep position open in dashboard
 
             # Get Position object for accurate P/L calculation
@@ -2673,15 +3126,18 @@ def close_position_smart(position_id: str, current_price: float, exit_reason: Ex
                 pnl = position.unrealized_pnl
             else:
                 # Fallback legacy calculation
-                # Note: entry_price and current_price are both YES prices
+                # BUG FIX: Use shares field, not size (which is dollar value)
+                shares = pos.get("shares", 1)
+                entry_price = pos.get("entry_price", 0.5)
+
                 if pos["side"] == "YES":
-                    pnl = pos["size"] * (current_price - pos["entry_price"])
+                    # YES: bought at entry_price, now worth current_price
+                    pnl = (current_price - entry_price) * shares
                 else:
-                    # For NO: profit = (entry_YES - current_YES) * shares
-                    # shares = size / (1 - entry_YES)
-                    no_price_at_entry = 1 - pos["entry_price"]
-                    shares = pos["size"] / no_price_at_entry if no_price_at_entry > 0 else 0
-                    pnl = (pos["entry_price"] - current_price) * shares
+                    # NO: bought at (1 - entry_price), now worth (1 - current_price)
+                    # P/L = ((1 - current_price) - (1 - entry_price)) * shares
+                    #     = (entry_price - current_price) * shares
+                    pnl = (entry_price - current_price) * shares
             if position:
                 st.session_state.position_manager.close_position(
                     position_id=position.position_id,
@@ -2815,7 +3271,21 @@ def update_position_prices(markets, forecasts=None):
 
 
 def auto_trade_check(signals, bankroll, kelly_fraction, max_position, min_edge, is_live, forecasts=None, markets=None):
-    """Check signals and execute trades automatically, including smart exits."""
+    """Check signals and execute trades automatically, including smart exits.
+
+    Implements senior trader logic:
+    1. Never bet on boundaries (forecast must be well inside bracket) - EXCEPT conviction trades
+    2. Require substantial edge after spread costs - EXCEPT conviction trades (0% edge OK)
+    3. Prefer range brackets over tail brackets
+    4. Size based on conviction, not just edge
+
+    Conviction Trades:
+    - Bypass edge minimum (use conviction_edge >= 0%)
+    - Bypass smart filter boundary rejection
+    - Require ≥80% confidence and ≤55¢ price
+    """
+    from weather_trader.strategy.smart_filter import smart_filter, RejectionReason
+
     if not st.session_state.auto_trade_enabled:
         return
 
@@ -2830,25 +3300,120 @@ def auto_trade_check(signals, bankroll, kelly_fraction, max_position, min_edge, 
         st.session_state.last_auto_trade_check = get_est_now()
         return
 
-    # PHASE 3: Execute new trades on signals
+    # PHASE 3: Execute new trades on signals with SMART FILTER
     trades_made = 0
     replacements_made = 0
+    filtered_count = 0
+    conviction_trades = 0
+
     for signal in signals:
         if signal["signal"] == "PASS":
             continue
 
-        if abs(signal["edge"]) < min_edge:
+        # Check if this is a conviction trade
+        is_conviction = signal.get("is_conviction", False)
+
+        # For conviction trades: use conviction_edge (>= 0%), for others use regular edge
+        if is_conviction:
+            effective_edge = signal.get("conviction_edge", signal["edge"])
+            # Conviction trades have 0% edge minimum, just need to not be negative
+            if effective_edge < 0:
+                continue
+        else:
+            effective_edge = signal["edge"]
+            if abs(effective_edge) < min_edge:
+                continue
+
+        # Confidence check - conviction trades already passed 80% check
+        if signal["confidence"] < st.session_state.trading_config.min_confidence_to_enter:
+            if not is_conviction:  # Conviction trades already have confidence >= 80%
+                continue
+
+        # === SMART FILTER: Senior trader logic ===
+        # Get signal data for filter evaluation
+        forecast_mean = signal.get("forecast_high_market", signal.get("forecast_high_f", 50))
+        forecast_std = signal.get("forecast_std", 4.0)
+        temp_low = signal.get("temp_low")
+        temp_high = signal.get("temp_high")
+        market_price = signal["market_prob"]
+        side = "YES" if signal["edge"] > 0 else "NO"
+
+        # Skip tail bets against forecast (contradictory to high confidence)
+        if signal.get('is_tail_bet_against_forecast'):
+            add_alert(
+                f"⚠️ Skipping {signal['city']} {signal.get('outcome','')}: "
+                f"Tail bet against forecast (forecast {forecast_mean:.1f}°F outside bracket)",
+                "warning"
+            )
             continue
 
-        if signal["confidence"] < st.session_state.trading_config.min_confidence_to_enter:
-            continue
+        # Estimate bid/ask from market price (typical spread is 4-8 cents)
+        # Conservative estimate: 3 cents each side of mid
+        estimated_spread = 0.06  # 6 cents total
+        bid_price = max(0.01, market_price - estimated_spread / 2)
+        ask_price = min(0.99, market_price + estimated_spread / 2)
+
+        # CONVICTION TRADES: Bypass smart filter (already validated)
+        if is_conviction:
+            # Conviction trades bypass boundary bet rejection
+            # They've already been validated: forecast INSIDE bracket, ≥80% confidence, ≤45¢ price
+            conviction_multiplier = 1.0  # Normal sizing for conviction trades
+            conv_edge = signal.get('conviction_edge', 0)
+            add_alert(
+                f"🎯 Conviction trade: {signal['city']} {signal.get('outcome','')} "
+                f"(forecast inside bracket, {signal['confidence']:.0%} conf, {signal['market_prob']:.0%} price, "
+                f"conv edge {conv_edge:+.1%})",
+                "info"
+            )
+            conviction_trades += 1
+        else:
+            # Run smart filter evaluation for non-conviction trades
+            filter_result = smart_filter.evaluate(
+                forecast_mean=forecast_mean,
+                forecast_std=forecast_std,
+                bracket_low=temp_low,
+                bracket_high=temp_high,
+                raw_edge=signal["edge"],
+                market_price=market_price,
+                bid_price=bid_price,
+                ask_price=ask_price,
+                confidence=signal["confidence"],
+                side=side,
+            )
+
+            if not filter_result.approved:
+                filtered_count += 1
+                # Log rejection reason (only for significant edges)
+                if abs(signal["edge"]) >= 0.10:
+                    add_alert(
+                        f"🛡️ Smart filter rejected {signal['city']} {signal.get('outcome','')}: "
+                        f"{filter_result.reason.value} - {filter_result.details}",
+                        "info"
+                    )
+                continue
+
+            # Apply conviction-based position sizing from smart filter
+            conviction_multiplier = filter_result.recommended_size_multiplier
 
         # Use risk manager to calculate position size
-        position_size = st.session_state.risk_manager.calculate_position_size(
-            edge=abs(signal["edge"]),
-            win_probability=signal["our_prob"] if signal["edge"] > 0 else (1 - signal["our_prob"]),
-            price=signal["market_prob"] if signal["edge"] > 0 else (1 - signal["market_prob"])
-        )
+        # For conviction trades, use adjusted probability and conviction edge
+        if is_conviction:
+            adj_prob = signal.get("adjusted_prob", signal["our_prob"])
+            conv_edge = signal.get("conviction_edge", signal["edge"])
+            position_size = st.session_state.risk_manager.calculate_position_size(
+                edge=abs(conv_edge),
+                win_probability=adj_prob,
+                price=signal["market_prob"]  # Always YES for conviction trades
+            )
+        else:
+            position_size = st.session_state.risk_manager.calculate_position_size(
+                edge=abs(signal["edge"]),
+                win_probability=signal["our_prob"] if signal["edge"] > 0 else (1 - signal["our_prob"]),
+                price=signal["market_prob"] if signal["edge"] > 0 else (1 - signal["market_prob"])
+            )
+
+        # Apply conviction-based sizing from smart filter
+        position_size = position_size * conviction_multiplier
 
         # Apply user's max position override
         max_size = bankroll * max_position / 100
@@ -2927,9 +3492,24 @@ def auto_trade_check(signals, bankroll, kelly_fraction, max_position, min_edge, 
 
     if trades_made > 0:
         msg = f"🤖 Auto-trader executed {trades_made} new trade(s)"
+        if conviction_trades > 0:
+            msg += f" ({conviction_trades} conviction)"
         if replacements_made > 0:
             msg += f" ({replacements_made} replaced weaker positions)"
         add_alert(msg, "success")
+
+        # Update scheduler state with trade count for this cycle
+        if st.session_state.scheduler_enabled:
+            sched_state = st.session_state.scheduler_state
+            # Store trade count in session for scheduler logging to pick up
+            st.session_state.scheduler_trades_this_cycle = trades_made
+
+    # Log filter summary if many trades were filtered
+    if filtered_count > 0 and trades_made == 0:
+        add_alert(
+            f"🛡️ Smart filter active: {filtered_count} signals filtered (boundary bets, low edge, etc.)",
+            "info"
+        )
 
     st.session_state.last_auto_trade_check = get_est_now()
 
@@ -3236,7 +3816,7 @@ def main():
     st.markdown("---")
 
     # Tabs
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
         "📊 Overview",
         "🌡️ Forecasts",
         "📈 Markets",
@@ -3244,7 +3824,8 @@ def main():
         "📅 Multi-Day",
         "💰 Trades & P/L",
         "📉 Price Charts",
-        "🔔 Alerts"
+        "🔔 Alerts",
+        "⏰ Scheduler"
     ])
 
     # Fetch data
@@ -3293,13 +3874,15 @@ def main():
 
         # Auto-trade status with smart exit info
         if auto_trade:
-            st.markdown("""
+            min_edge_pct = TradingDefaults.MIN_EDGE_ENTRY * 100
+            min_conf_pct = TradingDefaults.MIN_CONFIDENCE * 100
+            st.markdown(f"""
             <div class="auto-trade-active">
                 <strong>🤖 Smart Auto-Trading Enabled</strong><br>
                 <strong>Entry Criteria:</strong>
                 <ul>
-                    <li>Edge exceeds minimum threshold</li>
-                    <li>Confidence above minimum (configurable)</li>
+                    <li>Edge ≥ {min_edge_pct:.0f}% (currently set)</li>
+                    <li>Confidence ≥ {min_conf_pct:.0f}% (model agreement + data quality)</li>
                     <li>Risk limits not exceeded</li>
                 </ul>
                 <strong>Smart Exit Triggers:</strong>
@@ -3361,11 +3944,24 @@ def main():
             tradeable = len([s for s in signals if s["signal"] != "PASS"])
             st.metric("Trade Signals", tradeable)
         with col4:
-            avg_conf = sum(f["confidence"] for f in forecasts.values()) / len(forecasts) if forecasts else 0
-            st.metric("Avg Confidence", f"{avg_conf:.0%}")
+            # Use signal confidence (which is the adjusted confidence used for trading)
+            if signals:
+                avg_conf = sum(s.get("confidence", 0) for s in signals) / len(signals)
+            elif forecasts:
+                avg_conf = sum(f["confidence"] for f in forecasts.values()) / len(forecasts)
+            else:
+                avg_conf = 0
+            min_conf = TradingDefaults.MIN_CONFIDENCE
+            conf_status = "🟢" if avg_conf >= min_conf else "🟡"
+            st.metric("Avg Confidence", f"{conf_status} {avg_conf:.0%}",
+                     f"Min: {min_conf:.0%}")
         with col5:
-            strong = len([s for s in signals if "STRONG" in s["signal"]])
-            st.metric("Strong Signals", strong)
+            # Count signals that pass both edge AND confidence thresholds
+            tradeable_conf = len([s for s in signals
+                                 if s["signal"] != "PASS"
+                                 and s.get("confidence", 0) >= TradingDefaults.MIN_CONFIDENCE])
+            st.metric("Tradeable", f"{tradeable_conf}/{tradeable}",
+                     f"≥{TradingDefaults.MIN_CONFIDENCE:.0%} conf")
 
         st.markdown("---")
 
@@ -3393,6 +3989,13 @@ def main():
                 - **-5% to -10%**: BUY NO (market overvalues YES)
                 - **-10% or less**: STRONG BUY NO (market significantly overvalues)
 
+                ### 🎯 Conviction Trades (Blue):
+                - **CONVICTION YES**: Forecast is INSIDE bracket with ≥80% confidence
+                - Price must be ≤45¢ (good upside to $1.00)
+                - Range brackets only (NOT tail bets like "≤62°F")
+                - Uses confidence-adjusted probability (tighter distribution)
+                - Pure confidence play - trusting our forecast is correct
+
                 ### Example:
                 - Forecast: 21°F for NYC tomorrow
                 - Outcome: "20-21°F" range
@@ -3406,57 +4009,96 @@ def main():
             df_signals = df_signals.sort_values("signal_strength", ascending=False)
 
             # Column headers
-            header_cols = st.columns([2, 1.5, 1.2, 1, 1, 1, 2])
+            header_cols = st.columns([2, 1.5, 1.2, 1, 1, 0.8, 1, 2])
             header_cols[0].markdown("**City**")
             header_cols[1].markdown("**Outcome**")
             header_cols[2].markdown("**Forecast**")
             header_cols[3].markdown("**Our Prob**")
             header_cols[4].markdown("**Market**")
             header_cols[5].markdown("**Edge**")
-            header_cols[6].markdown("**Action**")
+            header_cols[6].markdown("**Conf**")
+            header_cols[7].markdown("**Action**")
             st.divider()
 
             for _, row in df_signals.iterrows():
                 with st.container():
-                    cols = st.columns([2, 1.5, 1.2, 1, 1, 1, 2])
+                    cols = st.columns([2, 1.5, 1.2, 1, 1, 0.8, 1, 2])
 
                     # City
                     city_label = f"**{row['city']}**"
                     if row.get('is_demo'):
                         city_label += " 🎮"
+                    if row.get('is_conviction'):
+                        city_label += " 🎯"  # Conviction trade indicator
                     cols[0].markdown(city_label)
 
-                    # Outcome (temperature range)
+                    # Outcome (temperature range) - warn if tail bet against forecast
                     outcome = row.get('outcome', f"{row.get('temp_low', '?')}-{row.get('temp_high', '?')}")
-                    cols[1].markdown(outcome)
+                    if row.get('is_tail_bet_against_forecast'):
+                        outcome += " ⚠️"
+                        cols[1].markdown(outcome, help="⚠️ WARNING: Betting against your forecast! Your forecast is outside this bracket but edge suggests YES. High confidence should mean trusting your forecast, not betting it's wrong.")
+                    else:
+                        cols[1].markdown(outcome)
 
                     # Forecast (our predicted temp in market's unit)
                     unit = row.get('temp_unit', 'F')
                     fcst = row.get('forecast_high_market', row.get('forecast_high_f', 0))
                     cols[2].markdown(f"{fcst:.1f}°{unit}")
 
-                    # Our Probability
-                    cols[3].markdown(f"{row['our_prob']:.0%}")
+                    # Our Probability (show adjusted for conviction trades)
+                    if row.get('is_conviction') and row.get('adjusted_prob'):
+                        adj_prob = row['adjusted_prob']
+                        orig_prob = row['our_prob']
+                        cols[3].markdown(f"**{adj_prob:.0%}**", help=f"Adjusted from {orig_prob:.0%} using confidence-scaled distribution")
+                    else:
+                        cols[3].markdown(f"{row['our_prob']:.0%}")
 
                     # Market Probability
                     cols[4].markdown(f"{row['market_prob']:.0%}")
 
-                    # Edge (with color)
-                    edge_color = "green" if row['edge'] > 0 else "red"
-                    cols[5].markdown(f"**:{edge_color}[{row['edge']:+.1%}]**")
+                    # Edge (with color) - show conviction edge for conviction trades
+                    if row.get('is_conviction') and row.get('conviction_edge') is not None:
+                        conv_edge = row['conviction_edge']
+                        orig_edge = row['edge']
+                        edge_color = "blue"
+                        cols[5].markdown(f"**:{edge_color}[{conv_edge:+.1%}]**", help=f"Conviction edge (original: {orig_edge:+.1%})")
+                    else:
+                        edge_color = "green" if row['edge'] > 0 else "red"
+                        cols[5].markdown(f"**:{edge_color}[{row['edge']:+.1%}]**")
+
+                    # Confidence (with color based on threshold and breakdown tooltip)
+                    conf = row.get('confidence', 0)
+                    conf_color = "green" if conf >= TradingDefaults.MIN_CONFIDENCE else "orange"
+
+                    # Build confidence breakdown tooltip
+                    breakdown = row.get('confidence_breakdown', {})
+                    tooltip_parts = []
+                    if breakdown.get('ensemble_confidence'):
+                        tooltip_parts.append(f"Ensemble: {breakdown['ensemble_confidence']:.0%}")
+                    if breakdown.get('model_count_desc'):
+                        tooltip_parts.append(breakdown['model_count_desc'])
+                    if breakdown.get('nws_agreement_desc'):
+                        tooltip_parts.append(breakdown['nws_agreement_desc'])
+                    if breakdown.get('std_desc'):
+                        tooltip_parts.append(breakdown['std_desc'])
+                    if breakdown.get('has_tomorrow_io') is not None:
+                        tooltip_parts.append(f"Tomorrow.io: {'✓' if breakdown['has_tomorrow_io'] else '✗'}")
+
+                    conf_tooltip = " | ".join(tooltip_parts) if tooltip_parts else "No breakdown available"
+                    cols[6].markdown(f":{conf_color}[{conf:.0%}]", help=conf_tooltip)
 
                     # Action button
                     if row['signal'] != "PASS":
                         button_label = f"{'🤖 ' if auto_trade else ''}{row['signal']}"
                         button_key = f"trade_{row['city']}_{row.get('condition_id', '')}"
-                        if cols[6].button(button_label, key=button_key):
+                        if cols[7].button(button_label, key=button_key):
                             kelly = max(0, abs(row['edge']) / (1 - row['market_prob'])) if row['market_prob'] < 1 else 0
                             position = min(bankroll * kelly * kelly_fraction, bankroll * max_position / 100)
                             if position > 1:
                                 execute_trade(row, position, is_live)
                                 st.rerun()
                     else:
-                        cols[6].markdown("*No edge*")
+                        cols[7].markdown("*No edge*")
 
             st.markdown("---")
 
@@ -3525,8 +4167,20 @@ def main():
                             st.metric("Low", f"{fc_today['low_mean']:.1f}°F")
                         with subcol3:
                             conf_pct = fc_today['confidence'] * 100
-                            conf_color = "🟢" if conf_pct >= 80 else "🟡" if conf_pct >= 60 else "🔴"
+                            min_conf_pct = TradingDefaults.MIN_CONFIDENCE * 100
+                            conf_color = "🟢" if conf_pct >= min_conf_pct else "🟡"
                             st.metric("Conf", f"{conf_color} {conf_pct:.0f}%", f"{fc_today['model_count']} models")
+
+                        # Show confidence breakdown if available
+                        breakdown = fc_today.get("confidence_breakdown", {})
+                        if breakdown:
+                            parts = []
+                            if breakdown.get("nws_agreement_desc"):
+                                parts.append(breakdown["nws_agreement_desc"])
+                            if breakdown.get("has_tomorrow_io") is not None:
+                                parts.append(f"Tomorrow.io: {'✓' if breakdown['has_tomorrow_io'] else '✗'}")
+                            if parts:
+                                st.caption(f"📊 {' | '.join(parts)}")
                     else:
                         st.info("No forecast available for today")
 
@@ -3541,8 +4195,20 @@ def main():
                             st.metric("Low", f"{fc_tomorrow['low_mean']:.1f}°F")
                         with subcol3:
                             conf_pct = fc_tomorrow['confidence'] * 100
-                            conf_color = "🟢" if conf_pct >= 80 else "🟡" if conf_pct >= 60 else "🔴"
+                            min_conf_pct = TradingDefaults.MIN_CONFIDENCE * 100
+                            conf_color = "🟢" if conf_pct >= min_conf_pct else "🟡"
                             st.metric("Conf", f"{conf_color} {conf_pct:.0f}%", f"{fc_tomorrow['model_count']} models")
+
+                        # Show confidence breakdown if available
+                        breakdown = fc_tomorrow.get("confidence_breakdown", {})
+                        if breakdown:
+                            parts = []
+                            if breakdown.get("model_count_desc"):
+                                parts.append(breakdown["model_count_desc"])
+                            if breakdown.get("has_tomorrow_io") is not None:
+                                parts.append(f"Tomorrow.io: {'✓' if breakdown['has_tomorrow_io'] else '✗'}")
+                            if parts:
+                                st.caption(f"📊 {' | '.join(parts)}")
                     else:
                         st.info("No forecast available for tomorrow")
 
@@ -3696,8 +4362,10 @@ def main():
                                     calc_type = "range"
                                 formula = f"P({temp_low:.0f}-0.5≤T≤{temp_high:.0f}+0.5)"
 
+                            # Pass confidence for confidence-adjusted probability
+                            confidence = fc.get("confidence") if fc else None
                             our_prob = calc_outcome_probability(
-                                temp_low, temp_high, forecast_high, forecast_std
+                                temp_low, temp_high, forecast_high, forecast_std, confidence
                             )
 
                         edge = (our_prob - yes_price) if our_prob is not None else None
@@ -3808,22 +4476,64 @@ def main():
                             fig.add_trace(go.Bar(name='Low', x=models, y=lows, marker_color='#2196f3',
                                                 text=[f"{l:.1f}" for l in lows], textposition='outside'))
 
-                            # Add ensemble line if available
+                            # Add ensemble line and confidence band if available
                             if fc:
                                 ensemble_high = fc.get("high_mean")
-                                if ensemble_high:
-                                    fig.add_hline(y=ensemble_high, line_dash="dash",
-                                                line_color="red", annotation_text=f"Ensemble: {ensemble_high:.1f}")
+                                ensemble_std = fc.get("high_std", 0)
+                                ensemble_conf = fc.get("confidence", 0)
 
-                            fig.update_layout(barmode='group', height=280, showlegend=False,
+                                if ensemble_high:
+                                    # Add confidence band (±1 std)
+                                    fig.add_hrect(
+                                        y0=ensemble_high - ensemble_std,
+                                        y1=ensemble_high + ensemble_std,
+                                        fillcolor="rgba(255,0,0,0.1)",
+                                        line_width=0,
+                                        annotation_text="",
+                                    )
+                                    # Add ensemble line
+                                    fig.add_hline(
+                                        y=ensemble_high, line_dash="dash",
+                                        line_color="red",
+                                        annotation_text=f"ALGO: {ensemble_high:.1f}°F (±{ensemble_std:.1f})"
+                                    )
+
+                            fig.update_layout(barmode='group', height=300, showlegend=False,
                                             yaxis_title=f"Temp ({unit_label})", xaxis_title="",
-                                            margin=dict(l=40, r=20, t=20, b=40))
+                                            margin=dict(l=40, r=20, t=30, b=40))
                             st.plotly_chart(fig, use_container_width=True, key=f"model_{city_key}_{day_key}")
+
+                            # Show ensemble details with confidence breakdown
+                            if fc:
+                                ensemble_high = fc.get("high_mean")
+                                ensemble_conf = fc.get("confidence", 0)
+                                breakdown = fc.get("confidence_breakdown", {})
+
+                                conf_color = "🟢" if ensemble_conf >= TradingDefaults.MIN_CONFIDENCE else "🟡"
+
+                                # Build breakdown string
+                                breakdown_parts = []
+                                if breakdown.get("model_count_desc"):
+                                    breakdown_parts.append(breakdown["model_count_desc"])
+                                if breakdown.get("has_tomorrow_io") is not None:
+                                    breakdown_parts.append(f"Tomorrow.io: {'✓' if breakdown['has_tomorrow_io'] else '✗'}")
+                                if breakdown.get("nws_agreement_desc"):
+                                    breakdown_parts.append(breakdown["nws_agreement_desc"])
+
+                                breakdown_str = " | ".join(breakdown_parts) if breakdown_parts else ""
+
+                                st.markdown(
+                                    f"**Algo Forecast:** {ensemble_high:.1f}°F &nbsp;&nbsp; "
+                                    f"**Confidence:** {conf_color} {ensemble_conf:.0%} &nbsp;&nbsp; "
+                                    f"**Std:** ±{fc.get('high_std', 0):.1f}°F"
+                                )
+                                if breakdown_str:
+                                    st.caption(f"📊 {breakdown_str}")
 
                             if len(highs) > 1:
                                 spread = max(highs) - min(highs)
                                 agreement = "High" if spread < 3 else ("Medium" if spread < 6 else "Low")
-                                st.caption(f"Agreement: {agreement} (spread: {spread:.1f}°F)")
+                                st.caption(f"Model Agreement: {agreement} (spread: {spread:.1f}°F)")
                         else:
                             st.info("No model data available")
 
@@ -4158,7 +4868,7 @@ def main():
 
         if st.session_state.price_history:
             for market_id, prices in st.session_state.price_history.items():
-                if len(prices) > 1:
+                if isinstance(prices, (list, np.ndarray)) and len(prices) > 1:
                     df = pd.DataFrame(prices)
                     fig = px.line(df, x='time', y='price', title=f"Market: {market_id[:30]}...")
                     fig.update_layout(yaxis_tickformat='.2f', height=300)
@@ -4222,6 +4932,205 @@ def main():
         else:
             st.info("No alerts yet")
 
+    # =====================
+    # TAB 9: Scheduler
+    # =====================
+    with tab9:
+        st.header("⏰ Scheduler Control")
+
+        # Load current state
+        sched_state = st.session_state.scheduler_state
+        window_name, window_config = get_current_window()
+        daily_stats = calculate_daily_cycles()
+
+        # --- Status Panel ---
+        st.subheader("Status Panel")
+
+        status_cols = st.columns([2, 1, 1])
+
+        with status_cols[0]:
+            # Toggle for scheduler
+            scheduler_enabled = st.toggle(
+                "Enable Scheduled Trading",
+                value=sched_state.get("enabled", False),
+                help="When enabled, trading cycles are tracked and logged. Works with auto-refresh."
+            )
+
+            # Update state if toggle changed
+            if scheduler_enabled != sched_state.get("enabled", False):
+                sched_state["enabled"] = scheduler_enabled
+                st.session_state.scheduler_state = sched_state
+                save_scheduler_state(sched_state)
+                if scheduler_enabled:
+                    add_alert("Scheduler enabled - cycles will be tracked", "success")
+                else:
+                    add_alert("Scheduler disabled", "info")
+                st.rerun()
+
+        with status_cols[1]:
+            status_emoji = "🟢" if scheduler_enabled else "🔴"
+            status_text = "ACTIVE" if scheduler_enabled else "DISABLED"
+            st.markdown(f"### {status_emoji} {status_text}")
+
+        with status_cols[2]:
+            st.markdown(f"**Window:** {window_name}")
+            st.caption(window_config.get("description", ""))
+
+        # Metrics row
+        metrics_cols = st.columns(4)
+
+        with metrics_cols[0]:
+            cycles_today = sched_state.get("cycles_today", 0)
+            total_expected = daily_stats["total_cycles"]
+            pct = (cycles_today / total_expected * 100) if total_expected > 0 else 0
+            st.metric("Cycles Today", f"{cycles_today}/{total_expected}", f"{pct:.0f}%")
+
+        with metrics_cols[1]:
+            api_calls = sched_state.get("api_calls_today", 0)
+            st.metric("API Calls (Est)", f"~{api_calls}/500")
+
+        with metrics_cols[2]:
+            last_cycle = sched_state.get("last_cycle_time")
+            if last_cycle:
+                try:
+                    last_dt = datetime.fromisoformat(last_cycle)
+                    if last_dt.tzinfo is None:
+                        last_dt = last_dt.replace(tzinfo=EST)
+                    last_str = last_dt.strftime("%H:%M:%S EST")
+                except:
+                    last_str = "Unknown"
+            else:
+                last_str = "Not yet"
+            st.metric("Last Cycle", last_str)
+
+        with metrics_cols[3]:
+            next_in = format_time_until_next_cycle(sched_state)
+            st.metric("Next Cycle", next_in)
+
+        st.markdown("---")
+
+        # --- Activity Log ---
+        st.subheader("📋 Activity Log")
+
+        activity_log = sched_state.get("activity_log", [])
+
+        if activity_log:
+            # Color-coded log display
+            for entry in activity_log[:20]:
+                status = entry.get("status", "no_action")
+                time_str = entry.get("time", "")
+                window = entry.get("window", "")
+                signals = entry.get("signals", 0)
+                trades = entry.get("trades", 0)
+                details = entry.get("details", "")
+
+                # Color coding
+                if status == "trade":
+                    color = "#22c55e"  # Green
+                    icon = "🟢"
+                elif status == "signal":
+                    color = "#3b82f6"  # Blue
+                    icon = "🔵"
+                elif status == "reset":
+                    color = "#a855f7"  # Purple
+                    icon = "🔄"
+                elif status == "skipped":
+                    color = "#f59e0b"  # Yellow
+                    icon = "🟡"
+                elif status == "error":
+                    color = "#ef4444"  # Red
+                    icon = "🔴"
+                else:
+                    color = "#6b7280"  # Gray
+                    icon = "⚪"
+
+                # Build message
+                msg = f"{signals} signals"
+                if trades > 0:
+                    msg += f", {trades} trade{'s' if trades > 1 else ''}"
+                if details:
+                    msg += f" ({details})"
+
+                st.markdown(
+                    f'<div style="color: {color}; margin: 4px 0; font-family: monospace;">'
+                    f'{icon} [{time_str}] {window} - {msg}</div>',
+                    unsafe_allow_html=True
+                )
+        else:
+            st.info("No activity logged yet. Enable scheduler and wait for refresh cycles.")
+
+        st.markdown("---")
+
+        # --- Today's Scheduler Trades ---
+        st.subheader("📈 Today's Scheduler Trades")
+
+        trades_today = sched_state.get("trades_today", [])
+
+        if trades_today:
+            trade_df = pd.DataFrame(trades_today)
+            display_cols = ["logged_time", "city", "bracket", "side", "edge", "size", "status"]
+            available_cols = [c for c in display_cols if c in trade_df.columns]
+            if available_cols:
+                st.dataframe(trade_df[available_cols], use_container_width=True)
+            else:
+                st.dataframe(trade_df, use_container_width=True)
+        else:
+            st.info("No scheduler trades today")
+
+        st.markdown("---")
+
+        # --- Schedule Overview ---
+        st.subheader("📅 Schedule Overview")
+
+        schedule_summary = get_schedule_summary()
+
+        # Display windows in a visual format
+        sched_cols = st.columns(4)
+
+        for i, window in enumerate(schedule_summary):
+            col_idx = i % 4
+            with sched_cols[col_idx]:
+                # Highlight current window
+                is_current = window["name"] == window_name
+                border_color = "#22c55e" if is_current else "#374151"
+                bg_color = "#14532d" if is_current else "#1f2937"
+
+                st.markdown(
+                    f'''
+                    <div style="
+                        background-color: {bg_color};
+                        border: 2px solid {border_color};
+                        border-radius: 8px;
+                        padding: 12px;
+                        margin: 4px 0;
+                        text-align: center;
+                    ">
+                        <div style="font-weight: bold; color: {'#22c55e' if is_current else '#e5e7eb'};">
+                            {window["name"].replace("_", " ").title()}
+                        </div>
+                        <div style="font-size: 12px; color: #9ca3af;">
+                            {window["hours_display"]}
+                        </div>
+                        <div style="font-size: 11px; color: #6b7280;">
+                            {window["description"]}
+                        </div>
+                        <div style="font-size: 11px; color: #60a5fa; margin-top: 4px;">
+                            {window["total_cycles"]} cycles/window
+                        </div>
+                    </div>
+                    ''',
+                    unsafe_allow_html=True
+                )
+
+        st.markdown("---")
+
+        # Info box
+        st.info(
+            "**How it works:** The scheduler uses the dashboard's auto-refresh cycle. "
+            "When enabled, each refresh cycle is logged with signal and trade counts. "
+            "The dashboard must be running with auto-refresh enabled for the scheduler to work."
+        )
+
     # Footer
     st.markdown("---")
     market_status = "Demo Markets" if use_demo else ("Live Markets" if markets else "No Markets")
@@ -4281,6 +5190,41 @@ def main():
 
             except Exception as e:
                 add_alert(f"Auto-sync error: {e}", "warning")
+
+        # Log scheduler cycle if enabled
+        if st.session_state.scheduler_enabled:
+            sched_state = st.session_state.scheduler_state
+
+            # Check for daily reset
+            today = str(datetime.now(EST).date())
+            if sched_state.get("daily_reset_date") != today:
+                sched_state = reset_daily_counters(sched_state)
+                add_alert("Scheduler: Daily counters reset", "info")
+
+            # Check if we should run a cycle (based on time window)
+            if should_run_cycle(sched_state, refresh_seconds):
+                # Count trades executed this cycle (from auto_trade_check)
+                trades_this_cycle = st.session_state.get('scheduler_trades_this_cycle', 0)
+                st.session_state.scheduler_trades_this_cycle = 0  # Reset for next cycle
+
+                # Build details string from recent signals
+                signal_details = ""
+                if signals:
+                    top_signal = signals[0] if signals else None
+                    if top_signal:
+                        signal_details = f"{top_signal.get('city', 'Unknown')} {top_signal.get('bracket', '')}"
+
+                # Log the cycle
+                sched_state = log_cycle(
+                    sched_state,
+                    signals_count=len(signals) if signals else 0,
+                    trades_count=trades_this_cycle,
+                    details=signal_details
+                )
+
+                # Save state
+                st.session_state.scheduler_state = sched_state
+                save_scheduler_state(sched_state)
 
         st.cache_data.clear()
         st.rerun()

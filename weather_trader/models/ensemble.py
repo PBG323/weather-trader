@@ -17,6 +17,7 @@ from datetime import datetime, date
 from typing import Optional
 import numpy as np
 from scipy import stats
+from scipy.stats import skewnorm
 
 from ..config import CityConfig
 from .bias_correction import BiasCorrector, CorrectedForecast
@@ -48,6 +49,14 @@ class EnsembleForecast:
     high_std: float
     low_std: float
 
+    # Skewness (for skew-normal distribution)
+    # Positive = warm tail extends further, Negative = cold tail extends further
+    high_skew: float = 0.0
+    low_skew: float = 0.0
+
+    # Model consensus ratio (0-1, higher = more agreement)
+    consensus_ratio: float = 1.0
+
     # Confidence intervals (90%)
     high_ci_lower: float
     high_ci_upper: float
@@ -61,11 +70,30 @@ class EnsembleForecast:
     # Overall confidence (0-1)
     confidence: float
 
+    def _get_std_floor(self) -> float:
+        """
+        Get minimum std floor based on model consensus.
+
+        When models strongly agree, we can use a tighter distribution.
+        When models disagree, we need more uncertainty buffer.
+
+        Returns:
+            Minimum std dev floor (1.0 to 2.0)
+        """
+        if self.consensus_ratio > 0.9:
+            return 1.0  # Very strong consensus - allow tight distribution
+        elif self.consensus_ratio > 0.8:
+            return 1.5  # Strong consensus
+        else:
+            return 2.0  # Normal case - keep conservative floor
+
     def get_probability_above(self, threshold: float, for_high: bool = True) -> float:
         """
         Calculate probability that actual temperature will be above threshold.
 
-        Uses normal distribution assumption based on ensemble mean and std.
+        Uses skew-normal distribution when skew is significant, otherwise normal.
+        The std already includes model disagreement, base forecast uncertainty,
+        and city-specific station bias uncertainty from 180-day historical analysis.
 
         Args:
             threshold: Temperature threshold in Fahrenheit
@@ -75,15 +103,21 @@ class EnsembleForecast:
             Probability (0-1) of exceeding threshold
         """
         if for_high:
-            mean, std = self.high_mean, self.high_std
+            mean, std, skew = self.high_mean, self.high_std, self.high_skew
         else:
-            mean, std = self.low_mean, self.low_std
+            mean, std, skew = self.low_mean, self.low_std, self.low_skew
 
-        # Add minimum uncertainty floor
-        std = max(std, 1.5)
+        # Apply consensus-aware std floor
+        std_floor = self._get_std_floor()
+        std = max(std, std_floor)
 
-        # P(X > threshold) = 1 - CDF(threshold)
-        return 1 - stats.norm.cdf(threshold, loc=mean, scale=std)
+        # Use skew-normal when skew is significant, otherwise normal (faster)
+        if abs(skew) >= 0.1:
+            # P(X > threshold) = 1 - CDF(threshold) using skew-normal
+            return 1 - skewnorm.cdf(threshold, a=skew, loc=mean, scale=std)
+        else:
+            # P(X > threshold) = 1 - CDF(threshold) using normal
+            return 1 - stats.norm.cdf(threshold, loc=mean, scale=std)
 
     def get_probability_below(self, threshold: float, for_high: bool = True) -> float:
         """
@@ -107,6 +141,8 @@ class EnsembleForecast:
         """
         Calculate probability that temperature falls within a range.
 
+        Uses skew-normal distribution when skew is significant, otherwise normal.
+
         Args:
             lower: Lower bound (inclusive)
             upper: Upper bound (inclusive)
@@ -116,16 +152,56 @@ class EnsembleForecast:
             Probability of temperature being in [lower, upper]
         """
         if for_high:
-            mean, std = self.high_mean, self.high_std
+            mean, std, skew = self.high_mean, self.high_std, self.high_skew
         else:
-            mean, std = self.low_mean, self.low_std
+            mean, std, skew = self.low_mean, self.low_std, self.low_skew
 
-        std = max(std, 1.5)
+        # Apply consensus-aware std floor
+        std_floor = self._get_std_floor()
+        std = max(std, std_floor)
 
-        p_below_upper = stats.norm.cdf(upper, loc=mean, scale=std)
-        p_below_lower = stats.norm.cdf(lower, loc=mean, scale=std)
+        # Use skew-normal when skew is significant
+        if abs(skew) >= 0.1:
+            p_below_upper = skewnorm.cdf(upper, a=skew, loc=mean, scale=std)
+            p_below_lower = skewnorm.cdf(lower, a=skew, loc=mean, scale=std)
+        else:
+            p_below_upper = stats.norm.cdf(upper, loc=mean, scale=std)
+            p_below_lower = stats.norm.cdf(lower, loc=mean, scale=std)
 
         return p_below_upper - p_below_lower
+
+
+def estimate_skew(values: np.ndarray) -> float:
+    """
+    Estimate distribution skew from model spread using Pearson's coefficient.
+
+    Temperature distributions are often skewed:
+    - Cold fronts create sharp drops (negative/left skew)
+    - Warm spells have long tails (positive/right skew)
+
+    Args:
+        values: Array of model forecast values
+
+    Returns:
+        Skew estimate, clamped to [-2.0, 2.0]
+    """
+    if len(values) < 3:
+        return 0.0  # Not enough data for skew estimation
+
+    mean = np.mean(values)
+    median = np.median(values)
+    std = np.std(values)
+
+    if std < 0.5:
+        return 0.0  # Very tight consensus, normal is appropriate
+
+    # Pearson's second skewness coefficient: 3 * (mean - median) / std
+    # Positive when mean > median (right skew, warm tail)
+    # Negative when mean < median (left skew, cold tail)
+    skew = 3 * (mean - median) / std
+
+    # Clamp to reasonable range for scipy.stats.skewnorm
+    return float(np.clip(skew, -2.0, 2.0))
 
 
 # Default model weights based on historical accuracy
@@ -136,7 +212,7 @@ DEFAULT_WEIGHTS = {
     "gfs": 1.2,     # Increased - good for US
     "hrrr": 1.3,    # Best for short-term US
     "best_match": 1.0,
-    "tomorrow": 1.4,  # Tomorrow.io strong for US cities
+    "tomorrow.io": 1.4,  # Tomorrow.io strong for US cities
     "nws": 1.1,     # NWS point forecast - local expertise
     "unknown": 0.7,
 }
@@ -250,21 +326,48 @@ class EnsembleForecaster:
         high_mean = np.average(highs, weights=weights)
         low_mean = np.average(lows, weights=weights)
 
+        # Apply station bias correction
+        # NWS station observations often differ systematically from grid model data
+        # due to local effects (urban heat island, elevation, microclimate).
+        # This bias is added to grid model forecasts to better predict NWS settlement.
+        station_bias = getattr(city_config, 'station_bias', 0.0)
+        station_bias_std = getattr(city_config, 'station_bias_std', 2.0)
+        if station_bias != 0.0:
+            high_mean += station_bias
+            low_mean += station_bias
+
         # Weighted standard deviation
         high_var = np.average((highs - high_mean) ** 2, weights=weights)
         low_var = np.average((lows - low_mean) ** 2, weights=weights)
 
-        # Add inherent forecast uncertainty (minimum std of ~2F)
+        # Add inherent forecast uncertainty
         #
-        # MIN_FORECAST_UNCERTAINTY = 2.0°F
-        # Even when all models perfectly agree, weather has irreducible uncertainty.
-        # 2°F std represents ~95% confidence interval of ±4°F, which matches
-        # typical NWS forecast accuracy for 1-3 day predictions.
-        # This prevents overconfident predictions when models happen to align.
-        MIN_FORECAST_UNCERTAINTY = 2.0  # degrees F
+        # Total uncertainty combines:
+        # 1. Model disagreement (high_var from weighted variance)
+        # 2. Minimum forecast uncertainty (weather is inherently unpredictable)
+        # 3. Station bias uncertainty (how variable the station-to-grid relationship is)
+        #
+        # We combine these in quadrature (sqrt of sum of squares) since they're
+        # independent sources of uncertainty.
+        #
+        # MIN_FORECAST_UNCERTAINTY = 1.5°F base forecast uncertainty
+        # station_bias_std = city-specific (from 180-day historical analysis)
+        #   - Miami/Chicago/Austin: ~1.5F (consistent, good for trading)
+        #   - NYC/Philly/Denver: ~2.0F (moderate)
+        #   - LA: 2.8F (high variability, marine layer effects)
+        MIN_FORECAST_UNCERTAINTY = 1.5  # degrees F (reduced since station_bias_std adds uncertainty)
 
-        high_std = max(np.sqrt(high_var), MIN_FORECAST_UNCERTAINTY)
-        low_std = max(np.sqrt(low_var), MIN_FORECAST_UNCERTAINTY)
+        # Combine uncertainties in quadrature
+        # Total std = sqrt(model_variance + min_uncertainty^2 + station_bias_std^2)
+        combined_uncertainty = np.sqrt(
+            high_var + MIN_FORECAST_UNCERTAINTY**2 + station_bias_std**2
+        )
+        high_std = combined_uncertainty
+
+        combined_uncertainty_low = np.sqrt(
+            low_var + MIN_FORECAST_UNCERTAINTY**2 + station_bias_std**2
+        )
+        low_std = combined_uncertainty_low
 
         # Model disagreement increases uncertainty, but cap the amplification
         # so a single outlier model can't blow up the std.
@@ -301,7 +404,15 @@ class EnsembleForecaster:
         low_ci_lower = low_mean - z_90 * low_std
         low_ci_upper = low_mean + z_90 * low_std
 
-        # Overall confidence based on consensus-model agreement
+        # Estimate skewness from model spread
+        # Used for skew-normal probability calculations
+        high_skew = estimate_skew(highs)
+        low_skew = estimate_skew(lows)
+
+        # Overall confidence based on:
+        # 1. Model consensus (do models agree?)
+        # 2. Station reliability (how predictable is the station bias?)
+        #
         # Count how many models are within 3°F of the median — the
         # "consensus core". One outlier shouldn't tank confidence if the
         # majority agrees.
@@ -312,9 +423,24 @@ class EnsembleForecaster:
             # Consensus ratio 1.0 → agreement 0.95, ratio 0.5 → agreement 0.65
             model_agreement = 0.5 + 0.45 * consensus_ratio
         else:
+            consensus_ratio = 1.0  # Assume consensus with few models
             model_agreement = 1 / (1 + np.std(highs) / 5)
 
-        confidence = min(0.95, model_agreement * 0.9)
+        # Station reliability factor based on bias std dev
+        # Low std (1.5F) = very reliable = factor ~1.0
+        # High std (2.8F) = less reliable = factor ~0.85
+        # This penalizes confidence for cities with unpredictable station behavior
+        BASELINE_STD = 1.5  # Miami/Chicago level - most reliable
+        station_reliability = 1.0 - 0.1 * max(0, (station_bias_std - BASELINE_STD))
+        station_reliability = max(0.8, station_reliability)  # Floor at 0.8
+
+        # Horizon decay: forecasts further out are less reliable
+        # ~8% decay per day, floor at 50%
+        # Day 0 (today): 1.0, Day 1: 0.92, Day 2: 0.84, Day 7: 0.50
+        horizon_days = (forecast_date - date.today()).days
+        horizon_factor = max(0.5, 1.0 - 0.08 * max(0, horizon_days))
+
+        confidence = min(0.95, model_agreement * 0.9 * station_reliability * horizon_factor)
 
         return EnsembleForecast(
             date=forecast_date,
@@ -325,6 +451,9 @@ class EnsembleForecaster:
             low_median=np.median(lows),
             high_std=high_std,
             low_std=low_std,
+            high_skew=high_skew,
+            low_skew=low_skew,
+            consensus_ratio=consensus_ratio,
             high_ci_lower=high_ci_lower,
             high_ci_upper=high_ci_upper,
             low_ci_lower=low_ci_lower,
