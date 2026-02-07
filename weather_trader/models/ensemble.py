@@ -49,14 +49,6 @@ class EnsembleForecast:
     high_std: float
     low_std: float
 
-    # Skewness (for skew-normal distribution)
-    # Positive = warm tail extends further, Negative = cold tail extends further
-    high_skew: float = 0.0
-    low_skew: float = 0.0
-
-    # Model consensus ratio (0-1, higher = more agreement)
-    consensus_ratio: float = 1.0
-
     # Confidence intervals (90%)
     high_ci_lower: float
     high_ci_upper: float
@@ -69,6 +61,14 @@ class EnsembleForecast:
 
     # Overall confidence (0-1)
     confidence: float
+
+    # Skewness (for skew-normal distribution) - fields with defaults must come last
+    # Positive = warm tail extends further, Negative = cold tail extends further
+    high_skew: float = 0.0
+    low_skew: float = 0.0
+
+    # Model consensus ratio (0-1, higher = more agreement)
+    consensus_ratio: float = 1.0
 
     def _get_std_floor(self) -> float:
         """
