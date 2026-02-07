@@ -435,10 +435,10 @@ class EnsembleForecaster:
         station_reliability = max(0.8, station_reliability)  # Floor at 0.8
 
         # Horizon decay: forecasts further out are less reliable
-        # ~8% decay per day, floor at 50%
-        # Day 0 (today): 1.0, Day 1: 0.92, Day 2: 0.84, Day 7: 0.50
+        # ~4% decay per day, floor at 70% (reduced from 8% to avoid over-penalizing)
+        # Day 0 (today): 1.0, Day 1: 0.96, Day 2: 0.92, Day 7: 0.72
         horizon_days = (forecast_date - date.today()).days
-        horizon_factor = max(0.5, 1.0 - 0.08 * max(0, horizon_days))
+        horizon_factor = max(0.70, 1.0 - 0.04 * max(0, horizon_days))
 
         confidence = min(0.95, model_agreement * 0.9 * station_reliability * horizon_factor)
 
