@@ -58,6 +58,10 @@ from weather_trader.scheduler_state import (
     should_run_cycle, log_cycle, reset_daily_counters, calculate_daily_cycles,
     get_schedule_summary, format_time_until_next_cycle, TRADING_SCHEDULE
 )
+from weather_trader.trade_history import (
+    log_trade, update_settlement, get_unsettled_trades, analyze_performance,
+    get_recent_trades, export_to_csv
+)
 
 # Page config
 st.set_page_config(
@@ -2811,6 +2815,34 @@ def execute_trade(signal, size, is_live=False):
     # Record trade in risk manager
     st.session_state.risk_manager.record_trade(signal.get("condition_id", ""), 0.0)
 
+    # LOG TRADE TO PERSISTENT HISTORY for analysis and learning
+    try:
+        target_date_str = target_date.isoformat() if hasattr(target_date, 'isoformat') else str(target_date)
+        log_trade(
+            ticker=signal.get("ticker", "") or signal.get("condition_id", ""),
+            city=signal["city"],
+            target_date=target_date_str,
+            bracket_desc=outcome,
+            temp_low=signal.get("temp_low"),
+            temp_high=signal.get("temp_high"),
+            side=side,
+            entry_price=entry_price,
+            size_contracts=int(shares),
+            size_dollars=size,
+            forecast_mean=signal.get("forecast_high_market", signal.get("forecast_high_f", 0)),
+            forecast_std=signal.get("forecast_std", 3.0),
+            forecast_confidence=signal.get("confidence", 0.75),
+            our_probability=signal["our_prob"],
+            raw_edge=signal.get("raw_edge", signal.get("edge", 0)),
+            effective_edge=signal.get("effective_edge", abs(signal.get("edge", 0))),
+            spread=signal.get("spread", 0.02),
+            signal_type=signal.get("signal", "UNKNOWN"),
+            is_same_day=signal.get("is_same_day", False),
+            is_conviction=signal.get("is_conviction", False),
+        )
+    except Exception as e:
+        print(f"[TradeHistory] Error logging trade: {e}")
+
     mode = "LIVE" if is_live else "SIMULATED"
     add_alert(f"📈 [{mode}] Opened: {signal['city']} {outcome} {side} ${size:.2f} @ {entry_price:.2f} (Edge: {signal['edge']:+.1%})",
               "success" if is_live else "info")
@@ -3816,7 +3848,7 @@ def main():
     st.markdown("---")
 
     # Tabs
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
         "📊 Overview",
         "🌡️ Forecasts",
         "📈 Markets",
@@ -3825,7 +3857,8 @@ def main():
         "💰 Trades & P/L",
         "📉 Price Charts",
         "🔔 Alerts",
-        "⏰ Scheduler"
+        "⏰ Scheduler",
+        "📚 Trade History"
     ])
 
     # Fetch data
@@ -5130,6 +5163,178 @@ def main():
             "When enabled, each refresh cycle is logged with signal and trade counts. "
             "The dashboard must be running with auto-refresh enabled for the scheduler to work."
         )
+
+    # =========================================================================
+    # TAB 10: Trade History & Analytics
+    # =========================================================================
+    with tab10:
+        st.header("📚 Trade History & Performance Analytics")
+
+        st.markdown("""
+        Track every trade with entry conditions, settlement results, and performance analysis.
+        Learn from historical data to improve trading decisions.
+        """)
+
+        # Load trade history
+        recent_trades = get_recent_trades(50)
+        unsettled = get_unsettled_trades()
+
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Total Logged Trades", len(recent_trades))
+        with col2:
+            st.metric("Awaiting Settlement", len(unsettled))
+        with col3:
+            settled_count = len([t for t in recent_trades if t.get("settled", False)])
+            st.metric("Settled Trades", settled_count)
+        with col4:
+            if settled_count > 0:
+                wins = len([t for t in recent_trades if t.get("settlement_result") == "WIN"])
+                st.metric("Win Rate", f"{wins/settled_count:.1%}")
+            else:
+                st.metric("Win Rate", "N/A")
+
+        st.markdown("---")
+
+        # Performance Analysis Section
+        st.subheader("📊 Performance Analysis")
+
+        if st.button("🔄 Analyze Performance", key="analyze_perf"):
+            analysis = analyze_performance()
+
+            if "error" in analysis:
+                st.warning(analysis["error"])
+            else:
+                # Summary metrics
+                summary = analysis["summary"]
+                st.markdown("### Overall Performance")
+                cols = st.columns(6)
+                cols[0].metric("Total Trades", summary["total_trades"])
+                cols[1].metric("Wins", summary["wins"])
+                cols[2].metric("Losses", summary["losses"])
+                cols[3].metric("Win Rate", f"{summary['win_rate']:.1%}")
+                cols[4].metric("Total P&L", f"${summary['total_pnl']:.2f}")
+                cols[5].metric("Avg P&L/Trade", f"${summary['avg_pnl_per_trade']:.2f}")
+
+                # Recommendations
+                st.markdown("### 💡 Recommendations")
+                for rec in analysis.get("recommendations", []):
+                    st.markdown(f"- {rec}")
+
+                # By Confidence
+                st.markdown("### Performance by Confidence Level")
+                if analysis.get("by_confidence"):
+                    conf_df = pd.DataFrame([
+                        {"Confidence": k, "Trades": v["count"], "Win Rate": f"{v['win_rate']:.1%}", "Avg P&L": f"${v['avg_pnl']:.2f}"}
+                        for k, v in analysis["by_confidence"].items()
+                    ])
+                    st.dataframe(conf_df, use_container_width=True, hide_index=True)
+
+                # By Edge
+                st.markdown("### Performance by Edge Size")
+                if analysis.get("by_edge"):
+                    edge_df = pd.DataFrame([
+                        {"Edge": k, "Trades": v["count"], "Win Rate": f"{v['win_rate']:.1%}", "Avg P&L": f"${v['avg_pnl']:.2f}"}
+                        for k, v in analysis["by_edge"].items()
+                    ])
+                    st.dataframe(edge_df, use_container_width=True, hide_index=True)
+
+                # By City
+                st.markdown("### Performance by City")
+                if analysis.get("by_city"):
+                    city_df = pd.DataFrame([
+                        {
+                            "City": k,
+                            "Trades": v["total_trades"],
+                            "Win Rate": f"{v['win_rate']:.1%}",
+                            "Total P&L": f"${v['total_pnl']:.2f}",
+                            "Forecast Bias": v.get("forecast_bias", "unknown"),
+                            "Avg Error": f"{v['avg_forecast_error']:.1f}°F"
+                        }
+                        for k, v in analysis["by_city"].items()
+                    ])
+                    st.dataframe(city_df, use_container_width=True, hide_index=True)
+
+                # Same-day vs Next-day
+                st.markdown("### Same-Day vs Next-Day Performance")
+                timing = analysis.get("same_day_vs_next_day", {})
+                cols = st.columns(2)
+                with cols[0]:
+                    sd = timing.get("same_day", {})
+                    st.markdown("**Same-Day Trades**")
+                    st.write(f"- Count: {sd.get('count', 0)}")
+                    st.write(f"- Win Rate: {sd.get('win_rate', 0):.1%}")
+                    st.write(f"- Total P&L: ${sd.get('total_pnl', 0):.2f}")
+                with cols[1]:
+                    nd = timing.get("next_day", {})
+                    st.markdown("**Next-Day Trades**")
+                    st.write(f"- Count: {nd.get('count', 0)}")
+                    st.write(f"- Win Rate: {nd.get('win_rate', 0):.1%}")
+                    st.write(f"- Total P&L: ${nd.get('total_pnl', 0):.2f}")
+
+                # Forecast Accuracy
+                st.markdown("### 🎯 Forecast Accuracy")
+                acc = analysis.get("forecast_accuracy", {})
+                if acc.get("mean_absolute_error") is not None:
+                    cols = st.columns(3)
+                    cols[0].metric("Mean Absolute Error", f"{acc['mean_absolute_error']:.2f}°F")
+                    cols[1].metric("Bias", f"{acc['bias']:.2f}°F ({acc['bias_direction']})")
+                    cols[2].metric("RMSE", f"{acc['rmse']:.2f}°F")
+                else:
+                    st.info("No forecast accuracy data yet")
+
+        st.markdown("---")
+
+        # Recent Trades Table
+        st.subheader("📋 Recent Trades")
+
+        if recent_trades:
+            trades_df = pd.DataFrame([
+                {
+                    "Time": t.get("timestamp", "")[:19],
+                    "City": t.get("city", ""),
+                    "Bracket": t.get("bracket_desc", ""),
+                    "Side": t.get("side", ""),
+                    "Entry": f"{t.get('entry_price', 0):.2f}",
+                    "Forecast": f"{t.get('forecast_mean', 0):.1f}°F",
+                    "Conf": f"{t.get('forecast_confidence', 0):.0%}",
+                    "Edge": f"{t.get('effective_edge', 0):.1%}",
+                    "Settled": "✅" if t.get("settled") else "⏳",
+                    "Result": t.get("settlement_result", "-"),
+                    "Actual": f"{t.get('actual_temp', '-')}°F" if t.get("actual_temp") else "-",
+                    "P&L": f"${t.get('pnl', 0):.2f}" if t.get("pnl") is not None else "-",
+                }
+                for t in recent_trades
+            ])
+            st.dataframe(trades_df, use_container_width=True, hide_index=True)
+
+            # Export button
+            if st.button("📥 Export to CSV"):
+                filepath = export_to_csv()
+                st.success(f"Exported to: {filepath}")
+        else:
+            st.info("No trades logged yet. Trades will be recorded when you execute trades with the system.")
+
+        st.markdown("---")
+
+        # Manual Settlement Update
+        st.subheader("🔧 Manual Settlement Update")
+        st.markdown("Use this to manually record settlement results for trades.")
+
+        with st.expander("Update Settlement"):
+            ticker_to_update = st.text_input("Ticker", key="settle_ticker")
+            actual_temp_input = st.number_input("Actual Temperature (°F)", value=70.0, key="settle_temp")
+            won_input = st.checkbox("Position Won", key="settle_won")
+
+            if st.button("Update Settlement", key="settle_btn"):
+                if ticker_to_update:
+                    success = update_settlement(ticker_to_update, actual_temp_input, won_input)
+                    if success:
+                        st.success(f"Updated settlement for {ticker_to_update}")
+                    else:
+                        st.warning(f"No unsettled trade found for {ticker_to_update}")
+                else:
+                    st.warning("Enter a ticker to update")
 
     # Footer
     st.markdown("---")
