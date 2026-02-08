@@ -332,6 +332,99 @@ class ExecutionEngine:
             logger.error(f"Kalshi order {order.order_id} failed: {e}")
             return False
 
+    async def execute_smart_order(
+        self,
+        ticker: str,
+        side: str,
+        total_count: int,
+        max_price_cents: int,
+        urgency: str = "normal"
+    ) -> dict:
+        """
+        Split large orders to minimize market impact.
+
+        Uses time-weighted execution for normal urgency,
+        single IOC for aggressive urgency.
+
+        Args:
+            ticker: Market ticker
+            side: "yes" or "no"
+            total_count: Total contracts to buy
+            max_price_cents: Maximum price willing to pay
+            urgency: "aggressive" (single IOC) or "normal" (split orders)
+
+        Returns:
+            Dict with filled count, average price, and execution details
+        """
+        import asyncio
+
+        if self.kalshi_client is None:
+            logger.warning("No Kalshi client - cannot execute smart order")
+            return {"filled": 0, "avg_price": 0, "success": False}
+
+        if urgency == "aggressive":
+            # Single IOC at max price for urgent execution
+            result = await self.kalshi_client.place_order(
+                ticker=ticker,
+                action="buy",
+                side=side,
+                count=total_count,
+                price_cents=max_price_cents,
+                order_type="limit",
+                time_in_force="immediate_or_cancel"
+            )
+            return {
+                "filled": result.filled_count if result.success else 0,
+                "avg_price": result.filled_price if result.success else 0,
+                "success": result.success,
+                "orders": 1
+            }
+
+        # Normal urgency: Split into chunks, escalate price if needed
+        filled = 0
+        total_cost = 0
+        orders_placed = 0
+        price = max_price_cents - 3  # Start 3 cents below max
+
+        while filled < total_count and price <= max_price_cents:
+            chunk = min(50, total_count - filled)  # Max 50 per order
+
+            try:
+                result = await self.kalshi_client.place_order(
+                    ticker=ticker,
+                    action="buy",
+                    side=side,
+                    count=chunk,
+                    price_cents=price,
+                    order_type="limit",
+                    time_in_force="immediate_or_cancel"
+                )
+                orders_placed += 1
+
+                if result.success and result.filled_count > 0:
+                    filled += result.filled_count
+                    total_cost += result.filled_count * (result.filled_price or price)
+                    logger.info(f"[SmartOrder] Filled {result.filled_count} @ {price}c, total: {filled}/{total_count}")
+
+                if result.remaining_count and result.remaining_count > 0:
+                    price += 1  # Escalate price for next attempt
+                    await asyncio.sleep(0.5)  # Brief pause between orders
+
+            except Exception as e:
+                logger.error(f"[SmartOrder] Order failed: {e}")
+                price += 1
+                await asyncio.sleep(0.5)
+
+        avg_price = total_cost / filled if filled > 0 else 0
+
+        return {
+            "filled": filled,
+            "avg_price": avg_price / 100.0,  # Convert to dollars
+            "success": filled > 0,
+            "orders": orders_placed,
+            "final_price_cents": price
+        }
+
     async def _simulate_fill(self, order: Order) -> None:
         """Simulate order fill for testing."""
         await asyncio.sleep(0.1)  # Simulate network delay

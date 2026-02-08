@@ -577,3 +577,83 @@ class EnsembleForecaster:
         if edge < -0.05:
             return f"Buy NO: {-edge:.1%} edge"
         return "No clear signal"
+
+
+def detect_weather_regime(forecasts: dict) -> dict:
+    """
+    Classify current weather regime for strategy adjustment.
+
+    Weather regimes:
+    - stable: High-confidence stable pattern → tighter spreads, smaller edge needed
+    - volatile: Active pattern (fronts, storms) → wider spreads, require larger edge
+    - normal: Typical conditions
+
+    Args:
+        forecasts: Dict of city -> EnsembleForecast
+
+    Returns:
+        Dict with regime classification and recommended parameters
+    """
+    if not forecasts:
+        return {
+            "regime": "unknown",
+            "min_edge": 0.05,
+            "position_scale": 1.0,
+            "reason": "No forecast data"
+        }
+
+    # Extract std and consensus from all forecasts
+    stds = []
+    consensus_ratios = []
+
+    for key, fc in forecasts.items():
+        if isinstance(fc, dict):
+            stds.append(fc.get("high_std", 3.0))
+            # Get consensus from confidence breakdown if available
+            breakdown = fc.get("confidence_breakdown", {})
+            consensus_ratios.append(breakdown.get("model_agreement", 0.75))
+        elif hasattr(fc, "high_std"):
+            stds.append(fc.high_std)
+            consensus_ratios.append(getattr(fc, "consensus_ratio", 0.75))
+
+    if not stds:
+        return {
+            "regime": "unknown",
+            "min_edge": 0.05,
+            "position_scale": 1.0,
+            "reason": "No valid forecasts"
+        }
+
+    avg_std = np.mean(stds)
+    avg_consensus = np.mean(consensus_ratios)
+
+    if avg_std < 2.5 and avg_consensus > 0.85:
+        # High confidence, stable weather pattern
+        return {
+            "regime": "stable",
+            "min_edge": 0.04,  # Can trade smaller edges
+            "position_scale": 1.2,  # Slightly larger positions OK
+            "avg_std": float(avg_std),
+            "avg_consensus": float(avg_consensus),
+            "reason": f"Stable pattern: avg_std={avg_std:.1f}°F, consensus={avg_consensus:.0%}"
+        }
+    elif avg_std > 4.0 or avg_consensus < 0.6:
+        # Volatile weather, high uncertainty
+        return {
+            "regime": "volatile",
+            "min_edge": 0.07,  # Require larger edge
+            "position_scale": 0.7,  # Smaller positions
+            "avg_std": float(avg_std),
+            "avg_consensus": float(avg_consensus),
+            "reason": f"Volatile pattern: avg_std={avg_std:.1f}°F, consensus={avg_consensus:.0%}"
+        }
+    else:
+        # Normal conditions
+        return {
+            "regime": "normal",
+            "min_edge": 0.05,
+            "position_scale": 1.0,
+            "avg_std": float(avg_std),
+            "avg_consensus": float(avg_consensus),
+            "reason": f"Normal pattern: avg_std={avg_std:.1f}°F, consensus={avg_consensus:.0%}"
+        }

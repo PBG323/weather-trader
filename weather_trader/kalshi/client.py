@@ -122,6 +122,38 @@ class KalshiClient:
             "spread": yes_ask - yes_bid,
         }
 
+    async def get_order_book(self, ticker: str) -> dict:
+        """Get full order book depth for better execution analysis.
+
+        Returns order book with bid/ask levels and total liquidity.
+        Helps avoid moving the market against yourself on larger orders.
+        """
+        try:
+            data = await self._request("GET", f"/markets/{ticker}/orderbook")
+            yes_bids = data.get("yes", [])  # List of [price, size]
+            no_bids = data.get("no", [])
+
+            return {
+                "yes_bids": yes_bids,
+                "no_bids": no_bids,
+                "total_yes_liquidity": sum(b[1] for b in yes_bids) if yes_bids else 0,
+                "total_no_liquidity": sum(b[1] for b in no_bids) if no_bids else 0,
+                "best_yes_bid": yes_bids[0][0] if yes_bids else 0,
+                "best_yes_ask": 100 - no_bids[0][0] if no_bids else 100,
+                "depth_levels": len(yes_bids),
+            }
+        except Exception as e:
+            print(f"[OrderBook] Error fetching {ticker}: {e}")
+            return {
+                "yes_bids": [],
+                "no_bids": [],
+                "total_yes_liquidity": 0,
+                "total_no_liquidity": 0,
+                "best_yes_bid": 0,
+                "best_yes_ask": 100,
+                "depth_levels": 0,
+            }
+
     async def place_order(
         self,
         ticker: str,

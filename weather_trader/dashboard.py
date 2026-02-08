@@ -1353,6 +1353,99 @@ def record_price(market_id: str, price: float):
     })
 
 
+def check_price_momentum(market_id: str, window: int = 5) -> dict:
+    """
+    Detect if price is moving toward or away from fair value.
+
+    Use for entry timing:
+    - If price moving TOWARD your forecast → wait for stabilization
+    - If price moving AWAY from forecast → enter immediately
+
+    Args:
+        market_id: Market identifier
+        window: Number of recent prices to analyze
+
+    Returns:
+        Dict with momentum direction and recommendation
+    """
+    if 'price_history' not in st.session_state:
+        return {"direction": "unknown", "action": "enter", "reason": "No history"}
+
+    history = st.session_state.price_history.get(market_id, [])
+
+    if len(history) < window:
+        return {"direction": "unknown", "action": "enter", "reason": f"Need {window} prices, have {len(history)}"}
+
+    # Get recent prices
+    recent = [h["price"] for h in history[-window:]]
+    first_price = recent[0]
+    last_price = recent[-1]
+
+    # Calculate slope (price change per observation)
+    slope = (last_price - first_price) / (window - 1)
+
+    if abs(slope) < 0.005:
+        return {
+            "direction": "stable",
+            "slope": round(slope, 4),
+            "action": "enter",
+            "reason": "Price stable, good entry"
+        }
+    elif slope > 0:
+        return {
+            "direction": "rising",
+            "slope": round(slope, 4),
+            "action": "wait_if_buying_no",
+            "reason": "YES price rising, wait if buying NO"
+        }
+    else:
+        return {
+            "direction": "falling",
+            "slope": round(slope, 4),
+            "action": "wait_if_buying_yes",
+            "reason": "YES price falling, wait if buying YES"
+        }
+
+
+def get_momentum_recommendation(market_id: str, our_side: str, our_forecast: float, market_price: float) -> dict:
+    """
+    Get entry timing recommendation based on price momentum and forecast.
+
+    Args:
+        market_id: Market identifier
+        our_side: "YES" or "NO"
+        our_forecast: Our probability forecast (0-1)
+        market_price: Current market price (0-1)
+
+    Returns:
+        Dict with recommendation (enter_now, wait, or urgent)
+    """
+    momentum = check_price_momentum(market_id)
+    direction = momentum.get("direction", "unknown")
+
+    # If price is moving toward our forecast, wait for better entry
+    # If price is moving away from our forecast, enter now before it gets worse
+
+    if direction == "unknown" or direction == "stable":
+        return {"action": "enter_now", "reason": "Price stable, enter at current level"}
+
+    price_moving_toward_forecast = (
+        (direction == "rising" and our_forecast > market_price) or
+        (direction == "falling" and our_forecast < market_price)
+    )
+
+    if price_moving_toward_forecast:
+        return {
+            "action": "wait",
+            "reason": f"Price moving toward fair value ({direction}), wait for stabilization"
+        }
+    else:
+        return {
+            "action": "urgent",
+            "reason": f"Price moving away from fair value ({direction}), enter immediately"
+        }
+
+
 def _simulate_price_movement(base_price: float, condition_id: str) -> float:
     """
     Bug #13 fix: Simulate realistic price movements for demo mode.

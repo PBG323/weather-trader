@@ -528,3 +528,143 @@ def export_to_csv(filepath: str = None) -> str:
         writer.writerows(history)
 
     return filepath
+
+
+def analyze_trade_outcome(trade: Dict, actual_temp: float) -> Dict:
+    """
+    Attribute trade outcome to specific factors.
+
+    Analyzes WHY a trade won or lost to improve future decisions.
+
+    Args:
+        trade: Trade record from history
+        actual_temp: Actual temperature that settled
+
+    Returns:
+        Dict with attribution analysis
+    """
+    forecast_temp = trade.get("forecast_mean", 0)
+    forecast_error = actual_temp - forecast_temp
+
+    our_prob = trade.get("our_probability", 0.5)
+    market_prob = trade.get("entry_price", 0.5)  # Entry price approximates market prob
+
+    # Determine if outcome fell in the bracket
+    temp_low = trade.get("temp_low")
+    temp_high = trade.get("temp_high")
+
+    if temp_low is None and temp_high is not None:
+        # "or_below" bracket
+        actual_in_bracket = actual_temp <= temp_high
+    elif temp_high is None and temp_low is not None:
+        # "or_higher" bracket
+        actual_in_bracket = actual_temp >= temp_low
+    elif temp_low is not None and temp_high is not None:
+        # Range bracket
+        actual_in_bracket = temp_low <= actual_temp <= temp_high
+    else:
+        actual_in_bracket = None
+
+    # Calculate actual probability (binary for settlement)
+    actual_prob = 1.0 if actual_in_bracket else 0.0
+
+    # Was our probability estimate better than market?
+    our_error = abs(our_prob - actual_prob)
+    market_error = abs(market_prob - actual_prob)
+    edge_was_real = our_error < market_error
+
+    # Spread cost as percentage of edge
+    spread = trade.get("spread", 0.02)
+    edge = trade.get("effective_edge", 0.05)
+    spread_cost_ratio = (spread / 2) / edge if edge > 0 else 0
+
+    # Identify which model was closest (if models data available)
+    models = trade.get("models", [])
+    best_model = None
+    best_model_error = float("inf")
+
+    for model in models:
+        model_high = model.get("high", 0)
+        error = abs(model_high - actual_temp)
+        if error < best_model_error:
+            best_model_error = error
+            best_model = model.get("model", "unknown")
+
+    return {
+        "forecast_error_f": round(forecast_error, 1),
+        "was_forecast_correct": abs(forecast_error) < 2.0,
+        "actual_in_bracket": actual_in_bracket,
+        "edge_was_real": edge_was_real,
+        "our_prob_error": round(our_error, 3),
+        "market_prob_error": round(market_error, 3),
+        "spread_cost_ratio": round(spread_cost_ratio, 2),
+        "model_closest": best_model,
+        "model_closest_error": round(best_model_error, 1) if best_model else None,
+        "confidence_at_entry": trade.get("forecast_confidence", 0),
+        "lesson": _derive_lesson(forecast_error, edge_was_real, spread_cost_ratio)
+    }
+
+
+def _derive_lesson(forecast_error: float, edge_was_real: bool, spread_cost_ratio: float) -> str:
+    """Generate actionable lesson from trade outcome."""
+    lessons = []
+
+    if abs(forecast_error) > 4:
+        lessons.append("Large forecast error - review model weights")
+    elif abs(forecast_error) > 2:
+        lessons.append("Moderate forecast error - within expectations")
+    else:
+        lessons.append("Accurate forecast")
+
+    if not edge_was_real:
+        lessons.append("Market was more accurate than our forecast")
+    else:
+        lessons.append("Our edge was real")
+
+    if spread_cost_ratio > 0.5:
+        lessons.append("Spread cost ate >50% of edge - need larger edges")
+    elif spread_cost_ratio > 0.3:
+        lessons.append("Spread cost significant - consider spread in sizing")
+
+    return "; ".join(lessons)
+
+
+def get_model_performance(history: List[Dict] = None) -> Dict:
+    """
+    Analyze which models are most accurate.
+
+    Returns ranking of models by forecast accuracy.
+    """
+    if history is None:
+        history = load_trade_history()
+
+    model_errors = {}  # model_name -> list of errors
+
+    for trade in history:
+        actual = trade.get("actual_temp")
+        if actual is None:
+            continue
+
+        models = trade.get("models", [])
+        for model in models:
+            name = model.get("model", "unknown")
+            high = model.get("high", 0)
+            error = abs(high - actual)
+
+            if name not in model_errors:
+                model_errors[name] = []
+            model_errors[name].append(error)
+
+    # Calculate stats for each model
+    results = {}
+    for name, errors in model_errors.items():
+        if len(errors) >= 3:  # Need minimum sample
+            results[name] = {
+                "count": len(errors),
+                "mae": round(sum(errors) / len(errors), 2),
+                "max_error": round(max(errors), 1),
+                "min_error": round(min(errors), 1),
+            }
+
+    # Sort by MAE (lower is better)
+    return dict(sorted(results.items(), key=lambda x: x[1]["mae"]))
