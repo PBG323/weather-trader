@@ -165,9 +165,9 @@ class OpenMeteoClient:
         elif model == WeatherModel.GFS:
             endpoint = f"{self.base_url}/gfs"
         elif model == WeatherModel.GFS_ENSEMBLE:
-            # GFS Ensemble uses the ensemble endpoint
-            endpoint = f"{self.base_url}/ensemble"
-            model_param = "gfs_seamless"  # GFS ensemble member mean
+            # GFS Ensemble - use GFS endpoint (ensemble endpoint doesn't support daily aggregates)
+            # Note: True ensemble spread data requires hourly fetching
+            endpoint = f"{self.base_url}/gfs"
         elif model == WeatherModel.HRRR:
             # HRRR only available for US via forecast endpoint
             if city_config.country != "US":
@@ -303,19 +303,15 @@ class OpenMeteoClient:
 
         # Core models - always included
         # Note: HRRR only supports hourly data, not daily aggregates like temp_max
+        # Note: GFS_ENSEMBLE and ECMWF_AIFS removed - don't support daily aggregates well
         models = [
             WeatherModel.ECMWF,       # Primary: ECMWF IFS 9km
             WeatherModel.GFS,         # Secondary: GFS 27km
-            WeatherModel.GFS_ENSEMBLE,  # Probabilistic: GFS ensemble mean
         ]
 
         # US-specific models
         if city_config.country == "US":
             models.append(WeatherModel.BEST_MATCH)  # Open-Meteo auto-blend
-
-        # Experimental models (can be disabled if causing issues)
-        if include_experimental:
-            models.append(WeatherModel.ECMWF_AIFS)  # AI-powered forecast
 
         for model in models:
             try:

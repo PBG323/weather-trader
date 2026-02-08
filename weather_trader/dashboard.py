@@ -43,7 +43,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from weather_trader.config import get_all_cities, get_city_config, config
-from weather_trader.apis import OpenMeteoClient, TomorrowIOClient, NWSClient
+from weather_trader.apis import OpenMeteoClient, TomorrowIOClient, NWSClient, VisualCrossingClient
 from weather_trader.models import EnsembleForecaster, BiasCorrector
 from weather_trader.models.ensemble import ModelForecast
 from weather_trader.kalshi import KalshiMarketFinder, KalshiAuth, KalshiClient, SameDayTradingChecker
@@ -1357,9 +1357,13 @@ def _simulate_price_movement(base_price: float, condition_id: str) -> float:
     Uses mean reversion + random walk to create realistic price dynamics.
     Prices tend to drift toward fair value but with noise.
     """
+    # Use separate key for simulation state to avoid conflict with price_history lists
+    sim_key = f"_sim_{condition_id}"
+    sim_prev_key = f"_sim_{condition_id}_prev"
+
     # Get previous price if exists, otherwise use base
-    price_history = st.session_state.get("price_history", {})
-    prev_price = price_history.get(condition_id, base_price)
+    price_sim = st.session_state.get("price_simulation", {})
+    prev_price = price_sim.get(sim_key, base_price)
 
     # Mean reversion factor (pull toward fair value)
     mean_reversion = 0.1 * (base_price - prev_price)
@@ -1368,7 +1372,7 @@ def _simulate_price_movement(base_price: float, condition_id: str) -> float:
     random_walk = random.gauss(0, 0.02)  # 2% std dev
 
     # Momentum component (slight trend continuation)
-    momentum = 0.3 * (prev_price - price_history.get(f"{condition_id}_prev", prev_price))
+    momentum = 0.3 * (prev_price - price_sim.get(sim_prev_key, prev_price))
 
     # Calculate new price
     new_price = prev_price + mean_reversion + random_walk + momentum
@@ -1376,11 +1380,11 @@ def _simulate_price_movement(base_price: float, condition_id: str) -> float:
     # Clamp to valid range
     new_price = max(0.01, min(0.99, new_price))
 
-    # Store for next iteration
-    if "price_history" not in st.session_state:
-        st.session_state.price_history = {}
-    st.session_state.price_history[f"{condition_id}_prev"] = prev_price
-    st.session_state.price_history[condition_id] = new_price
+    # Store for next iteration in separate simulation state
+    if "price_simulation" not in st.session_state:
+        st.session_state.price_simulation = {}
+    st.session_state.price_simulation[sim_prev_key] = prev_price
+    st.session_state.price_simulation[sim_key] = new_price
 
     return new_price
 
@@ -1713,6 +1717,19 @@ async def _fetch_forecasts_with_models():
         except Exception as e:
             print(f"NWS client init error: {e}")
 
+        # Create Visual Crossing client for backup/validation forecasts
+        vc_client = None
+        try:
+            vc_client = VisualCrossingClient()
+            if vc_client.is_configured():
+                await vc_client.__aenter__()
+                print(f"[Visual Crossing] API configured, {vc_client.get_remaining_calls()} calls remaining today")
+            else:
+                vc_client = None
+        except Exception as e:
+            print(f"Visual Crossing client init error: {e}")
+            vc_client = None
+
         try:
             for city_key in get_all_cities():
                 city_config = get_city_config(city_key)
@@ -1727,6 +1744,19 @@ async def _fetch_forecasts_with_models():
                             tm_call_count += 1
                         except Exception as e:
                             print(f"Tomorrow.io error for {city_key}: {e}")
+
+                    # Fetch Visual Crossing forecasts (backup/validation source)
+                    vc_forecasts_by_date = {}
+                    if vc_client:
+                        try:
+                            vc_forecasts = await vc_client.get_forecast(city_config, days=5)
+                            for f in vc_forecasts:
+                                vc_forecasts_by_date[f.date] = {
+                                    "high": f.temperature_high,
+                                    "low": f.temperature_low
+                                }
+                        except Exception as e:
+                            print(f"Visual Crossing error for {city_key}: {e}")
 
                     # Fetch NWS point forecasts (US cities only)
                     nws_forecasts_by_date = {}
@@ -1838,6 +1868,20 @@ async def _fetch_forecasts_with_models():
                                 "low": nws_low
                             })
 
+                        # Add Visual Crossing forecast for this date (backup source)
+                        if target_date in vc_forecasts_by_date:
+                            vc_data = vc_forecasts_by_date[target_date]
+                            model_forecasts.append(ModelForecast(
+                                model_name="visual_crossing",
+                                forecast_high=vc_data["high"],
+                                forecast_low=vc_data["low"],
+                            ))
+                            model_details.append({
+                                "model": "visual_crossing",
+                                "high": vc_data["high"],
+                                "low": vc_data["low"]
+                            })
+
                         if model_forecasts:
                             ens = ensemble.create_ensemble(
                                 city_config, model_forecasts, target_date,
@@ -1848,6 +1892,7 @@ async def _fetch_forecasts_with_models():
                             model_names = [m["model"] for m in model_details]
                             has_tomorrow_io = "tomorrow.io" in model_names
                             has_nws = "nws" in model_names
+                            has_visual_crossing = "visual_crossing" in model_names
 
                             confidence_breakdown = {
                                 "ensemble_confidence": float(ens.confidence),
@@ -1855,6 +1900,7 @@ async def _fetch_forecasts_with_models():
                                 "model_count_desc": f"{ens.model_count} models ({', '.join(model_names)})",
                                 "has_tomorrow_io": has_tomorrow_io,
                                 "has_nws": has_nws,
+                                "has_visual_crossing": has_visual_crossing,
                                 "high_std": float(ens.high_std),
                                 "std_desc": f"Forecast uncertainty: ±{ens.high_std:.1f}°F",
                                 "final_confidence": float(ens.confidence),
@@ -1920,6 +1966,8 @@ async def _fetch_forecasts_with_models():
                     print(f"Tomorrow.io: {tm_call_count} city calls (#{_tomorrow_io_calls_today} today)")
             if nws_client:
                 await nws_client.__aexit__(None, None, None)
+            if vc_client:
+                await vc_client.__aexit__(None, None, None)
 
     city_count = len([k for k in forecasts if '_' not in k or not k.split('_')[-1][:4].isdigit()])
     date_count = len([k for k in forecasts if '_' in k and k.split('_')[-1][:4].isdigit()])

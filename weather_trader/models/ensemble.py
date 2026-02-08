@@ -208,12 +208,15 @@ def estimate_skew(values: np.ndarray) -> float:
 # GFS and Tomorrow.io weighted higher for US weather markets
 # ECMWF reduced due to larger spread/variance observed
 DEFAULT_WEIGHTS = {
-    "ecmwf": 0.8,   # Reduced - shows larger spread
-    "gfs": 1.2,     # Increased - good for US
-    "hrrr": 1.3,    # Best for short-term US
+    "ecmwf": 0.8,         # Reduced - shows larger spread
+    "ecmwf_aifs": 1.0,    # ECMWF AI model - experimental, equal weight
+    "gfs": 1.2,           # Increased - good for US
+    "gfs_ensemble": 1.1,  # GFS ensemble mean - probabilistic
+    "hrrr": 1.3,          # Best for short-term US
     "best_match": 1.0,
-    "tomorrow.io": 1.4,  # Tomorrow.io strong for US cities
-    "nws": 1.1,     # NWS point forecast - local expertise
+    "tomorrow.io": 1.4,   # Tomorrow.io strong for US cities
+    "nws": 1.1,           # NWS point forecast - local expertise
+    "visual_crossing": 1.0,  # Visual Crossing - backup/validation source
     "unknown": 0.7,
 }
 
