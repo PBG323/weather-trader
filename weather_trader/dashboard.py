@@ -47,7 +47,10 @@ from weather_trader.apis import OpenMeteoClient, TomorrowIOClient, NWSClient, Vi
 from weather_trader.models import EnsembleForecaster, BiasCorrector
 from weather_trader.models.ensemble import ModelForecast
 from weather_trader.kalshi import KalshiMarketFinder, KalshiAuth, KalshiClient, SameDayTradingChecker
-from weather_trader.strategy import ExpectedValueCalculator
+# Note: Signal generation is done inline in generate_signals_from_data() with:
+# - Spread-adjusted edge (lines 2500-2544)
+# - Volume/liquidity filtering (lines 2465-2474)
+# - Skew-normal probabilities via ensemble.py
 from weather_trader.trading import (
     TradingConfig, PositionManager, RiskManager, ExecutionEngine,
     AutoTrader, PnLTracker, Position, ExitReason, PositionStatus
