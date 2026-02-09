@@ -7,6 +7,7 @@ Supports:
 - Tomorrow.io: Proprietary hyperlocal forecasts
 - NWS: Official settlement source data
 - NOAA CDO: Historical climate data for bias analysis
+- Aviation Weather: METAR/TAF real-time observations (pilot edge)
 """
 
 from .open_meteo import OpenMeteoClient, WeatherModel, reset_rate_limit as _reset_open_meteo
@@ -14,6 +15,12 @@ from .visual_crossing import VisualCrossingClient, reset_rate_limit as _reset_vi
 from .tomorrow_io import TomorrowIOClient
 from .nws import NWSClient
 from .noaa_cdo import NOAACDOClient
+from .aviation_weather import (
+    AviationWeatherClient,
+    METARObservation,
+    CITY_AIRPORTS,
+    get_aviation_edge,
+)
 
 
 def reset_all_api_state():
@@ -27,7 +34,7 @@ def reset_all_api_state():
     _reset_open_meteo()
     # Reset Visual Crossing daily counter
     _reset_visual_crossing()
-    # Note: Tomorrow.io and NWS don't have module-level rate limit state
+    # Note: Tomorrow.io, NWS, and Aviation don't have module-level rate limit state
 
 
 __all__ = [
@@ -37,5 +44,9 @@ __all__ = [
     "TomorrowIOClient",
     "NWSClient",
     "NOAACDOClient",
+    "AviationWeatherClient",
+    "METARObservation",
+    "CITY_AIRPORTS",
+    "get_aviation_edge",
     "reset_all_api_state",
 ]

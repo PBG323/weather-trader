@@ -65,6 +65,16 @@ from weather_trader.trade_history import (
     log_trade, update_settlement, get_unsettled_trades, analyze_performance,
     get_recent_trades, export_to_csv
 )
+# Advanced strategies: Laddering, Tail hunting, Forecast alerts
+from weather_trader.strategy import (
+    generate_temperature_ladder,
+    find_tail_opportunities,
+    calculate_bankroll_allocation,
+    score_model_consensus,
+    ForecastAlertMonitor,
+    AlertPriority,
+)
+from weather_trader.apis import AviationWeatherClient, get_aviation_edge, CITY_AIRPORTS
 
 # Page config
 st.set_page_config(
@@ -3992,10 +4002,11 @@ def main():
     st.markdown("---")
 
     # Tabs
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
         "📊 Overview",
         "🌡️ Forecasts",
         "📈 Markets",
+        "🎯 Advanced",
         "🔬 Model Comparison",
         "📅 Multi-Day",
         "💰 Trades & P/L",
@@ -4605,9 +4616,214 @@ def main():
             st.info("Enable Demo Mode in the sidebar to test with simulated markets, or check if Kalshi has active weather markets.")
 
     # =====================
-    # TAB 4: Model Comparison
+    # TAB 4: Advanced Strategies (Ladder, Tail, Aviation)
     # =====================
     with tab4:
+        st.header("🎯 Advanced Trading Strategies")
+        st.caption("Temperature laddering, tail bracket hunting, and real-time aviation observations")
+
+        # Strategy allocation settings
+        st.subheader("📊 Bankroll Allocation")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            core_pct = st.slider("Core Strategy %", 40, 80, 60, 5) / 100
+        with col2:
+            ladder_pct = st.slider("Ladder Strategy %", 10, 40, 25, 5) / 100
+        with col3:
+            tail_pct = st.slider("Tail Hunting %", 5, 30, 15, 5) / 100
+
+        # Normalize if they don't sum to 1
+        total_pct = core_pct + ladder_pct + tail_pct
+        if abs(total_pct - 1.0) > 0.01:
+            st.warning(f"Allocations sum to {total_pct*100:.0f}% - will be normalized")
+            core_pct, ladder_pct, tail_pct = core_pct/total_pct, ladder_pct/total_pct, tail_pct/total_pct
+
+        allocation = calculate_bankroll_allocation(bankroll, core_pct, ladder_pct, tail_pct)
+
+        alloc_cols = st.columns(3)
+        with alloc_cols[0]:
+            st.metric("Core Strategy", f"${allocation['core']['allocation']:.2f}", f"{allocation['core']['percentage']*100:.0f}%")
+        with alloc_cols[1]:
+            st.metric("Ladder Strategy", f"${allocation['ladder']['allocation']:.2f}", f"{allocation['ladder']['percentage']*100:.0f}%")
+        with alloc_cols[2]:
+            st.metric("Tail Hunting", f"${allocation['tail']['allocation']:.2f}", f"{allocation['tail']['percentage']*100:.0f}%")
+
+        st.markdown("---")
+
+        # Real-time Aviation Weather (Pilot Edge)
+        st.subheader("✈️ Aviation Weather (METAR)")
+        st.caption("Real-time observations from airport weather stations - the 'pilot edge'")
+
+        if st.button("🔄 Fetch Live METAR Data"):
+            with st.spinner("Fetching aviation weather..."):
+                async def fetch_aviation():
+                    async with AviationWeatherClient() as client:
+                        return await client.get_all_city_temperatures()
+
+                try:
+                    aviation_data = run_async(fetch_aviation())
+                    if aviation_data:
+                        metar_cols = st.columns(4)
+                        for i, (city, data) in enumerate(aviation_data.items()):
+                            with metar_cols[i % 4]:
+                                freshness = "🟢" if data.get("is_fresh") else "🟡"
+                                st.markdown(f"""
+                                **{city.upper()}** {freshness}
+                                - Temp: **{data['temperature_f']:.1f}°F**
+                                - Station: {data['station']}
+                                - Age: {data['age_minutes']} min
+                                """)
+                    else:
+                        st.info("No aviation data available")
+                except Exception as e:
+                    st.error(f"Failed to fetch aviation data: {e}")
+
+        st.markdown("---")
+
+        # Tail Bracket Opportunities
+        st.subheader("🎲 Tail Bracket Opportunities")
+        st.caption("Low-probability, high-return opportunities (10x+ potential)")
+
+        tail_min_return = st.slider("Minimum Return Multiple", 3, 20, 5)
+        tail_max_price = st.slider("Max YES Price (cents)", 5, 20, 15) / 100
+        tail_min_consensus = st.slider("Min Models Agreeing", 2, 5, 3)
+
+        if forecasts and markets:
+            # Convert forecasts to EnsembleForecast objects if needed
+            ensemble_forecasts = {}
+            for city_key, fc in forecasts.items():
+                if hasattr(fc, 'high_mean'):
+                    ensemble_forecasts[city_key] = fc
+                elif isinstance(fc, dict) and 'high_mean' in fc:
+                    # Create a simple mock object with required attributes
+                    class MockForecast:
+                        def __init__(self, d):
+                            self.high_mean = d.get('high_mean', 50)
+                            self.high_std = d.get('high_std', 2)
+                            self.consensus_ratio = d.get('confidence', 0.8)
+                            self.model_count = 5
+                            self.date = d.get('date', today_est())
+                            self.model_forecasts = []
+                        def get_probability_in_range(self, low, high):
+                            return stats.norm.cdf(high, self.high_mean, self.high_std) - stats.norm.cdf(low, self.high_mean, self.high_std)
+                        def get_probability_below(self, threshold):
+                            return stats.norm.cdf(threshold, self.high_mean, self.high_std)
+                        def get_probability_above(self, threshold):
+                            return 1 - stats.norm.cdf(threshold, self.high_mean, self.high_std)
+                    ensemble_forecasts[city_key] = MockForecast(fc)
+
+            if ensemble_forecasts:
+                # Format markets for tail scanner
+                formatted_markets = []
+                for m in markets:
+                    formatted_markets.append({
+                        "city_key": m.get("city_key", ""),
+                        "brackets": [m] if "yes_price" in m else m.get("brackets", []),
+                    })
+
+                tail_opps = find_tail_opportunities(
+                    markets=formatted_markets,
+                    forecasts=ensemble_forecasts,
+                    min_potential_return=float(tail_min_return),
+                    max_yes_price=tail_max_price,
+                    min_consensus_models=tail_min_consensus,
+                )
+
+                if tail_opps:
+                    st.success(f"Found {len(tail_opps)} tail opportunities!")
+                    tail_data = []
+                    for opp in tail_opps[:10]:  # Top 10
+                        tail_data.append({
+                            "Bracket": opp.bracket_desc,
+                            "Side": opp.side,
+                            "Price": f"{opp.market_price*100:.0f}¢",
+                            "Our Prob": f"{opp.our_probability*100:.1f}%",
+                            "Edge": f"{opp.edge*100:+.1f}%",
+                            "Return": f"{opp.potential_return:.0f}x",
+                            "Models": f"{opp.models_agreeing}",
+                            "Score": f"{opp.confidence_score:.2f}",
+                        })
+                    st.dataframe(pd.DataFrame(tail_data), use_container_width=True, hide_index=True)
+
+                    # Show recommendation for top opportunity
+                    if tail_opps:
+                        top = tail_opps[0]
+                        st.info(f"**Top Opportunity:** {top.recommendation}")
+                else:
+                    st.info("No tail opportunities found with current filters. Try adjusting thresholds.")
+            else:
+                st.warning("No forecast data available for tail analysis")
+        else:
+            st.warning("Markets or forecasts not available")
+
+        st.markdown("---")
+
+        # Temperature Laddering
+        st.subheader("🪜 Temperature Laddering")
+        st.caption("Spread bets across multiple temperature brackets (Neobrother style)")
+
+        ladder_city = st.selectbox("Select City for Ladder", list(get_all_cities().keys()))
+        ladder_allocation = st.number_input("Ladder Allocation ($)", 50, 5000, int(allocation['ladder']['allocation']))
+
+        if st.button("Generate Ladder Strategy") and forecasts and markets:
+            fc = forecasts.get(ladder_city)
+            if fc:
+                # Get brackets for this city
+                city_brackets = [m for m in markets if m.get("city_key", "").lower() == ladder_city.lower()]
+
+                if city_brackets:
+                    # Create mock forecast if needed
+                    if isinstance(fc, dict):
+                        class MockForecast:
+                            def __init__(self, d):
+                                self.high_mean = d.get('high_mean', 50)
+                                self.high_std = d.get('high_std', 2)
+                                self.city = d.get('city', ladder_city)
+                                self.date = d.get('date', today_est())
+                            def get_probability_in_range(self, low, high):
+                                return stats.norm.cdf(high, self.high_mean, self.high_std) - stats.norm.cdf(low, self.high_mean, self.high_std)
+                            def get_probability_below(self, threshold):
+                                return stats.norm.cdf(threshold, self.high_mean, self.high_std)
+                            def get_probability_above(self, threshold):
+                                return 1 - stats.norm.cdf(threshold, self.high_mean, self.high_std)
+                        fc_obj = MockForecast(fc)
+                    else:
+                        fc_obj = fc
+
+                    ladder = generate_temperature_ladder(
+                        forecast=fc_obj,
+                        available_brackets=city_brackets,
+                        total_allocation=float(ladder_allocation),
+                        max_rungs=7,
+                    )
+
+                    if ladder.positions:
+                        st.success(f"Generated {len(ladder.positions)} ladder positions")
+                        ladder_data = []
+                        for pos in ladder.positions:
+                            ladder_data.append({
+                                "Bracket": pos.temp_bracket,
+                                "Allocation": f"${pos.allocation_pct * ladder_allocation:.2f}",
+                                "Target Price": f"{pos.target_price*100:.0f}¢",
+                                "Max Price": f"{pos.max_price*100:.0f}¢",
+                                "Our Prob": f"{pos.our_probability*100:.1f}%",
+                                "Potential": f"{pos.potential_return:.0f}x",
+                            })
+                        st.dataframe(pd.DataFrame(ladder_data), use_container_width=True, hide_index=True)
+
+                        # Show expected value
+                        st.metric("Ladder Expected Value", f"${ladder.expected_value:.2f}")
+                    else:
+                        st.warning("No suitable brackets found for laddering")
+                else:
+                    st.warning(f"No market brackets found for {ladder_city}")
+            else:
+                st.warning(f"No forecast available for {ladder_city}")
+
+    # =====================
+    # TAB 5: Model Comparison
+    # =====================
+    with tab5:
         st.header("🔬 Model Comparison")
         st.caption("Comparing forecasts from ECMWF, GFS, HRRR, Tomorrow.io, and Best Match models")
 
@@ -4757,9 +4973,9 @@ def main():
             st.caption("Tomorrow.io API key not configured. Add TOMORROW_IO_API_KEY to .env for additional model data.")
 
     # =====================
-    # TAB 5: Multi-Day
+    # TAB 6: Multi-Day
     # =====================
-    with tab5:
+    with tab6:
         st.header("📅 7-Day Forecast")
 
         if multi_day:
@@ -4800,9 +5016,9 @@ def main():
                 }), use_container_width=True)
 
     # =====================
-    # TAB 6: Trades & P/L
+    # TAB 7: Trades & P/L
     # =====================
-    with tab6:
+    with tab7:
         st.header("💰 Trades & P/L")
 
         # Note: Position prices are already updated in the main flow
@@ -5038,9 +5254,9 @@ def main():
             st.info("No trades recorded yet")
 
     # =====================
-    # TAB 7: Price Charts
+    # TAB 8: Price Charts
     # =====================
-    with tab7:
+    with tab8:
         st.header("📉 Price History")
 
         if st.session_state.price_history:
@@ -5065,9 +5281,9 @@ def main():
             st.plotly_chart(fig, use_container_width=True)
 
     # =====================
-    # TAB 8: Alerts
+    # TAB 9: Alerts
     # =====================
-    with tab8:
+    with tab9:
         st.header("🔔 Alerts")
 
         col1, col2 = st.columns([3, 1])
@@ -5110,9 +5326,9 @@ def main():
             st.info("No alerts yet")
 
     # =====================
-    # TAB 9: Scheduler
+    # TAB 10: Scheduler
     # =====================
-    with tab9:
+    with tab10:
         st.header("⏰ Scheduler Control")
 
         # Load current state
@@ -5309,9 +5525,9 @@ def main():
         )
 
     # =========================================================================
-    # TAB 10: Trade History & Analytics
+    # TAB 11: Trade History & Analytics
     # =========================================================================
-    with tab10:
+    with tab11:
         st.header("📚 Trade History & Performance Analytics")
 
         st.markdown("""
