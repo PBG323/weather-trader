@@ -10,17 +10,43 @@ The ensemble approach outperforms any single model because:
 1. Different models have different strengths
 2. Combining reduces individual model errors
 3. Spread of forecasts indicates uncertainty
+
+For same-day trading, we use Bayesian conditioning on METAR observations:
+- Observations provide a hard floor (high cannot be below current temp)
+- Time-of-day determines how much additional warming is possible
+- City-specific afternoon warming patterns refine estimates
 """
 
 from dataclasses import dataclass, field
-from datetime import datetime, date
+from datetime import datetime, date, time
 from typing import Optional
+from zoneinfo import ZoneInfo
 import numpy as np
 from scipy import stats
-from scipy.stats import skewnorm
+from scipy.stats import skewnorm, truncnorm
 
 from ..config import CityConfig
 from .bias_correction import BiasCorrector, CorrectedForecast
+
+
+# Timezone for US weather markets
+EST = ZoneInfo("America/New_York")
+
+# City-specific afternoon warming patterns (degrees F typically gained after observation)
+# Based on climatology: how much does temp typically rise from current hour to daily max
+# Format: {city: {hour: expected_additional_warming}}
+AFTERNOON_WARMING = {
+    "nyc": {8: 8, 9: 7, 10: 6, 11: 4, 12: 3, 13: 2, 14: 1, 15: 0.5, 16: 0, 17: 0},
+    "chicago": {8: 9, 9: 8, 10: 6, 11: 5, 12: 3, 13: 2, 14: 1, 15: 0.5, 16: 0, 17: 0},
+    "miami": {8: 6, 9: 5, 10: 4, 11: 3, 12: 2, 13: 1.5, 14: 1, 15: 0.5, 16: 0, 17: 0},
+    "la": {8: 10, 9: 9, 10: 7, 11: 5, 12: 4, 13: 3, 14: 2, 15: 1, 16: 0.5, 17: 0},
+    "denver": {8: 12, 9: 10, 10: 8, 11: 6, 12: 4, 13: 3, 14: 2, 15: 1, 16: 0, 17: 0},
+    "philadelphia": {8: 8, 9: 7, 10: 6, 11: 4, 12: 3, 13: 2, 14: 1, 15: 0.5, 16: 0, 17: 0},
+    "austin": {8: 10, 9: 9, 10: 7, 11: 5, 12: 4, 13: 3, 14: 2, 15: 1, 16: 0.5, 17: 0},
+}
+
+# Default warming pattern for cities not explicitly defined
+DEFAULT_WARMING = {8: 8, 9: 7, 10: 6, 11: 4, 12: 3, 13: 2, 14: 1, 15: 0.5, 16: 0, 17: 0}
 
 
 @dataclass
@@ -174,114 +200,315 @@ class EnsembleForecast:
         self,
         observed_temp: float,
         observation_age_minutes: int = 60,
+        observation_hour: Optional[int] = None,
+        city_key: Optional[str] = None,
         is_same_day: bool = True,
     ) -> "EnsembleForecast":
         """
-        Create an adjusted forecast based on real-time METAR observation.
+        Bayesian update of forecast using real-time METAR observation.
 
-        For same-day trading, current observations constrain the distribution:
-        - The final high CANNOT be below the current observed temp
-        - If observed temp exceeds forecast mean, shift the distribution up
-        - Reduce uncertainty since we have real data
+        Uses truncated normal distribution for statistically rigorous probability
+        calculations. The observation provides a HARD FLOOR - the daily high
+        cannot be below the current observed temperature.
 
-        This is the "pilot edge" - using actual sensor readings to improve
-        probability estimates before market close.
+        Key insight: P(high | forecast, observation) ≠ P(high | forecast)
+
+        The posterior distribution is:
+        1. Truncated at observed_temp (hard floor)
+        2. Mean shifted based on observation vs forecast delta
+        3. Std reduced based on time-of-day (less uncertainty later)
+        4. City-specific afternoon warming patterns applied
 
         Args:
             observed_temp: Current observed temperature in Fahrenheit
             observation_age_minutes: How old the observation is
+            observation_hour: Hour of observation (0-23, EST). Auto-detected if None.
+            city_key: City identifier for warming patterns. Uses default if None.
             is_same_day: Whether this is for same-day bracket trading
 
         Returns:
-            New EnsembleForecast with adjusted probabilities
+            New EnsembleForecast with Bayesian-updated probabilities
         """
-        from copy import deepcopy
-
-        # Don't adjust if observation is too old
+        # Don't adjust if observation is too old (>3 hours)
         if observation_age_minutes > 180:
             return self
 
-        # Calculate how much the observation exceeds or falls short of forecast
-        diff = observed_temp - self.high_mean
+        # Get current hour if not provided
+        if observation_hour is None:
+            now = datetime.now(EST)
+            observation_hour = now.hour
 
-        # Observation freshness factor (fresher = more weight)
-        # 0 min = 1.0, 60 min = 0.8, 120 min = 0.6, 180 min = 0.4
-        freshness = max(0.4, 1.0 - (observation_age_minutes / 300))
+        # For non-same-day, observations are informational only
+        if not is_same_day:
+            return self
 
-        # For same-day trading, the key insight is:
-        # If current temp at 2pm is 72°F, the daily high CANNOT be below 72°F
-        # So we need to shift the mean and truncate the distribution
+        # === BAYESIAN UPDATE FOR SAME-DAY TRADING ===
 
-        if is_same_day:
-            # Shift the mean towards observed temp
-            # More weight to observation as it gets later in the day and fresher
-            shift_weight = freshness * 0.5  # Max 50% shift towards observation
-            new_high_mean = self.high_mean + (diff * shift_weight)
+        # 1. HARD FLOOR: The high CANNOT be below current observation
+        floor_temp = observed_temp
 
-            # Floor the mean at observed temp (can't go lower than what we've seen)
-            new_high_mean = max(new_high_mean, observed_temp)
+        # 2. EXPECTED ADDITIONAL WARMING based on time of day and city
+        city_lower = (city_key or self.city or "").lower()
+        warming_schedule = AFTERNOON_WARMING.get(city_lower, DEFAULT_WARMING)
 
-            # Reduce uncertainty since we have real data
-            # The later in the day, the less uncertainty remains
-            uncertainty_reduction = freshness * 0.3  # Up to 30% reduction
-            new_high_std = self.high_std * (1 - uncertainty_reduction)
+        # Get expected additional warming from current hour to daily max
+        # Daily max typically occurs between 2-5pm depending on city
+        expected_additional = warming_schedule.get(observation_hour, 0)
 
-            # Adjust skew based on observation vs forecast
-            # If observed > forecast, distribution should skew warm (positive)
-            # If observed < forecast, distribution should skew cold (negative)
-            skew_adjustment = np.clip(diff / 5.0, -1.0, 1.0) * freshness
-            new_high_skew = self.high_skew + skew_adjustment
+        # Add uncertainty to the additional warming estimate
+        # Earlier in day = more uncertainty about afternoon warming
+        warming_uncertainty = max(0.5, expected_additional * 0.3)
 
-            # Increase confidence when observation confirms forecast
-            if abs(diff) <= 2.0:
-                # Observation within 2°F of forecast - boost confidence
-                confidence_boost = freshness * 0.1
-            elif abs(diff) <= 4.0:
-                # Observation within 4°F - slight boost
-                confidence_boost = freshness * 0.05
-            else:
-                # Observation differs significantly - reduce confidence slightly
-                # (but the adjusted mean is now more accurate)
-                confidence_boost = -0.05
+        # 3. POSTERIOR MEAN CALCULATION
+        # The posterior mean is influenced by:
+        # a) Original forecast (prior)
+        # b) Current observation + expected additional warming (likelihood)
 
-            new_confidence = min(0.98, self.confidence + confidence_boost)
-
-            # Recalculate confidence intervals
-            z_90 = 1.645
-            new_ci_lower = max(observed_temp, new_high_mean - z_90 * new_high_std)
-            new_ci_upper = new_high_mean + z_90 * new_high_std
-
+        # Weight observation more heavily as day progresses
+        # 8am: 30% observation weight, 3pm: 90% observation weight
+        if observation_hour <= 8:
+            obs_weight = 0.3
+        elif observation_hour >= 15:
+            obs_weight = 0.9
         else:
-            # For next-day trading, observations are informational but don't
-            # directly constrain the forecast
-            new_high_mean = self.high_mean
-            new_high_std = self.high_std
-            new_high_skew = self.high_skew
-            new_confidence = self.confidence
-            new_ci_lower = self.high_ci_lower
-            new_ci_upper = self.high_ci_upper
+            # Linear interpolation from 8am to 3pm
+            obs_weight = 0.3 + (observation_hour - 8) * (0.6 / 7)
 
-        # Create adjusted forecast
-        return EnsembleForecast(
+        # Observation-based estimate of final high
+        obs_estimated_high = observed_temp + expected_additional
+
+        # Bayesian posterior mean (weighted combination)
+        posterior_mean = (1 - obs_weight) * self.high_mean + obs_weight * obs_estimated_high
+
+        # Ensure posterior mean is at least the floor
+        posterior_mean = max(posterior_mean, floor_temp + 0.5)
+
+        # 4. POSTERIOR STD CALCULATION
+        # Uncertainty decreases as we get more data through the day
+        # Also incorporates warming uncertainty
+
+        # Base reduction: later in day = less uncertainty
+        if observation_hour <= 8:
+            std_reduction = 0.1  # 10% reduction at 8am
+        elif observation_hour >= 16:
+            std_reduction = 0.7  # 70% reduction at 4pm (near daily max)
+        else:
+            std_reduction = 0.1 + (observation_hour - 8) * (0.6 / 8)
+
+        # Posterior std combines reduced forecast uncertainty with warming uncertainty
+        reduced_forecast_std = self.high_std * (1 - std_reduction)
+        posterior_std = np.sqrt(reduced_forecast_std**2 + warming_uncertainty**2)
+
+        # Minimum std floor (some uncertainty always remains)
+        posterior_std = max(posterior_std, 0.8)
+
+        # 5. SKEW ADJUSTMENT
+        # If observation is running hot, distribution should skew warm
+        diff = observed_temp - self.high_mean
+        if diff > 2:
+            # Running hot - positive skew (warm tail)
+            posterior_skew = min(self.high_skew + 0.5, 2.0)
+        elif diff < -2:
+            # Running cold - but floor constrains, so slight negative skew
+            posterior_skew = max(self.high_skew - 0.3, -1.0)
+        else:
+            # Confirming forecast - reduce skew toward normal
+            posterior_skew = self.high_skew * 0.7
+
+        # 6. CONFIDENCE UPDATE
+        # Confidence increases when we have real data
+        # But decreases if observation conflicts significantly with forecast
+
+        if abs(diff) <= 1.5:
+            # Observation confirms forecast - high confidence
+            confidence_boost = 0.15 * obs_weight
+        elif abs(diff) <= 3.0:
+            # Minor deviation - moderate confidence boost
+            confidence_boost = 0.08 * obs_weight
+        elif abs(diff) <= 5.0:
+            # Significant deviation - small boost (we have data, just unexpected)
+            confidence_boost = 0.03 * obs_weight
+        else:
+            # Major deviation - slight reduction (something unusual happening)
+            confidence_boost = -0.05
+
+        posterior_confidence = min(0.98, max(0.5, self.confidence + confidence_boost))
+
+        # 7. CONFIDENCE INTERVALS (accounting for truncation)
+        z_90 = 1.645
+        ci_lower = max(floor_temp, posterior_mean - z_90 * posterior_std)
+        ci_upper = posterior_mean + z_90 * posterior_std
+
+        # Create conditioned forecast
+        return ObservationConditionedForecast(
             date=self.date,
             city=self.city,
-            high_mean=new_high_mean,
-            high_median=max(self.high_median, observed_temp) if is_same_day else self.high_median,
+            high_mean=posterior_mean,
+            high_median=max(self.high_median, floor_temp + expected_additional * 0.5),
             low_mean=self.low_mean,
             low_median=self.low_median,
-            high_std=new_high_std,
+            high_std=posterior_std,
             low_std=self.low_std,
-            high_ci_lower=new_ci_lower,
-            high_ci_upper=new_ci_upper,
+            high_ci_lower=ci_lower,
+            high_ci_upper=ci_upper,
             low_ci_lower=self.low_ci_lower,
             low_ci_upper=self.low_ci_upper,
             model_count=self.model_count,
             model_forecasts=self.model_forecasts,
-            confidence=new_confidence,
-            high_skew=new_high_skew,
+            confidence=posterior_confidence,
+            high_skew=posterior_skew,
             low_skew=self.low_skew,
             consensus_ratio=self.consensus_ratio,
+            # Observation-specific fields
+            observation_floor=floor_temp,
+            observed_temp=observed_temp,
+            observation_hour=observation_hour,
+            expected_additional_warming=expected_additional,
+            obs_weight=obs_weight,
         )
+
+
+@dataclass
+class ObservationConditionedForecast(EnsembleForecast):
+    """
+    Forecast conditioned on real-time METAR observation.
+
+    Extends EnsembleForecast with:
+    1. Truncated normal distribution (floor at observed temp)
+    2. Observation metadata for transparency
+    3. Specialized probability calculations accounting for truncation
+
+    This provides statistically rigorous probability calculations that
+    properly account for the constraint that high >= observed_temp.
+    """
+    # Observation-specific fields
+    observation_floor: float = 0.0  # Hard floor (observed temp)
+    observed_temp: float = 0.0
+    observation_hour: int = 12
+    expected_additional_warming: float = 0.0
+    obs_weight: float = 0.5
+
+    def get_probability_above(self, threshold: float, for_high: bool = True) -> float:
+        """
+        Calculate P(high > threshold) using truncated normal distribution.
+
+        The distribution is truncated at the observation floor since the
+        daily high cannot be below what's already been observed.
+
+        Args:
+            threshold: Temperature threshold in Fahrenheit
+            for_high: If True, calculate for daily high; if False, for daily low
+
+        Returns:
+            Probability (0-1) of exceeding threshold
+        """
+        if not for_high:
+            # Low temperature not affected by high temp observation
+            return super().get_probability_above(threshold, for_high=False)
+
+        # For high temperature with observation, use truncated normal
+        floor = self.observation_floor
+        mean = self.high_mean
+        std = max(self.high_std, 0.5)
+
+        # If threshold is below floor, probability is 1.0
+        # (we know the high is at least the floor)
+        if threshold <= floor:
+            return 1.0
+
+        # Use truncated normal: X ~ TruncNorm(mean, std, a=floor, b=inf)
+        # P(X > threshold) = 1 - P(X <= threshold)
+
+        # Standardize for truncnorm
+        a = (floor - mean) / std  # Lower bound in standard units
+        b = np.inf  # No upper bound
+
+        # Create truncated normal distribution
+        try:
+            trunc_dist = truncnorm(a=a, b=b, loc=mean, scale=std)
+            prob = 1 - trunc_dist.cdf(threshold)
+        except Exception:
+            # Fallback to regular normal if truncnorm fails
+            prob = 1 - stats.norm.cdf(threshold, loc=mean, scale=std)
+
+        return float(np.clip(prob, 0.001, 0.999))
+
+    def get_probability_below(self, threshold: float, for_high: bool = True) -> float:
+        """
+        Calculate P(high < threshold) using truncated normal distribution.
+
+        Args:
+            threshold: Temperature threshold in Fahrenheit
+            for_high: If True, calculate for daily high; if False, for daily low
+
+        Returns:
+            Probability (0-1) of being below threshold
+        """
+        if not for_high:
+            return super().get_probability_below(threshold, for_high=False)
+
+        # P(X < threshold) = 1 - P(X >= threshold)
+        return 1 - self.get_probability_above(threshold, for_high=True)
+
+    def get_probability_in_range(
+        self,
+        lower: float,
+        upper: float,
+        for_high: bool = True
+    ) -> float:
+        """
+        Calculate P(lower <= high <= upper) using truncated normal.
+
+        This is the key function for bracket probability calculation.
+
+        Args:
+            lower: Lower bound (inclusive)
+            upper: Upper bound (inclusive)
+            for_high: If True, calculate for daily high; if False, for daily low
+
+        Returns:
+            Probability of temperature being in [lower, upper]
+        """
+        if not for_high:
+            return super().get_probability_in_range(lower, upper, for_high=False)
+
+        floor = self.observation_floor
+        mean = self.high_mean
+        std = max(self.high_std, 0.5)
+
+        # If entire range is below floor, probability is 0
+        if upper < floor:
+            return 0.0
+
+        # Adjust lower bound to floor if needed
+        effective_lower = max(lower, floor)
+
+        # Use truncated normal
+        a = (floor - mean) / std
+        b = np.inf
+
+        try:
+            trunc_dist = truncnorm(a=a, b=b, loc=mean, scale=std)
+            prob = trunc_dist.cdf(upper) - trunc_dist.cdf(effective_lower)
+        except Exception:
+            # Fallback
+            prob = stats.norm.cdf(upper, mean, std) - stats.norm.cdf(effective_lower, mean, std)
+
+        return float(np.clip(prob, 0.0, 1.0))
+
+    def get_observation_summary(self) -> dict:
+        """Get summary of observation conditioning for logging/display."""
+        return {
+            "observed_temp": self.observed_temp,
+            "observation_floor": self.observation_floor,
+            "observation_hour": self.observation_hour,
+            "expected_additional_warming": self.expected_additional_warming,
+            "obs_weight": self.obs_weight,
+            "posterior_mean": self.high_mean,
+            "posterior_std": self.high_std,
+            "confidence": self.confidence,
+            "is_truncated": True,
+        }
 
 
 def estimate_skew(values: np.ndarray) -> float:
@@ -701,8 +928,14 @@ async def adjust_forecasts_with_metar(
 
     This integrates the "pilot edge" into probability calculations by:
     1. Fetching current METAR observations for all cities
-    2. Adjusting forecasts based on observed temperatures
+    2. Applying Bayesian conditioning with truncated normal distribution
     3. Returning both adjusted forecasts and observation metadata
+
+    The adjustment uses:
+    - Hard floor constraint (high cannot be below observation)
+    - Time-of-day weighting (afternoon obs matter more)
+    - City-specific afternoon warming patterns
+    - Truncated normal for rigorous probability calculations
 
     Args:
         forecasts: Dict of city_key -> EnsembleForecast
@@ -710,13 +943,17 @@ async def adjust_forecasts_with_metar(
 
     Returns:
         Tuple of (adjusted_forecasts, metar_data)
-        - adjusted_forecasts: Dict of city_key -> adjusted EnsembleForecast
+        - adjusted_forecasts: Dict of city_key -> ObservationConditionedForecast
         - metar_data: Dict of city_key -> observation info for UI display
     """
     from ..apis.aviation_weather import AviationWeatherClient
 
     adjusted = {}
     metar_data = {}
+
+    # Get current hour for time-of-day weighting
+    now = datetime.now(EST)
+    current_hour = now.hour
 
     try:
         async with AviationWeatherClient() as client:
@@ -730,27 +967,45 @@ async def adjust_forecasts_with_metar(
                     observed_temp = obs["temperature_f"]
                     age_minutes = obs.get("age_minutes", 60)
 
-                    # Adjust forecast based on observation
+                    # Calculate observation hour (accounting for age)
+                    obs_hour = current_hour
+                    if age_minutes > 30:
+                        obs_hour = max(8, current_hour - (age_minutes // 60))
+
+                    # Adjust forecast with Bayesian conditioning
                     adjusted_forecast = forecast.adjust_for_observation(
                         observed_temp=observed_temp,
                         observation_age_minutes=age_minutes,
+                        observation_hour=obs_hour,
+                        city_key=city_lower,
                         is_same_day=is_same_day,
                     )
                     adjusted[city_key] = adjusted_forecast
 
                     # Store METAR data for UI/logging
                     diff = observed_temp - forecast.high_mean
+                    expected_warming = AFTERNOON_WARMING.get(
+                        city_lower, DEFAULT_WARMING
+                    ).get(obs_hour, 0)
+
                     metar_data[city_key] = {
                         "observed_temp": observed_temp,
                         "forecast_high": forecast.high_mean,
                         "adjusted_high": adjusted_forecast.high_mean,
+                        "adjusted_std": adjusted_forecast.high_std,
                         "difference": diff,
                         "station": obs.get("station", "unknown"),
                         "age_minutes": age_minutes,
+                        "observation_hour": obs_hour,
+                        "expected_additional_warming": expected_warming,
                         "is_fresh": obs.get("is_fresh", False),
                         "adjustment_applied": True,
                         "original_confidence": forecast.confidence,
                         "adjusted_confidence": adjusted_forecast.confidence,
+                        "uses_truncated_normal": isinstance(
+                            adjusted_forecast, ObservationConditionedForecast
+                        ),
+                        "observation_floor": observed_temp,
                     }
                 else:
                     # No observation available, use original forecast
@@ -774,13 +1029,18 @@ async def adjust_forecasts_with_metar(
 
 def get_metar_edge_summary(metar_data: dict[str, dict]) -> list[str]:
     """
-    Generate summary messages for METAR edges found.
+    Generate actionable trading insights from METAR observations.
+
+    Provides specific guidance on:
+    - Which brackets are affected by current observations
+    - Hard floor constraints from observed temperatures
+    - Expected additional warming potential
 
     Args:
         metar_data: Dict from adjust_forecasts_with_metar
 
     Returns:
-        List of human-readable edge descriptions
+        List of human-readable edge descriptions with trading implications
     """
     summaries = []
 
@@ -791,21 +1051,49 @@ def get_metar_edge_summary(metar_data: dict[str, dict]) -> list[str]:
         diff = data.get("difference", 0)
         observed = data.get("observed_temp", 0)
         forecast = data.get("forecast_high", 0)
+        adjusted = data.get("adjusted_high", observed)
+        expected_warming = data.get("expected_additional_warming", 0)
+        obs_hour = data.get("observation_hour", 12)
 
-        if diff >= 3.0:
+        # Calculate trading-relevant floor
+        floor = observed  # Hard floor - high cannot be below this
+
+        if diff >= 5.0:
+            # Major bullish signal
             summaries.append(
-                f"🔥 {city_key.upper()}: Current {observed:.0f}°F is {diff:.0f}°F ABOVE forecast "
-                f"({forecast:.0f}°F) - BULLISH on higher brackets"
+                f"🔥 {city_key.upper()} STRONG BULLISH: Already at {observed:.0f}°F "
+                f"({diff:.0f}°F above {forecast:.0f}°F forecast). "
+                f"Floor locked at {floor:.0f}°F. Brackets ≤{floor:.0f}°F now have ~0% probability."
+            )
+        elif diff >= 3.0:
+            summaries.append(
+                f"📈 {city_key.upper()} BULLISH: Running hot at {observed:.0f}°F "
+                f"(+{diff:.0f}°F vs forecast). Expected final high: {adjusted:.0f}°F. "
+                f"Hard floor: {floor:.0f}°F."
+            )
+        elif diff <= -5.0:
+            summaries.append(
+                f"❄️ {city_key.upper()} STRONG BEARISH: Only at {observed:.0f}°F "
+                f"({abs(diff):.0f}°F below {forecast:.0f}°F forecast). "
+                f"May still warm +{expected_warming:.0f}°F to ~{observed + expected_warming:.0f}°F."
             )
         elif diff <= -3.0:
             summaries.append(
-                f"❄️ {city_key.upper()}: Current {observed:.0f}°F is {abs(diff):.0f}°F BELOW forecast "
-                f"({forecast:.0f}°F) - BEARISH on higher brackets"
+                f"📉 {city_key.upper()} BEARISH: Running cold at {observed:.0f}°F "
+                f"(-{abs(diff):.0f}°F vs forecast). "
+                f"Potential recovery to ~{observed + expected_warming:.0f}°F if warming continues."
             )
-        elif data.get("is_fresh") and abs(diff) <= 1.0:
+        elif data.get("is_fresh") and abs(diff) <= 1.5:
             summaries.append(
-                f"✅ {city_key.upper()}: Observation confirms forecast "
-                f"({observed:.0f}°F vs {forecast:.0f}°F forecast)"
+                f"✅ {city_key.upper()}: On track at {observed:.0f}°F "
+                f"(forecast: {forecast:.0f}°F). High confidence. "
+                f"Floor: {floor:.0f}°F, expected final: {adjusted:.0f}°F."
+            )
+        elif obs_hour >= 14:
+            # Late observation - near final high
+            summaries.append(
+                f"⏰ {city_key.upper()}: Late observation ({obs_hour}:00) at {observed:.0f}°F. "
+                f"Likely near final high. Limited additional warming expected (+{expected_warming:.0f}°F max)."
             )
 
     return summaries

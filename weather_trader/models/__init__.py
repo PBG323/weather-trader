@@ -10,8 +10,10 @@ from .bias_correction import BiasCorrector, BiasModel
 from .ensemble import (
     EnsembleForecaster,
     EnsembleForecast,
+    ObservationConditionedForecast,
     adjust_forecasts_with_metar,
     get_metar_edge_summary,
+    AFTERNOON_WARMING,
 )
 
 __all__ = [
@@ -19,6 +21,8 @@ __all__ = [
     "BiasModel",
     "EnsembleForecaster",
     "EnsembleForecast",
+    "ObservationConditionedForecast",
     "adjust_forecasts_with_metar",
     "get_metar_edge_summary",
+    "AFTERNOON_WARMING",
 ]
