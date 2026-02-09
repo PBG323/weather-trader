@@ -170,6 +170,119 @@ class EnsembleForecast:
 
         return p_below_upper - p_below_lower
 
+    def adjust_for_observation(
+        self,
+        observed_temp: float,
+        observation_age_minutes: int = 60,
+        is_same_day: bool = True,
+    ) -> "EnsembleForecast":
+        """
+        Create an adjusted forecast based on real-time METAR observation.
+
+        For same-day trading, current observations constrain the distribution:
+        - The final high CANNOT be below the current observed temp
+        - If observed temp exceeds forecast mean, shift the distribution up
+        - Reduce uncertainty since we have real data
+
+        This is the "pilot edge" - using actual sensor readings to improve
+        probability estimates before market close.
+
+        Args:
+            observed_temp: Current observed temperature in Fahrenheit
+            observation_age_minutes: How old the observation is
+            is_same_day: Whether this is for same-day bracket trading
+
+        Returns:
+            New EnsembleForecast with adjusted probabilities
+        """
+        from copy import deepcopy
+
+        # Don't adjust if observation is too old
+        if observation_age_minutes > 180:
+            return self
+
+        # Calculate how much the observation exceeds or falls short of forecast
+        diff = observed_temp - self.high_mean
+
+        # Observation freshness factor (fresher = more weight)
+        # 0 min = 1.0, 60 min = 0.8, 120 min = 0.6, 180 min = 0.4
+        freshness = max(0.4, 1.0 - (observation_age_minutes / 300))
+
+        # For same-day trading, the key insight is:
+        # If current temp at 2pm is 72°F, the daily high CANNOT be below 72°F
+        # So we need to shift the mean and truncate the distribution
+
+        if is_same_day:
+            # Shift the mean towards observed temp
+            # More weight to observation as it gets later in the day and fresher
+            shift_weight = freshness * 0.5  # Max 50% shift towards observation
+            new_high_mean = self.high_mean + (diff * shift_weight)
+
+            # Floor the mean at observed temp (can't go lower than what we've seen)
+            new_high_mean = max(new_high_mean, observed_temp)
+
+            # Reduce uncertainty since we have real data
+            # The later in the day, the less uncertainty remains
+            uncertainty_reduction = freshness * 0.3  # Up to 30% reduction
+            new_high_std = self.high_std * (1 - uncertainty_reduction)
+
+            # Adjust skew based on observation vs forecast
+            # If observed > forecast, distribution should skew warm (positive)
+            # If observed < forecast, distribution should skew cold (negative)
+            skew_adjustment = np.clip(diff / 5.0, -1.0, 1.0) * freshness
+            new_high_skew = self.high_skew + skew_adjustment
+
+            # Increase confidence when observation confirms forecast
+            if abs(diff) <= 2.0:
+                # Observation within 2°F of forecast - boost confidence
+                confidence_boost = freshness * 0.1
+            elif abs(diff) <= 4.0:
+                # Observation within 4°F - slight boost
+                confidence_boost = freshness * 0.05
+            else:
+                # Observation differs significantly - reduce confidence slightly
+                # (but the adjusted mean is now more accurate)
+                confidence_boost = -0.05
+
+            new_confidence = min(0.98, self.confidence + confidence_boost)
+
+            # Recalculate confidence intervals
+            z_90 = 1.645
+            new_ci_lower = max(observed_temp, new_high_mean - z_90 * new_high_std)
+            new_ci_upper = new_high_mean + z_90 * new_high_std
+
+        else:
+            # For next-day trading, observations are informational but don't
+            # directly constrain the forecast
+            new_high_mean = self.high_mean
+            new_high_std = self.high_std
+            new_high_skew = self.high_skew
+            new_confidence = self.confidence
+            new_ci_lower = self.high_ci_lower
+            new_ci_upper = self.high_ci_upper
+
+        # Create adjusted forecast
+        return EnsembleForecast(
+            date=self.date,
+            city=self.city,
+            high_mean=new_high_mean,
+            high_median=max(self.high_median, observed_temp) if is_same_day else self.high_median,
+            low_mean=self.low_mean,
+            low_median=self.low_median,
+            high_std=new_high_std,
+            low_std=self.low_std,
+            high_ci_lower=new_ci_lower,
+            high_ci_upper=new_ci_upper,
+            low_ci_lower=self.low_ci_lower,
+            low_ci_upper=self.low_ci_upper,
+            model_count=self.model_count,
+            model_forecasts=self.model_forecasts,
+            confidence=new_confidence,
+            high_skew=new_high_skew,
+            low_skew=self.low_skew,
+            consensus_ratio=self.consensus_ratio,
+        )
+
 
 def estimate_skew(values: np.ndarray) -> float:
     """
@@ -577,3 +690,122 @@ class EnsembleForecaster:
         if edge < -0.05:
             return f"Buy NO: {-edge:.1%} edge"
         return "No clear signal"
+
+
+async def adjust_forecasts_with_metar(
+    forecasts: dict[str, EnsembleForecast],
+    is_same_day: bool = True,
+) -> tuple[dict[str, EnsembleForecast], dict[str, dict]]:
+    """
+    Adjust ensemble forecasts using real-time METAR observations.
+
+    This integrates the "pilot edge" into probability calculations by:
+    1. Fetching current METAR observations for all cities
+    2. Adjusting forecasts based on observed temperatures
+    3. Returning both adjusted forecasts and observation metadata
+
+    Args:
+        forecasts: Dict of city_key -> EnsembleForecast
+        is_same_day: Whether these are same-day bracket forecasts
+
+    Returns:
+        Tuple of (adjusted_forecasts, metar_data)
+        - adjusted_forecasts: Dict of city_key -> adjusted EnsembleForecast
+        - metar_data: Dict of city_key -> observation info for UI display
+    """
+    from ..apis.aviation_weather import AviationWeatherClient
+
+    adjusted = {}
+    metar_data = {}
+
+    try:
+        async with AviationWeatherClient() as client:
+            observations = await client.get_all_city_temperatures()
+
+            for city_key, forecast in forecasts.items():
+                city_lower = city_key.lower()
+
+                if city_lower in observations:
+                    obs = observations[city_lower]
+                    observed_temp = obs["temperature_f"]
+                    age_minutes = obs.get("age_minutes", 60)
+
+                    # Adjust forecast based on observation
+                    adjusted_forecast = forecast.adjust_for_observation(
+                        observed_temp=observed_temp,
+                        observation_age_minutes=age_minutes,
+                        is_same_day=is_same_day,
+                    )
+                    adjusted[city_key] = adjusted_forecast
+
+                    # Store METAR data for UI/logging
+                    diff = observed_temp - forecast.high_mean
+                    metar_data[city_key] = {
+                        "observed_temp": observed_temp,
+                        "forecast_high": forecast.high_mean,
+                        "adjusted_high": adjusted_forecast.high_mean,
+                        "difference": diff,
+                        "station": obs.get("station", "unknown"),
+                        "age_minutes": age_minutes,
+                        "is_fresh": obs.get("is_fresh", False),
+                        "adjustment_applied": True,
+                        "original_confidence": forecast.confidence,
+                        "adjusted_confidence": adjusted_forecast.confidence,
+                    }
+                else:
+                    # No observation available, use original forecast
+                    adjusted[city_key] = forecast
+                    metar_data[city_key] = {
+                        "adjustment_applied": False,
+                        "reason": "No METAR observation available",
+                    }
+
+    except Exception as e:
+        # If METAR fetch fails, return original forecasts
+        for city_key, forecast in forecasts.items():
+            adjusted[city_key] = forecast
+            metar_data[city_key] = {
+                "adjustment_applied": False,
+                "reason": f"METAR fetch error: {str(e)}",
+            }
+
+    return adjusted, metar_data
+
+
+def get_metar_edge_summary(metar_data: dict[str, dict]) -> list[str]:
+    """
+    Generate summary messages for METAR edges found.
+
+    Args:
+        metar_data: Dict from adjust_forecasts_with_metar
+
+    Returns:
+        List of human-readable edge descriptions
+    """
+    summaries = []
+
+    for city_key, data in metar_data.items():
+        if not data.get("adjustment_applied"):
+            continue
+
+        diff = data.get("difference", 0)
+        observed = data.get("observed_temp", 0)
+        forecast = data.get("forecast_high", 0)
+
+        if diff >= 3.0:
+            summaries.append(
+                f"🔥 {city_key.upper()}: Current {observed:.0f}°F is {diff:.0f}°F ABOVE forecast "
+                f"({forecast:.0f}°F) - BULLISH on higher brackets"
+            )
+        elif diff <= -3.0:
+            summaries.append(
+                f"❄️ {city_key.upper()}: Current {observed:.0f}°F is {abs(diff):.0f}°F BELOW forecast "
+                f"({forecast:.0f}°F) - BEARISH on higher brackets"
+            )
+        elif data.get("is_fresh") and abs(diff) <= 1.0:
+            summaries.append(
+                f"✅ {city_key.upper()}: Observation confirms forecast "
+                f"({observed:.0f}°F vs {forecast:.0f}°F forecast)"
+            )
+
+    return summaries

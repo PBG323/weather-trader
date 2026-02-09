@@ -44,7 +44,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from weather_trader.config import get_all_cities, get_city_config, config
 from weather_trader.apis import OpenMeteoClient, TomorrowIOClient, NWSClient, VisualCrossingClient
-from weather_trader.models import EnsembleForecaster, BiasCorrector
+from weather_trader.models import EnsembleForecaster, BiasCorrector, adjust_forecasts_with_metar, get_metar_edge_summary
 from weather_trader.models.ensemble import ModelForecast
 from weather_trader.kalshi import KalshiMarketFinder, KalshiAuth, KalshiClient, SameDayTradingChecker
 # Note: Signal generation is done inline in generate_signals_from_data() with:
@@ -3935,6 +3935,64 @@ def main():
         else:
             markets = fetch_real_markets()
 
+    # METAR Integration: Adjust forecasts based on real-time aviation observations
+    # This provides the "pilot edge" for same-day trading
+    metar_data = {}
+    metar_edge_summaries = []
+    if forecasts:
+        try:
+            # Convert dict forecasts to EnsembleForecast objects for adjustment
+            ensemble_forecasts = {}
+            for city_key, fc in forecasts.items():
+                if hasattr(fc, 'high_mean'):
+                    ensemble_forecasts[city_key] = fc
+                elif isinstance(fc, dict) and 'high_mean' in fc:
+                    # Create EnsembleForecast-like object for compatibility
+                    from weather_trader.models import EnsembleForecast
+                    ensemble_forecasts[city_key] = type('MockForecast', (), {
+                        'high_mean': fc.get('high_mean', 50),
+                        'high_std': fc.get('high_std', 2),
+                        'high_median': fc.get('high_mean', 50),
+                        'low_mean': fc.get('low_mean', 40),
+                        'low_std': fc.get('low_std', 2),
+                        'low_median': fc.get('low_mean', 40),
+                        'high_skew': fc.get('high_skew', 0),
+                        'low_skew': fc.get('low_skew', 0),
+                        'consensus_ratio': fc.get('confidence', 0.8),
+                        'confidence': fc.get('confidence', 0.8),
+                        'model_count': fc.get('model_count', 5),
+                        'model_forecasts': [],
+                        'date': fc.get('date', today_est()),
+                        'city': city_key,
+                        'high_ci_lower': fc.get('high_mean', 50) - 1.645 * fc.get('high_std', 2),
+                        'high_ci_upper': fc.get('high_mean', 50) + 1.645 * fc.get('high_std', 2),
+                        'low_ci_lower': fc.get('low_mean', 40) - 1.645 * fc.get('low_std', 2),
+                        'low_ci_upper': fc.get('low_mean', 40) + 1.645 * fc.get('low_std', 2),
+                        'adjust_for_observation': lambda self, **kwargs: self,
+                    })()
+
+            if ensemble_forecasts:
+                adjusted_forecasts, metar_data = run_async(
+                    adjust_forecasts_with_metar(ensemble_forecasts, is_same_day=True)
+                )
+                metar_edge_summaries = get_metar_edge_summary(metar_data)
+
+                # Update forecasts with METAR-adjusted values
+                for city_key, adj_fc in adjusted_forecasts.items():
+                    if city_key in forecasts and metar_data.get(city_key, {}).get('adjustment_applied'):
+                        if isinstance(forecasts[city_key], dict):
+                            forecasts[city_key]['high_mean'] = adj_fc.high_mean if hasattr(adj_fc, 'high_mean') else adj_fc.get('high_mean', forecasts[city_key]['high_mean'])
+                            forecasts[city_key]['high_std'] = adj_fc.high_std if hasattr(adj_fc, 'high_std') else adj_fc.get('high_std', forecasts[city_key]['high_std'])
+                            forecasts[city_key]['confidence'] = adj_fc.confidence if hasattr(adj_fc, 'confidence') else adj_fc.get('confidence', forecasts[city_key]['confidence'])
+                            forecasts[city_key]['metar_adjusted'] = True
+
+        except Exception as e:
+            print(f"[METAR] Warning: Could not adjust forecasts with METAR: {e}")
+
+    # Store METAR data in session state for display in UI
+    st.session_state['metar_data'] = metar_data
+    st.session_state['metar_edge_summaries'] = metar_edge_summaries
+
     # Calculate signals (best only for trading, all for analysis)
     signals = calculate_signals(forecasts, markets, show_all_outcomes=False) if markets and forecasts else []
     all_signals = calculate_signals(forecasts, markets, show_all_outcomes=True) if markets and forecasts else []
@@ -3966,6 +4024,26 @@ def main():
         if config.api.tomorrow_io_api_key and "your_" not in config.api.tomorrow_io_api_key.lower():
             usage = get_tomorrow_io_usage()
             st.caption(f"📡 Tomorrow.io: {usage['calls_today']}/{usage['daily_limit']} calls today")
+
+        # METAR Edge Display - Real-time observation insights
+        metar_summaries = st.session_state.get('metar_edge_summaries', [])
+        if metar_summaries:
+            st.markdown("---")
+            st.subheader("✈️ Real-Time METAR Edge")
+            st.caption("Live observations from airport weather stations (updates every 1-3 hours)")
+            for summary in metar_summaries:
+                if "BULLISH" in summary:
+                    st.success(summary)
+                elif "BEARISH" in summary:
+                    st.warning(summary)
+                else:
+                    st.info(summary)
+
+            # Show which forecasts were adjusted
+            metar_data = st.session_state.get('metar_data', {})
+            adjusted_cities = [k for k, v in metar_data.items() if v.get('adjustment_applied')]
+            if adjusted_cities:
+                st.caption(f"📊 Forecasts adjusted for: {', '.join(c.upper() for c in adjusted_cities)}")
 
         # Auto-trade status with smart exit info
         if auto_trade:
@@ -5192,6 +5270,59 @@ def main():
     # =====================
     with tab9:
         st.header("🔔 Alerts")
+
+        # METAR Observation Alerts Section
+        metar_data = st.session_state.get('metar_data', {})
+        observation_alerts = []
+        for city_key, data in metar_data.items():
+            if not data.get('adjustment_applied'):
+                continue
+            diff = data.get('difference', 0)
+            observed = data.get('observed_temp', 0)
+            forecast = data.get('forecast_high', 0)
+
+            if diff >= 5.0:
+                observation_alerts.append({
+                    'level': 'danger',
+                    'message': f"🔥 {city_key.upper()} OBSERVATION CONFLICT: Current {observed:.0f}°F is {diff:.0f}°F ABOVE forecast ({forecast:.0f}°F) - HIGH brackets more likely!"
+                })
+            elif diff >= 3.0:
+                observation_alerts.append({
+                    'level': 'warning',
+                    'message': f"🌡️ {city_key.upper()}: Running {diff:.0f}°F warmer than forecast ({observed:.0f}°F vs {forecast:.0f}°F)"
+                })
+            elif diff <= -5.0:
+                observation_alerts.append({
+                    'level': 'danger',
+                    'message': f"❄️ {city_key.upper()} OBSERVATION CONFLICT: Current {observed:.0f}°F is {abs(diff):.0f}°F BELOW forecast ({forecast:.0f}°F) - LOW brackets more likely!"
+                })
+            elif diff <= -3.0:
+                observation_alerts.append({
+                    'level': 'warning',
+                    'message': f"🌡️ {city_key.upper()}: Running {abs(diff):.0f}°F cooler than forecast ({observed:.0f}°F vs {forecast:.0f}°F)"
+                })
+
+        if observation_alerts:
+            st.subheader("✈️ METAR Observation Alerts")
+            st.caption("Real-time temperature observations vs forecasts")
+            for alert in observation_alerts:
+                level_styles = {
+                    "warning": {"bg": "#713f12", "border": "#f59e0b", "text": "#fef3c7"},
+                    "danger": {"bg": "#7f1d1d", "border": "#ef4444", "text": "#fee2e2"}
+                }
+                style = level_styles.get(alert['level'], level_styles['warning'])
+                st.markdown(f"""
+                <div style="background-color: {style['bg']};
+                            border-left: 4px solid {style['border']};
+                            color: {style['text']};
+                            padding: 12px 15px;
+                            border-radius: 5px;
+                            margin: 8px 0;
+                            font-size: 14px;">
+                    {alert['message']}
+                </div>
+                """, unsafe_allow_html=True)
+            st.markdown("---")
 
         col1, col2 = st.columns([3, 1])
         with col2:
