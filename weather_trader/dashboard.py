@@ -4182,20 +4182,21 @@ def main():
             df_signals = df_signals.sort_values("signal_strength", ascending=False)
 
             # Column headers
-            header_cols = st.columns([2, 1.5, 1.2, 1, 1, 0.8, 1, 2])
+            header_cols = st.columns([1.8, 1, 1.5, 1.2, 1, 1, 0.8, 1, 2])
             header_cols[0].markdown("**City**")
-            header_cols[1].markdown("**Outcome**")
-            header_cols[2].markdown("**Forecast**")
-            header_cols[3].markdown("**Our Prob**")
-            header_cols[4].markdown("**Market**")
-            header_cols[5].markdown("**Edge**")
-            header_cols[6].markdown("**Conf**")
-            header_cols[7].markdown("**Action**")
+            header_cols[1].markdown("**Date**")
+            header_cols[2].markdown("**Outcome**")
+            header_cols[3].markdown("**Forecast**")
+            header_cols[4].markdown("**Our Prob**")
+            header_cols[5].markdown("**Market**")
+            header_cols[6].markdown("**Edge**")
+            header_cols[7].markdown("**Conf**")
+            header_cols[8].markdown("**Action**")
             st.divider()
 
             for _, row in df_signals.iterrows():
                 with st.container():
-                    cols = st.columns([2, 1.5, 1.2, 1, 1, 0.8, 1, 2])
+                    cols = st.columns([1.8, 1, 1.5, 1.2, 1, 1, 0.8, 1, 2])
 
                     # City
                     city_label = f"**{row['city']}**"
@@ -4205,39 +4206,61 @@ def main():
                         city_label += " 🎯"  # Conviction trade indicator
                     cols[0].markdown(city_label)
 
+                    # Date - show target date for the market
+                    target_date = row.get('target_date')
+                    if target_date:
+                        try:
+                            from datetime import datetime
+                            if isinstance(target_date, str):
+                                dt = datetime.strptime(target_date, "%Y-%m-%d")
+                            else:
+                                dt = target_date
+                            date_str = dt.strftime("%m/%d")
+                            # Add "Today" indicator
+                            if row.get('is_same_day'):
+                                date_str += " 📍"
+                        except:
+                            date_str = str(target_date)[:5]
+                    else:
+                        date_str = "N/A"
+                    cols[1].markdown(date_str, help="📍 = Today (using blended NWS+ensemble forecast)" if row.get('is_same_day') else None)
+
                     # Outcome (temperature range) - warn if tail bet against forecast
                     outcome = row.get('outcome', f"{row.get('temp_low', '?')}-{row.get('temp_high', '?')}")
                     if row.get('is_tail_bet_against_forecast'):
                         outcome += " ⚠️"
-                        cols[1].markdown(outcome, help="⚠️ WARNING: Betting against your forecast! Your forecast is outside this bracket but edge suggests YES. High confidence should mean trusting your forecast, not betting it's wrong.")
+                        cols[2].markdown(outcome, help="⚠️ WARNING: Betting against your forecast! Your forecast is outside this bracket but edge suggests YES. High confidence should mean trusting your forecast, not betting it's wrong.")
                     else:
-                        cols[1].markdown(outcome)
+                        cols[2].markdown(outcome)
 
                     # Forecast (our predicted temp in market's unit)
                     unit = row.get('temp_unit', 'F')
                     fcst = row.get('forecast_high_market', row.get('forecast_high_f', 0))
-                    cols[2].markdown(f"{fcst:.1f}°{unit}")
+                    fcst_tooltip = None
+                    if row.get('is_same_day'):
+                        fcst_tooltip = "Same-day forecast: NWS observations blended with ensemble based on time of day"
+                    cols[3].markdown(f"{fcst:.1f}°{unit}", help=fcst_tooltip)
 
                     # Our Probability (show adjusted for conviction trades)
                     if row.get('is_conviction') and row.get('adjusted_prob'):
                         adj_prob = row['adjusted_prob']
                         orig_prob = row['our_prob']
-                        cols[3].markdown(f"**{adj_prob:.0%}**", help=f"Adjusted from {orig_prob:.0%} using confidence-scaled distribution")
+                        cols[4].markdown(f"**{adj_prob:.0%}**", help=f"Adjusted from {orig_prob:.0%} using confidence-scaled distribution")
                     else:
-                        cols[3].markdown(f"{row['our_prob']:.0%}")
+                        cols[4].markdown(f"{row['our_prob']:.0%}")
 
                     # Market Probability
-                    cols[4].markdown(f"{row['market_prob']:.0%}")
+                    cols[5].markdown(f"{row['market_prob']:.0%}")
 
                     # Edge (with color) - show conviction edge for conviction trades
                     if row.get('is_conviction') and row.get('conviction_edge') is not None:
                         conv_edge = row['conviction_edge']
                         orig_edge = row['edge']
                         edge_color = "blue"
-                        cols[5].markdown(f"**:{edge_color}[{conv_edge:+.1%}]**", help=f"Conviction edge (original: {orig_edge:+.1%})")
+                        cols[6].markdown(f"**:{edge_color}[{conv_edge:+.1%}]**", help=f"Conviction edge (original: {orig_edge:+.1%})")
                     else:
                         edge_color = "green" if row['edge'] > 0 else "red"
-                        cols[5].markdown(f"**:{edge_color}[{row['edge']:+.1%}]**")
+                        cols[6].markdown(f"**:{edge_color}[{row['edge']:+.1%}]**")
 
                     # Confidence (with color based on threshold and breakdown tooltip)
                     conf = row.get('confidence', 0)
@@ -4258,13 +4281,13 @@ def main():
                         tooltip_parts.append(f"Tomorrow.io: {'✓' if breakdown['has_tomorrow_io'] else '✗'}")
 
                     conf_tooltip = " | ".join(tooltip_parts) if tooltip_parts else "No breakdown available"
-                    cols[6].markdown(f":{conf_color}[{conf:.0%}]", help=conf_tooltip)
+                    cols[7].markdown(f":{conf_color}[{conf:.0%}]", help=conf_tooltip)
 
                     # Action button
                     if row['signal'] != "PASS":
                         button_label = f"{'🤖 ' if auto_trade else ''}{row['signal']}"
                         button_key = f"trade_{row['city']}_{row.get('condition_id', '')}"
-                        if cols[7].button(button_label, key=button_key):
+                        if cols[8].button(button_label, key=button_key):
                             kelly = max(0, abs(row['edge']) / (1 - row['market_prob'])) if row['market_prob'] < 1 else 0
                             position = min(bankroll * kelly * kelly_fraction, bankroll * max_position / 100)
                             if position > 1:
