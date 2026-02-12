@@ -15,6 +15,35 @@ from weather_trader.config import get_city_config, get_all_cities
 
 EST = ZoneInfo("America/New_York")
 
+async def get_metar_high(station_id: str) -> tuple[float | None, list]:
+    """Get high temp from METAR data for comparison."""
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(
+                "https://aviationweather.gov/api/data/metar",
+                params={"ids": station_id, "format": "json", "hours": 24}
+            )
+            if response.status_code == 200:
+                data = response.json()
+                temps = []
+                observations = []
+                for metar in data if isinstance(data, list) else []:
+                    temp_c = metar.get("temp")
+                    if temp_c is not None:
+                        temp_f = (float(temp_c) * 9/5) + 32
+                        temps.append(temp_f)
+                        obs_time = metar.get("obsTime")
+                        if obs_time:
+                            from datetime import datetime
+                            dt = datetime.fromtimestamp(obs_time)
+                            observations.append((dt.strftime("%H:%M"), temp_f))
+                return (max(temps) if temps else None, observations[:6])
+    except Exception as e:
+        return None, []
+    return None, []
+
+
 async def debug_city(city_key: str):
     """Debug NWS data for a single city."""
     city_config = get_city_config(city_key)
@@ -60,8 +89,8 @@ async def debug_city(city_key: str):
         except Exception as e:
             print(f"  Error fetching forecast: {e}")
 
-        # Get recent observations
-        print("\nRecent Observations (last 6 hours):")
+        # Get recent observations from NWS API
+        print("\nRecent NWS Observations (last 6 hours):")
         try:
             observations = await nws.get_station_observations(city_config, hours=6)
             for obs in observations[:6]:
@@ -69,6 +98,18 @@ async def debug_city(city_key: str):
                 print(f"  {time_str}: {obs.temperature:.1f}°F - {obs.description}")
         except Exception as e:
             print(f"  Error fetching observations: {e}")
+
+        # Compare with METAR data
+        print("\nMETAR Comparison (aviationweather.gov):")
+        metar_high, metar_obs = await get_metar_high(city_config.station_id)
+        if metar_high:
+            print(f"  METAR 24hr High: {metar_high:.1f}°F")
+            if current_high and abs(metar_high - current_high) > 2:
+                print(f"  ⚠️  DISCREPANCY: NWS={current_high:.1f}°F vs METAR={metar_high:.1f}°F")
+            for time_str, temp in metar_obs:
+                print(f"  {time_str}: {temp:.1f}°F")
+        else:
+            print("  METAR data unavailable")
 
 
 async def main():
