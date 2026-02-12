@@ -156,9 +156,15 @@ class AviationWeatherClient:
         """Parse METAR JSON response into structured observation."""
         try:
             # Extract observation time
-            obs_time_str = data.get("obsTime") or data.get("reportTime")
-            if obs_time_str:
-                obs_time = datetime.fromisoformat(obs_time_str.replace("Z", "+00:00"))
+            # Aviation Weather API returns obsTime as Unix timestamp (int)
+            obs_time_val = data.get("obsTime") or data.get("reportTime")
+            if obs_time_val:
+                if isinstance(obs_time_val, (int, float)):
+                    # Unix timestamp
+                    obs_time = datetime.fromtimestamp(obs_time_val, tz=ZoneInfo("UTC"))
+                else:
+                    # ISO string format
+                    obs_time = datetime.fromisoformat(str(obs_time_val).replace("Z", "+00:00"))
             else:
                 obs_time = datetime.now(ZoneInfo("UTC"))
 

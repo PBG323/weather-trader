@@ -80,12 +80,20 @@ class NWSClient:
         """
         station_id = city_config.nws_station_id
 
-        # For US stations, use NWS API
+        # METAR is more reliable and complete than NWS observations API
+        # Use METAR as primary source for all stations, fall back to NWS if needed
+        try:
+            metar_obs = await self._get_metar_observations(station_id, hours)
+            if metar_obs:
+                return metar_obs
+        except Exception:
+            pass
+
+        # Fall back to NWS API for US stations if METAR fails
         if city_config.country == "US":
             return await self._get_nws_observations(station_id, hours)
-        else:
-            # For international stations, use METAR data
-            return await self._get_metar_observations(station_id, hours)
+
+        return []
 
     async def _get_nws_observations(
         self,
