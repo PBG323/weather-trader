@@ -6,7 +6,6 @@ Supports:
 - Visual Crossing: Backup/validation forecasts (free tier: 1,000/day)
 - Tomorrow.io: Proprietary hyperlocal forecasts
 - NWS: Official settlement source data
-- NOAA CDO: Historical climate data for bias analysis
 - Aviation Weather: METAR/TAF real-time observations (pilot edge)
 """
 
@@ -14,7 +13,6 @@ from .open_meteo import OpenMeteoClient, WeatherModel, reset_rate_limit as _rese
 from .visual_crossing import VisualCrossingClient, reset_rate_limit as _reset_visual_crossing
 from .tomorrow_io import TomorrowIOClient
 from .nws import NWSClient
-from .noaa_cdo import NOAACDOClient
 from .aviation_weather import (
     AviationWeatherClient,
     METARObservation,
@@ -43,7 +41,6 @@ __all__ = [
     "VisualCrossingClient",
     "TomorrowIOClient",
     "NWSClient",
-    "NOAACDOClient",
     "AviationWeatherClient",
     "METARObservation",
     "CITY_AIRPORTS",
