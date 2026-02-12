@@ -398,14 +398,13 @@ class NWSClient:
         if not observations:
             return None
 
-        # Filter to today's date in the city's timezone
-        # Most US cities use Eastern, Central, Mountain, or Pacific
-        # For simplicity, use the observation timestamps which are already localized
-        today = datetime.now(ZoneInfo("America/New_York")).date()
+        # Filter to today's date in the city's actual timezone
+        city_tz = ZoneInfo(city_config.timezone)
+        today = datetime.now(city_tz).date()
 
         today_obs = [
             obs for obs in observations
-            if obs.timestamp.date() == today
+            if obs.timestamp.astimezone(city_tz).date() == today
         ]
 
         if not today_obs:
@@ -453,7 +452,8 @@ class NWSClient:
                 return None
 
             from zoneinfo import ZoneInfo
-            now = datetime.now(ZoneInfo("America/New_York"))
+            city_tz = ZoneInfo(city_config.timezone)
+            now = datetime.now(city_tz)
             today = now.date()
 
             # Filter to remaining hours today
@@ -465,7 +465,8 @@ class NWSClient:
 
                 try:
                     start_time = datetime.fromisoformat(start_time_str)
-                    if start_time.date() == today and start_time > now:
+                    start_time_local = start_time.astimezone(city_tz)
+                    if start_time_local.date() == today and start_time_local > now:
                         temp = period.get("temperature")
                         if temp is not None:
                             remaining_temps.append(float(temp))
