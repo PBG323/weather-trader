@@ -4748,7 +4748,7 @@ def main():
         st.caption("Spread bets across multiple temperature brackets (Neobrother style)")
 
         ladder_city = st.selectbox("Select City for Ladder", get_all_cities())
-        ladder_allocation = st.number_input("Ladder Allocation ($)", 50, 5000, int(allocation['ladder']['allocation']))
+        ladder_allocation = st.number_input("Ladder Allocation ($)", 50, 5000, max(50, int(allocation['ladder']['allocation'])))
 
         if st.button("Generate Ladder Strategy") and forecasts and markets:
             fc = forecasts.get(ladder_city)
