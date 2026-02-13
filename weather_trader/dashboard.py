@@ -47,6 +47,7 @@ from weather_trader.apis import OpenMeteoClient, TomorrowIOClient, NWSClient, Vi
 from weather_trader.models import EnsembleForecaster, BiasCorrector, adjust_forecasts_with_metar, get_metar_edge_summary
 from weather_trader.models.ensemble import ModelForecast
 from weather_trader.kalshi import KalshiMarketFinder, KalshiAuth, KalshiClient, SameDayTradingChecker
+from weather_trader.kalshi.rounding import get_bracket_probability_with_rounding, kalshi_round
 # Note: Signal generation is done inline in generate_signals_from_data() with:
 # - Spread-adjusted edge (lines 2500-2544)
 # - Volume/liquidity filtering (lines 2465-2474)
@@ -1278,16 +1279,15 @@ def calc_outcome_probability(
     forecast_std: float,
     confidence: float = None,
 ) -> float:
-    """Calculate probability for a market outcome with continuity correction.
+    """Calculate probability for a market outcome using Kalshi rounding rules.
 
-    Weather markets settle on INTEGER temperatures (e.g., "8°C" means the
-    station reported 8). When modeling discrete integer outcomes with a
-    continuous normal distribution, we must apply continuity correction:
+    Uses the rounding-aware probability calculation from kalshi/rounding.py
+    which properly accounts for how temperatures are rounded when settling:
 
-        "8°C" (single temp) → P(7.5 ≤ T < 8.5)
-        "20-21°F" (range)   → P(19.5 ≤ T < 21.5)
-        "≤6°C" (or below)   → P(T < 6.5)
-        "≥12°C" (or higher) → P(T ≥ 11.5)
+        37.4°F → rounds to 37°F (in "36-37°F" bracket)
+        37.5°F → rounds to 38°F (NOT in "36-37°F" bracket)
+
+    For bracket "36-37°F", the continuous range is 35.5 ≤ T < 37.5
 
     CONFIDENCE-ADJUSTED STD DEV:
     When confidence is provided, we adjust the std dev to reflect how much
@@ -1295,14 +1295,8 @@ def calc_outcome_probability(
     - High confidence (90%) → tighter distribution → forecast more likely correct
     - Low confidence (70%) → wider distribution → more uncertainty
 
-    This naturally:
-    - INCREASES probability for brackets containing the forecast (good for conviction trades)
-    - DECREASES probability for tail bets where forecast is outside bracket
-
     Returns clipped probability, or None if inputs are invalid.
     """
-    CONTINUITY = 0.5
-
     # Apply confidence-adjusted std dev if confidence is provided
     if confidence is not None and confidence > 0:
         # Scale factor: high confidence = tighter distribution
@@ -1311,23 +1305,22 @@ def calc_outcome_probability(
         # At 80% conf: factor = 0.7
         # At 70% conf: factor = 0.8
         # At 50% conf: factor = 1.0 (no adjustment)
-        # Formula: factor = 1.0 - (confidence - 0.5) * 1.0, clamped to [0.5, 1.2]
         confidence_factor = max(0.5, min(1.2, 1.0 - (confidence - 0.5)))
         adjusted_std = max(1.5, forecast_std * confidence_factor)  # Floor at 1.5°F
     else:
         adjusted_std = forecast_std
 
-    if temp_low is None and temp_high is not None:
-        # "≤X" - P(temp rounds to X or below)
-        raw_prob = stats.norm.cdf(temp_high + CONTINUITY, loc=forecast_mean, scale=adjusted_std)
-    elif temp_high is None and temp_low is not None:
-        # "≥X" - P(temp rounds to X or above)
-        raw_prob = 1 - stats.norm.cdf(temp_low - CONTINUITY, loc=forecast_mean, scale=adjusted_std)
-    elif temp_low is not None and temp_high is not None:
-        # Range or single temp - P(low ≤ reading ≤ high)
-        raw_prob = stats.norm.cdf(temp_high + CONTINUITY, loc=forecast_mean, scale=adjusted_std) - \
-                   stats.norm.cdf(temp_low - CONTINUITY, loc=forecast_mean, scale=adjusted_std)
-    else:
+    # Use rounding-aware probability calculation
+    # This properly handles Kalshi settlement rounding (≥0.5 rounds up)
+    raw_prob = get_bracket_probability_with_rounding(
+        forecast_mean=forecast_mean,
+        forecast_std=adjusted_std,
+        bracket_low=temp_low,
+        bracket_high=temp_high,
+        skew=0.0,  # Use normal distribution
+    )
+
+    if raw_prob is None:
         return None
 
     return clip_probability(raw_prob)
