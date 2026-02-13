@@ -2516,6 +2516,11 @@ def calculate_signals(forecasts, markets, show_all_outcomes=False):
                 market_prob = market["yes_price"]
                 spread = 0.02  # Assume 2% spread if unknown
 
+            # Skip markets where outcome is essentially determined (price > 90% or < 10%)
+            # These are typically same-day markets where NWS has already reported the high
+            if market_prob > 0.90 or market_prob < 0.10:
+                continue
+
             # Calculate our probability with continuity correction + clipping
             if temp_low is None and temp_high is not None:
                 range_type = "or_below"
