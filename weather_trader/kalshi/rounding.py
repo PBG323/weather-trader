@@ -179,42 +179,40 @@ def is_bracket_relevant(
     forecast_std: float,
     bracket_low: Optional[float],
     bracket_high: Optional[float],
-    std_threshold: float = 2.5,
+    min_probability: float = 0.03,
 ) -> bool:
     """
-    Check if a bracket is within reasonable range of forecast.
+    Check if a bracket has meaningful probability given the forecast.
 
-    Filters out brackets that are highly unlikely given the forecast.
-    For example, don't show 61-62°F bracket when forecast is 60.1°F ± 2°F.
+    Uses rounding-aware probability calculation to determine relevance.
+    A bracket is relevant if there's at least min_probability chance of
+    the temperature settling in it after rounding.
+
+    IMPORTANT: This replaces the old std_threshold approach which was
+    too aggressive. Example: forecast 60.1°F ± 2°F, bracket 61-62°F
+    - Old method: 61-62°F is ~0.5 std dev away, might filter it out
+    - New method: P(60.5 ≤ X < 62.5) ≈ 30%, definitely relevant!
 
     Args:
         forecast_mean: Forecast temperature
         forecast_std: Forecast std dev
         bracket_low: Lower bound (None for "≤X")
         bracket_high: Upper bound (None for "≥X")
-        std_threshold: Number of std devs to consider relevant (default 2.5)
+        min_probability: Minimum probability to consider relevant (default 3%)
 
     Returns:
-        True if bracket is within forecast range
+        True if bracket has >= min_probability chance
     """
-    # Calculate forecast range
-    low_bound = forecast_mean - std_threshold * forecast_std
-    high_bound = forecast_mean + std_threshold * forecast_std
+    # Calculate actual probability with rounding
+    prob = get_bracket_probability_with_rounding(
+        forecast_mean=forecast_mean,
+        forecast_std=forecast_std,
+        bracket_low=bracket_low,
+        bracket_high=bracket_high,
+        skew=0.0,  # Use normal for quick filtering
+    )
 
-    # Check bracket overlap with forecast range
-    if bracket_low is None and bracket_high is not None:
-        # "≤X" bracket - relevant if upper bound is within range
-        return bracket_high >= low_bound - 1
-
-    elif bracket_high is None and bracket_low is not None:
-        # "≥X" bracket - relevant if lower bound is within range
-        return bracket_low <= high_bound + 1
-
-    elif bracket_low is not None and bracket_high is not None:
-        # Range bracket - check overlap
-        return not (bracket_high < low_bound or bracket_low > high_bound)
-
-    return False
+    return prob >= min_probability
 
 
 def validate_edge_with_rounding(

@@ -303,14 +303,16 @@ class ExpectedValueCalculator:
 
             # Evaluate each bracket independently
             for bracket in market.brackets:
-                # Filter out irrelevant brackets (far from forecast)
+                # Filter out brackets with < 3% probability (truly irrelevant)
+                # This uses rounding-aware probability, so a 60.1°F forecast
+                # will still show the 61-62°F bracket (30%+ probability)
                 if filter_irrelevant_brackets:
                     if not is_bracket_relevant(
                         forecast_mean=forecast.high_mean,
                         forecast_std=forecast.high_std,
                         bracket_low=bracket.temp_low,
                         bracket_high=bracket.temp_high,
-                        std_threshold=2.5,
+                        min_probability=0.03,  # 3% minimum to show
                     ):
                         continue
 
