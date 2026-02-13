@@ -194,8 +194,10 @@ class AviationWeatherClient:
             wind_speed = data.get("wspd")
             wind_dir = data.get("wdir")
 
-            # Visibility
+            # Visibility - handle values like '10+' meaning "> 10 miles"
             visibility = data.get("visib")
+            if visibility is not None and isinstance(visibility, str):
+                visibility = visibility.rstrip('+')  # Remove trailing '+'
 
             # Altimeter
             altimeter = data.get("altim")
