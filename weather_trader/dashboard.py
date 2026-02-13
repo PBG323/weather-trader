@@ -2312,7 +2312,7 @@ def check_conviction_trade(signal_data, forecast_mean, forecast_std, confidence)
     # Conviction trade thresholds
     MIN_CONFIDENCE = 0.70  # 70% minimum (matches EV calculator)
     MAX_PRICE = 0.55       # 55¢ maximum - good upside potential
-    MIN_EDGE = 0.0         # 0% edge minimum (pure confidence play)
+    # NO edge requirement - conviction overrides edge when rounded forecast is IN bracket
 
     # Check basic criteria
     if confidence < MIN_CONFIDENCE:
@@ -2348,14 +2348,9 @@ def check_conviction_trade(signal_data, forecast_mean, forecast_std, confidence)
     # Calculate conviction edge (using adjusted probability)
     conviction_edge = adj_prob - market_prob
 
-    # For conviction trades, we allow 0% edge (pure confidence play)
-    if conviction_edge < MIN_EDGE:
-        return {
-            'is_conviction': False,
-            'reason': f'Conviction edge {conviction_edge:.1%} < {MIN_EDGE:.0%}',
-            'adjusted_prob': adj_prob,
-            'conviction_edge': conviction_edge,
-        }
+    # NO edge requirement for conviction - the rounded forecast being IN the bracket
+    # with high confidence is enough. We're betting our forecast is right, not
+    # that the market is mispriced.
 
     # All criteria met - this is a conviction trade!
     return {
