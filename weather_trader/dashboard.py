@@ -2518,6 +2518,7 @@ def calculate_signals(forecasts, markets, show_all_outcomes=False):
     - We use confidence-adjusted probability for a "conviction YES" signal
     """
     signals = []
+    all_signals_for_hedge = []  # Collect ALL signals for hedge detection (even when showing best only)
 
     # Pre-check same-day market uncertainty
     # This fetches NWS observations and blends with ensemble based on time of day
@@ -2814,6 +2815,9 @@ def calculate_signals(forecasts, markets, show_all_outcomes=False):
                 signal_data["adjusted_prob"] = conviction_check.get('adjusted_prob', our_prob)
                 signal_data["signal_strength"] = abs(conviction_check.get('conviction_edge', edge))
 
+            # ALWAYS collect all signals for hedge detection
+            all_signals_for_hedge.append(signal_data)
+
             if show_all_outcomes:
                 # Add all outcomes
                 signals.append(signal_data)
@@ -2830,7 +2834,8 @@ def calculate_signals(forecasts, markets, show_all_outcomes=False):
                 add_alert(f"🎯 Strong signal: {best_signal['city']} {best_signal['outcome']} - {best_signal['signal']} ({best_signal['edge']:+.1%} edge)", "success")
 
     # Detect hedge opportunities (forecast near .5 boundary, adjacent brackets cheap)
-    hedges = detect_hedge_opportunities(signals, max_combined_cost=0.85, boundary_threshold=0.3)
+    # Use ALL signals for hedge detection, not just filtered best signals
+    hedges = detect_hedge_opportunities(all_signals_for_hedge, max_combined_cost=0.85, boundary_threshold=0.3)
 
     # Add hedge info to signals and create alerts
     for hedge in hedges:
