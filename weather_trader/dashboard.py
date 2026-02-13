@@ -2277,15 +2277,18 @@ def check_conviction_trade(signal_data, forecast_mean, forecast_std, confidence)
     Detect high-conviction YES opportunities where forecast is centered in bracket.
 
     Conviction Trade Criteria:
-    - Forecast is INSIDE the bracket (not just near it)
-    - Model confidence >= 80%
-    - Market price <= 45¢ (good upside potential to $1.00)
+    - ROUNDED forecast is INSIDE the bracket (Kalshi settles on rounded integers)
+    - Model confidence >= 70%
+    - Market price <= 55¢ (good upside potential to $1.00)
     - Range bracket ONLY (not open-ended tail bets like "62°F or below")
 
     Why only range brackets?
     - Tail bets (e.g., "≤62°F" when forecast is 64°F) require forecast to be WRONG
     - High confidence means we TRUST our forecast, not bet against it
     - Range brackets with forecast inside = betting forecast is RIGHT
+
+    IMPORTANT: Uses Kalshi rounding rules for bracket check.
+    Example: Forecast 38.1°F rounds to 38, so bracket 37-38°F qualifies.
 
     Args:
         signal_data: Signal dictionary with market info
@@ -2307,8 +2310,8 @@ def check_conviction_trade(signal_data, forecast_mean, forecast_std, confidence)
         return {'is_conviction': False, 'reason': 'Not a range bracket (tail bets excluded)'}
 
     # Conviction trade thresholds
-    MIN_CONFIDENCE = 0.80  # 80% minimum
-    MAX_PRICE = 0.45       # 45¢ maximum (was 55¢) - better upside potential
+    MIN_CONFIDENCE = 0.70  # 70% minimum (matches EV calculator)
+    MAX_PRICE = 0.55       # 55¢ maximum - good upside potential
     MIN_EDGE = 0.0         # 0% edge minimum (pure confidence play)
 
     # Check basic criteria
@@ -2318,21 +2321,23 @@ def check_conviction_trade(signal_data, forecast_mean, forecast_std, confidence)
     if market_prob > MAX_PRICE:
         return {'is_conviction': False, 'reason': f'Price {market_prob:.0%} > {MAX_PRICE:.0%}'}
 
-    # Check if forecast is INSIDE the bracket (strict requirement)
-    # We're betting the temp will land in this exact range
-    # High confidence + forecast inside = we trust our forecast will be right
+    # Check if ROUNDED forecast is INSIDE the bracket
+    # IMPORTANT: Kalshi settles based on rounded integers (≥0.5 rounds up)
+    # Example: forecast 38.1°F → rounds to 38 → IS inside 37-38°F bracket
+    # Example: forecast 82.4°F → rounds to 82 → IS inside 82-83°F bracket
+    rounded_forecast = kalshi_round(forecast_mean)
     bracket_center = (temp_low + temp_high) / 2
     bracket_width = temp_high - temp_low
     distance_from_center = abs(forecast_mean - bracket_center)
 
-    # Forecast MUST be inside the bracket for conviction trade
-    # Being "near" isn't enough - we need to truly believe this bracket will hit
-    is_inside_bracket = temp_low <= forecast_mean <= temp_high
+    # ROUNDED forecast MUST be inside the bracket for conviction trade
+    # This is how Kalshi settles - we need the rounded value to land in range
+    is_inside_bracket = temp_low <= rounded_forecast <= temp_high
 
     if not is_inside_bracket:
         return {
             'is_conviction': False,
-            'reason': f'Forecast {forecast_mean:.1f}°F outside bracket {temp_low}-{temp_high}°F'
+            'reason': f'Rounded forecast {rounded_forecast}°F outside bracket {temp_low:.0f}-{temp_high:.0f}°F'
         }
 
     # Calculate confidence-adjusted probability
@@ -2353,11 +2358,9 @@ def check_conviction_trade(signal_data, forecast_mean, forecast_std, confidence)
         }
 
     # All criteria met - this is a conviction trade!
-    position_desc = "inside" if is_inside_bracket else "near"
-
     return {
         'is_conviction': True,
-        'reason': f'Forecast {forecast_mean:.1f}°F {position_desc} {temp_low}-{temp_high}°F bracket',
+        'reason': f'Rounded forecast {rounded_forecast}°F inside {temp_low:.0f}-{temp_high:.0f}°F bracket',
         'adjusted_prob': adj_prob,
         'adjusted_std': adj_std,
         'original_prob': signal_data.get('our_prob', 0),
@@ -2365,6 +2368,7 @@ def check_conviction_trade(signal_data, forecast_mean, forecast_std, confidence)
         'original_edge': signal_data.get('edge', 0),
         'distance_from_center': distance_from_center,
         'bracket_center': bracket_center,
+        'rounded_forecast': rounded_forecast,
     }
 
 
@@ -2557,8 +2561,9 @@ def calculate_signals(forecasts, markets, show_all_outcomes=False):
             # WARNING: High confidence + tail bet where forecast is outside bracket
             # This means we're betting AGAINST our own forecast, which is contradictory
             # Example: forecast 64°F, betting on "≤62°F" = betting we're wrong by 2°F
+            # These signals should be SKIPPED - don't show them as trading opportunities
             is_tail_bet_against_forecast = False
-            if adjusted_confidence >= 0.80:
+            if adjusted_confidence >= 0.70:  # Match EV calculator threshold
                 if range_type == "or_below" and temp_high is not None:
                     # Betting temp will be ≤ temp_high, but forecast is above
                     if forecast_temp_market > temp_high + 1:  # More than 1°F above
@@ -2567,6 +2572,11 @@ def calculate_signals(forecasts, markets, show_all_outcomes=False):
                     # Betting temp will be ≥ temp_low, but forecast is below
                     if forecast_temp_market < temp_low - 1:  # More than 1°F below
                         is_tail_bet_against_forecast = True
+
+            # Skip tail bets against forecast - these are contradictory signals
+            # High confidence means we trust our forecast, not bet against it
+            if is_tail_bet_against_forecast:
+                continue
 
             # For same-day markets, require higher edge to compensate for reduced forecast value
             if is_same_day:
