@@ -2367,6 +2367,137 @@ def check_conviction_trade(signal_data, forecast_mean, forecast_std, confidence)
     }
 
 
+def detect_hedge_opportunities(signals, max_combined_cost=0.85, boundary_threshold=0.3):
+    """
+    Detect hedge opportunities when forecast is near a .5 rounding boundary.
+
+    When forecast is close to X.5°F, there's significant probability the actual
+    temp could round either way. If we can buy BOTH adjacent brackets for less
+    than the payout, we have a guaranteed profit.
+
+    Example:
+        Forecast: 38.3°F (0.2°F from 38.5 boundary)
+        Bracket 37-38°F costs 52¢
+        Bracket 38-39°F costs 28¢
+        Combined: 80¢ < 85¢ threshold
+        → HEDGE: Buy both, guaranteed $1.00 if temp lands in either
+
+    Args:
+        signals: List of signal dictionaries
+        max_combined_cost: Maximum combined cost for hedge (default 85¢)
+        boundary_threshold: How close to .5 to consider hedging (default 0.3°F)
+
+    Returns:
+        List of hedge opportunity dictionaries
+    """
+    hedges = []
+
+    # Group signals by city and date
+    signal_groups = {}
+    for sig in signals:
+        city = sig.get('city', '')
+        target_date = sig.get('target_date')
+        if target_date:
+            if hasattr(target_date, 'date'):
+                target_date = target_date.date()
+            group_key = f"{city}_{target_date}"
+        else:
+            group_key = city
+
+        if group_key not in signal_groups:
+            signal_groups[group_key] = []
+        signal_groups[group_key].append(sig)
+
+    for group_key, group_signals in signal_groups.items():
+        # Only consider range brackets (not tail bets)
+        range_signals = [s for s in group_signals if s.get('range_type') == 'range']
+
+        if len(range_signals) < 2:
+            continue
+
+        # Sort by temp_low to find adjacent brackets
+        range_signals.sort(key=lambda s: s.get('temp_low', 0) or 0)
+
+        # Get forecast info from first signal
+        forecast_mean = range_signals[0].get('forecast_high_market', 0)
+        confidence = range_signals[0].get('confidence', 0)
+
+        # Check if forecast is near a .5 boundary
+        decimal_part = forecast_mean % 1
+        distance_to_boundary = min(abs(decimal_part - 0.5), abs(decimal_part + 0.5 - 1))
+
+        if distance_to_boundary > boundary_threshold:
+            # Not near a boundary, skip hedge check
+            continue
+
+        # Find the two brackets that straddle the .5 boundary
+        rounded_down = int(forecast_mean)  # e.g., 38.3 -> 38
+        rounded_up = rounded_down + 1       # e.g., 39
+
+        # Find brackets containing these rounded values
+        lower_bracket = None
+        upper_bracket = None
+
+        for sig in range_signals:
+            temp_low = sig.get('temp_low')
+            temp_high = sig.get('temp_high')
+            if temp_low is None or temp_high is None:
+                continue
+
+            # Check if rounded_down is in this bracket
+            if temp_low <= rounded_down <= temp_high:
+                lower_bracket = sig
+            # Check if rounded_up is in this bracket
+            if temp_low <= rounded_up <= temp_high:
+                upper_bracket = sig
+
+        # Need both brackets for a hedge
+        if not lower_bracket or not upper_bracket:
+            continue
+
+        # Same bracket? Skip (not a hedge situation)
+        if lower_bracket.get('outcome') == upper_bracket.get('outcome'):
+            continue
+
+        # Calculate combined cost
+        lower_cost = lower_bracket.get('market_prob', 1.0)
+        upper_cost = upper_bracket.get('market_prob', 1.0)
+        combined_cost = lower_cost + upper_cost
+
+        # Check if hedge is profitable
+        if combined_cost < max_combined_cost:
+            profit = 1.0 - combined_cost
+            profit_pct = profit / combined_cost
+
+            hedge = {
+                'city': lower_bracket.get('city'),
+                'target_date': lower_bracket.get('target_date'),
+                'forecast_mean': forecast_mean,
+                'distance_to_boundary': distance_to_boundary,
+                'confidence': confidence,
+                'lower_bracket': {
+                    'outcome': lower_bracket.get('outcome'),
+                    'cost': lower_cost,
+                    'ticker': lower_bracket.get('ticker'),
+                    'condition_id': lower_bracket.get('condition_id'),
+                },
+                'upper_bracket': {
+                    'outcome': upper_bracket.get('outcome'),
+                    'cost': upper_cost,
+                    'ticker': upper_bracket.get('ticker'),
+                    'condition_id': upper_bracket.get('condition_id'),
+                },
+                'combined_cost': combined_cost,
+                'profit': profit,
+                'profit_pct': profit_pct,
+                'signal': 'HEDGE',
+                'signal_color': '#9c27b0',  # Purple for hedge
+            }
+            hedges.append(hedge)
+
+    return hedges
+
+
 def calculate_signals(forecasts, markets, show_all_outcomes=False):
     """Calculate trading signals for multi-outcome markets.
 
@@ -2697,6 +2828,48 @@ def calculate_signals(forecasts, markets, show_all_outcomes=False):
             signals.append(best_signal)
             if abs(best_signal["edge"]) > 0.10 and best_signal["confidence"] > 0.7:
                 add_alert(f"🎯 Strong signal: {best_signal['city']} {best_signal['outcome']} - {best_signal['signal']} ({best_signal['edge']:+.1%} edge)", "success")
+
+    # Detect hedge opportunities (forecast near .5 boundary, adjacent brackets cheap)
+    hedges = detect_hedge_opportunities(signals, max_combined_cost=0.85, boundary_threshold=0.3)
+
+    # Add hedge info to signals and create alerts
+    for hedge in hedges:
+        city = hedge['city']
+        lower = hedge['lower_bracket']
+        upper = hedge['upper_bracket']
+        combined = hedge['combined_cost']
+        profit_pct = hedge['profit_pct']
+
+        # Add hedge alert
+        add_alert(
+            f"🔀 HEDGE: {city} - Buy {lower['outcome']} @ {lower['cost']:.0%} + {upper['outcome']} @ {upper['cost']:.0%} = {combined:.0%} (profit: {profit_pct:.1%})",
+            "info"
+        )
+
+        # Mark the signals involved in hedges
+        for sig in signals:
+            if sig.get('city') == city:
+                if sig.get('outcome') == lower['outcome'] or sig.get('outcome') == upper['outcome']:
+                    sig['is_hedge_candidate'] = True
+                    sig['hedge_info'] = hedge
+
+    # Also return hedges as pseudo-signals for display
+    for hedge in hedges:
+        hedge_signal = {
+            'city': hedge['city'],
+            'target_date': hedge['target_date'],
+            'outcome': f"HEDGE: {hedge['lower_bracket']['outcome']} + {hedge['upper_bracket']['outcome']}",
+            'our_prob': 1.0,  # Combined probability is ~100% if both brackets cover forecast
+            'market_prob': hedge['combined_cost'],
+            'edge': hedge['profit'],
+            'signal': 'HEDGE',
+            'signal_color': '#9c27b0',
+            'confidence': hedge['confidence'],
+            'forecast_high_market': hedge['forecast_mean'],
+            'is_hedge': True,
+            'hedge_details': hedge,
+        }
+        signals.append(hedge_signal)
 
     return signals
 
