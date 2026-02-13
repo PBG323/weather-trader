@@ -4,6 +4,7 @@ Kalshi weather market discovery and data structures.
 Discovers KXHIGH (high temperature) events and parses bracket markets.
 """
 
+import asyncio
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -278,9 +279,12 @@ class KalshiMarketFinder:
             resp = await self._client.get("/events", params=params)
             resp.raise_for_status()
             data = resp.json()
+            # Rate limit: wait 250ms between API calls to avoid 429 errors
+            await asyncio.sleep(0.25)
             return data.get("events", [])
         except Exception as e:
             print(f"[KalshiMarketFinder] Error fetching events for {series_ticker}: {e}")
+            await asyncio.sleep(0.25)
             return []
 
     async def _fetch_brackets(self, event_ticker: str) -> list[dict]:
@@ -292,9 +296,12 @@ class KalshiMarketFinder:
             resp = await self._client.get("/markets", params={"event_ticker": event_ticker})
             resp.raise_for_status()
             data = resp.json()
+            # Rate limit: wait 250ms between API calls to avoid 429 errors
+            await asyncio.sleep(0.25)
             return data.get("markets", [])
         except Exception as e:
             print(f"[KalshiMarketFinder] Error fetching brackets for {event_ticker}: {e}")
+            await asyncio.sleep(0.25)
             return []
 
     def _extract_date_from_ticker(self, event_ticker: str) -> Optional[date]:

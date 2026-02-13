@@ -14,8 +14,12 @@ Orchestrates the complete trading workflow:
 import asyncio
 from datetime import datetime, date, timedelta
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from .config import config, get_city_config, get_all_cities, CityConfig
+
+# Kalshi markets operate in Eastern time
+EST = ZoneInfo("America/New_York")
 from .apis import OpenMeteoClient, TomorrowIOClient, NWSClient
 from .apis.open_meteo import WeatherModel
 from .models import BiasCorrector, EnsembleForecaster, EnsembleForecast
@@ -148,7 +152,9 @@ class WeatherTrader:
             Dictionary mapping city keys to EnsembleForecast objects
         """
         if target_date is None:
-            target_date = date.today() + timedelta(days=1)
+            # Use EST since Kalshi markets operate in Eastern time
+            today_est = datetime.now(EST).date()
+            target_date = today_est + timedelta(days=1)
 
         logger.info(f"Fetching forecasts for {target_date}")
 
@@ -336,7 +342,9 @@ class WeatherTrader:
         logger.info("Starting trading cycle")
         logger.info("=" * 50)
 
-        target_date = date.today() + timedelta(days=1)
+        # Use EST since Kalshi markets operate in Eastern time
+        today_est = datetime.now(EST).date()
+        target_date = today_est + timedelta(days=1)
 
         # 1. Fetch forecasts
         forecasts = await self.fetch_forecasts(target_date)
