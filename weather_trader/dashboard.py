@@ -3574,10 +3574,119 @@ def auto_trade_check(signals, bankroll, kelly_fraction, max_position, min_edge, 
     replacements_made = 0
     filtered_count = 0
     conviction_trades = 0
+    hedge_trades = 0
 
     for signal in signals:
         if signal["signal"] == "PASS":
             continue
+
+        # === HEDGE TRADE EXECUTION ===
+        # Hedge trades require buying BOTH adjacent brackets
+        if signal.get("is_hedge"):
+            hedge_details = signal.get("hedge_details", {})
+            if not hedge_details:
+                continue
+
+            lower_bracket = hedge_details.get("lower_bracket", {})
+            upper_bracket = hedge_details.get("upper_bracket", {})
+            combined_cost = hedge_details.get("combined_cost", 1.0)
+            profit_pct = hedge_details.get("profit_pct", 0)
+
+            # Skip if profit margin too thin
+            if profit_pct < 0.10:  # Require at least 10% profit margin
+                add_alert(
+                    f"⚠️ Hedge profit too thin: {signal['city']} {profit_pct:.1%} < 10%",
+                    "info"
+                )
+                continue
+
+            # Calculate position size for hedge (split between both brackets)
+            # Use risk manager to get base position size
+            position_size = st.session_state.risk_manager.calculate_position_size(
+                edge=profit_pct,  # Use profit percentage as "edge"
+                win_probability=0.95,  # High probability since we're covering both outcomes
+                price=combined_cost  # Total cost
+            )
+
+            # Apply max position limit
+            max_size = bankroll * max_position / 100
+            position_size = min(position_size, max_size)
+
+            if position_size < st.session_state.trading_config.min_position_size:
+                continue
+
+            # Split position between both brackets proportionally to their cost
+            lower_cost = lower_bracket.get("cost", 0.5)
+            upper_cost = upper_bracket.get("cost", 0.5)
+            total_cost = lower_cost + upper_cost
+
+            lower_size = position_size * (lower_cost / total_cost)
+            upper_size = position_size * (upper_cost / total_cost)
+
+            # Check for existing positions in either bracket
+            lower_market_id = lower_bracket.get("condition_id", "")
+            upper_market_id = upper_bracket.get("condition_id", "")
+
+            existing_lower = st.session_state.position_manager.get_positions_by_market(lower_market_id) if lower_market_id else []
+            existing_upper = st.session_state.position_manager.get_positions_by_market(upper_market_id) if upper_market_id else []
+
+            if existing_lower or existing_upper:
+                add_alert(
+                    f"⚠️ Hedge skipped: already have position in {signal['city']} bracket",
+                    "info"
+                )
+                continue
+
+            # Execute both legs of the hedge
+            add_alert(
+                f"🔀 Executing HEDGE: {signal['city']} - "
+                f"{lower_bracket.get('outcome')} @ {lower_cost:.0%} + "
+                f"{upper_bracket.get('outcome')} @ {upper_cost:.0%} = "
+                f"{combined_cost:.0%} (profit: {profit_pct:.1%})",
+                "info"
+            )
+
+            # Create synthetic signals for each leg
+            lower_signal = {
+                "city": signal.get("city"),
+                "outcome": lower_bracket.get("outcome"),
+                "condition_id": lower_market_id,
+                "ticker": lower_bracket.get("ticker", ""),
+                "market_prob": lower_cost,
+                "our_prob": 0.5,  # Hedge doesn't rely on probability
+                "edge": profit_pct / 2,  # Split edge
+                "confidence": signal.get("confidence", 0.7),
+                "target_date": signal.get("target_date"),
+                "is_hedge_leg": True,
+            }
+
+            upper_signal = {
+                "city": signal.get("city"),
+                "outcome": upper_bracket.get("outcome"),
+                "condition_id": upper_market_id,
+                "ticker": upper_bracket.get("ticker", ""),
+                "market_prob": upper_cost,
+                "our_prob": 0.5,  # Hedge doesn't rely on probability
+                "edge": profit_pct / 2,  # Split edge
+                "confidence": signal.get("confidence", 0.7),
+                "target_date": signal.get("target_date"),
+                "is_hedge_leg": True,
+            }
+
+            # Execute both legs
+            try:
+                execute_trade(lower_signal, lower_size, is_live)
+                execute_trade(upper_signal, upper_size, is_live)
+                trades_made += 2
+                hedge_trades += 1
+                add_alert(
+                    f"✅ Hedge executed: {signal['city']} - 2 positions opened",
+                    "success"
+                )
+            except Exception as e:
+                add_alert(f"❌ Hedge execution failed: {e}", "danger")
+
+            continue  # Move to next signal
 
         # Check if this is a conviction trade
         is_conviction = signal.get("is_conviction", False)
@@ -3761,6 +3870,8 @@ def auto_trade_check(signals, bankroll, kelly_fraction, max_position, min_edge, 
 
     if trades_made > 0:
         msg = f"🤖 Auto-trader executed {trades_made} new trade(s)"
+        if hedge_trades > 0:
+            msg += f" ({hedge_trades} hedge pair(s))"
         if conviction_trades > 0:
             msg += f" ({conviction_trades} conviction)"
         if replacements_made > 0:
