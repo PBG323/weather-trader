@@ -196,6 +196,64 @@ class EnsembleForecast:
 
         return p_below_upper - p_below_lower
 
+    def get_kalshi_bracket_probability(
+        self,
+        bracket_low: Optional[float],
+        bracket_high: Optional[float],
+        for_high: bool = True
+    ) -> float:
+        """
+        Calculate probability for a Kalshi bracket with proper rounding.
+
+        Kalshi settles based on rounded integers (≥0.5 rounds up).
+        This method accounts for rounding in probability calculations.
+
+        For bracket "36-37°F":
+        - 35.5°F rounds to 36 (IN bracket)
+        - 37.4°F rounds to 37 (IN bracket)
+        - 37.5°F rounds to 38 (OUT of bracket)
+
+        Args:
+            bracket_low: Lower bound (None for "≤X" brackets)
+            bracket_high: Upper bound (None for "≥X" brackets)
+            for_high: Calculate for daily high (True) or low (False)
+
+        Returns:
+            Probability (0-1) of settling in this bracket
+        """
+        from ..kalshi.rounding import get_bracket_probability_with_rounding
+
+        if for_high:
+            mean, std, skew = self.high_mean, self.high_std, self.high_skew
+        else:
+            mean, std, skew = self.low_mean, self.low_std, self.low_skew
+
+        # Apply consensus-aware std floor
+        std_floor = self._get_std_floor()
+        std = max(std, std_floor)
+
+        return get_bracket_probability_with_rounding(
+            forecast_mean=mean,
+            forecast_std=std,
+            bracket_low=bracket_low,
+            bracket_high=bracket_high,
+            skew=skew,
+        )
+
+    def get_rounded_forecast(self, for_high: bool = True) -> int:
+        """
+        Get forecast rounded to nearest integer (Kalshi settlement format).
+
+        Args:
+            for_high: Return high (True) or low (False) forecast
+
+        Returns:
+            Rounded forecast as integer
+        """
+        from ..kalshi.rounding import kalshi_round
+        mean = self.high_mean if for_high else self.low_mean
+        return kalshi_round(mean)
+
     def adjust_for_observation(
         self,
         observed_temp: float,

@@ -15,6 +15,16 @@ from .markets import (
     SameDayTradingChecker,
     today_est,
 )
+from .rounding import (
+    kalshi_round,
+    get_settlement_range,
+    get_bracket_probability_with_rounding,
+    get_determined_bracket,
+    is_bracket_relevant,
+    validate_edge_with_rounding,
+    format_bracket,
+    get_best_bracket_for_forecast,
+)
 
 __all__ = [
     "KalshiAuth",
@@ -26,4 +36,13 @@ __all__ = [
     "SameDayUncertainty",
     "SameDayTradingChecker",
     "today_est",
+    # Rounding utilities
+    "kalshi_round",
+    "get_settlement_range",
+    "get_bracket_probability_with_rounding",
+    "get_determined_bracket",
+    "is_bracket_relevant",
+    "validate_edge_with_rounding",
+    "format_bracket",
+    "get_best_bracket_for_forecast",
 ]
