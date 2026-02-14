@@ -2889,15 +2889,17 @@ def execute_trade(signal, size, is_live=False):
     else:
         side = "YES" if signal["edge"] > 0 else "NO"
 
-    # IMPORTANT: Always store YES price for consistency
+    # Store the ACTUAL price paid for each side
     # For YES positions: we pay market_prob per share
-    # For NO positions: we pay (1 - market_prob) per share, but store YES price for tracking
+    # For NO positions: we pay (1 - market_prob) per share
     yes_price = signal["market_prob"]
     actual_cost_per_share = yes_price if side == "YES" else (1 - yes_price)
     shares = size / actual_cost_per_share
 
-    # Store YES price as entry_price for consistent price tracking
-    entry_price = yes_price
+    # Store the actual price paid (not YES price) for correct P/L calculation
+    # YES: entry_price = yes_price (what we paid for YES)
+    # NO: entry_price = 1 - yes_price (what we paid for NO)
+    entry_price = yes_price if side == "YES" else (1 - yes_price)
 
     # Determine settlement date
     target_date = signal.get("target_date", today_est() + timedelta(days=1))
@@ -3001,6 +3003,17 @@ def execute_trade(signal, size, is_live=False):
                     filled = result.filled_count
                     remaining = result.remaining_count
 
+                    # Use ACTUAL fill price from Kalshi, not calculated price
+                    actual_fill_price = result.filled_price  # 0-1 probability
+                    if actual_fill_price > 0:
+                        # Update entry_price with actual Kalshi fill price
+                        # For YES: this is the YES price paid
+                        # For NO: this is the NO price paid (Kalshi reports NO fill for NO orders)
+                        entry_price = actual_fill_price
+                        # Also update the Position object
+                        position.entry_price = actual_fill_price
+                        add_alert(f"Fill price: {actual_fill_price:.0%} (requested {price_cents}c)", "info")
+
                     if filled == 0:
                         # IOC cancelled - no fill at this price
                         add_alert(f"IOC cancelled (no fill): {ticker} @ {price_cents}c - will retry next cycle at better price", "warning")
@@ -3008,10 +3021,10 @@ def execute_trade(signal, size, is_live=False):
                     elif filled < count:
                         # Partial fill - update position with actual amount
                         shares = filled
-                        add_alert(f"PARTIAL FILL: {ticker} {filled}/{count} @ {price_cents}c (edge: {edge:.1%})", "info")
+                        add_alert(f"PARTIAL FILL: {ticker} {filled}/{count} @ {actual_fill_price:.0%} (edge: {edge:.1%})", "info")
                     else:
                         # Full fill
-                        add_alert(f"FILLED: BUY {side} {ticker} x{count} @ {price_cents}c (edge: {edge:.1%})", "success")
+                        add_alert(f"FILLED: BUY {side} {ticker} x{count} @ {actual_fill_price:.0%} (edge: {edge:.1%})", "success")
                 else:
                     add_alert(f"Live order failed: {result.message}", "warning")
                     return None  # Don't create position on failure
@@ -3405,13 +3418,13 @@ def close_position_smart(position_id: str, current_price: float, exit_reason: Ex
                 entry_price = pos.get("entry_price", 0.5)
 
                 if pos["side"] == "YES":
-                    # YES: bought at entry_price, now worth current_price
+                    # YES: bought at entry_price (YES price), now worth current_price
                     pnl = (current_price - entry_price) * shares
                 else:
-                    # NO: bought at (1 - entry_price), now worth (1 - current_price)
-                    # P/L = ((1 - current_price) - (1 - entry_price)) * shares
-                    #     = (entry_price - current_price) * shares
-                    pnl = (entry_price - current_price) * shares
+                    # NO: entry_price is actual NO price paid
+                    # current_price is YES price, so current NO value = 1 - current_price
+                    current_no_value = 1 - current_price
+                    pnl = (current_no_value - entry_price) * shares
             if position:
                 st.session_state.position_manager.close_position(
                     position_id=position.position_id,
@@ -4561,16 +4574,18 @@ def main():
                     # Build confidence breakdown tooltip
                     breakdown = row.get('confidence_breakdown', {})
                     tooltip_parts = []
-                    if breakdown.get('ensemble_confidence'):
-                        tooltip_parts.append(f"Ensemble: {breakdown['ensemble_confidence']:.0%}")
-                    if breakdown.get('model_count_desc'):
-                        tooltip_parts.append(breakdown['model_count_desc'])
-                    if breakdown.get('nws_agreement_desc'):
-                        tooltip_parts.append(breakdown['nws_agreement_desc'])
-                    if breakdown.get('std_desc'):
-                        tooltip_parts.append(breakdown['std_desc'])
-                    if breakdown.get('has_tomorrow_io') is not None:
-                        tooltip_parts.append(f"Tomorrow.io: {'✓' if breakdown['has_tomorrow_io'] else '✗'}")
+                    # Ensure breakdown is a dict (sometimes it's a float)
+                    if isinstance(breakdown, dict):
+                        if breakdown.get('ensemble_confidence'):
+                            tooltip_parts.append(f"Ensemble: {breakdown['ensemble_confidence']:.0%}")
+                        if breakdown.get('model_count_desc'):
+                            tooltip_parts.append(breakdown['model_count_desc'])
+                        if breakdown.get('nws_agreement_desc'):
+                            tooltip_parts.append(breakdown['nws_agreement_desc'])
+                        if breakdown.get('std_desc'):
+                            tooltip_parts.append(breakdown['std_desc'])
+                        if breakdown.get('has_tomorrow_io') is not None:
+                            tooltip_parts.append(f"Tomorrow.io: {'✓' if breakdown['has_tomorrow_io'] else '✗'}")
 
                     conf_tooltip = " | ".join(tooltip_parts) if tooltip_parts else "No breakdown available"
                     cols[7].markdown(f":{conf_color}[{conf:.0%}]", help=conf_tooltip)
