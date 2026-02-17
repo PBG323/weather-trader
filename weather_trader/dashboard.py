@@ -4591,8 +4591,12 @@ def main():
                     cols[7].markdown(f":{conf_color}[{conf:.0%}]", help=conf_tooltip)
 
                     # Action button
-                    if row['signal'] != "PASS":
-                        button_label = f"{'🤖 ' if auto_trade else ''}{row['signal']}"
+                    # Show button for conviction trades OR non-PASS signals
+                    if row['signal'] != "PASS" or row.get('is_conviction'):
+                        if row.get('is_conviction'):
+                            button_label = f"{'🤖 ' if auto_trade else ''}CONVICTION YES"
+                        else:
+                            button_label = f"{'🤖 ' if auto_trade else ''}{row['signal']}"
                         button_key = f"trade_{row['city']}_{row.get('condition_id', '')}"
                         if cols[8].button(button_label, key=button_key):
                             kelly = max(0, abs(row['edge']) / (1 - row['market_prob'])) if row['market_prob'] < 1 else 0
@@ -4601,7 +4605,7 @@ def main():
                                 execute_trade(row, position, is_live)
                                 st.rerun()
                     else:
-                        cols[7].markdown("*No edge*")
+                        cols[8].markdown("*No edge*")
 
             st.markdown("---")
 
