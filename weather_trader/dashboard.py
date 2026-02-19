@@ -3709,12 +3709,13 @@ def auto_trade_check(signals, bankroll, kelly_fraction, max_position, min_edge, 
         # Check if this is a conviction trade
         is_conviction = signal.get("is_conviction", False)
 
-        # For conviction trades: use conviction_edge (>= 0%), for others use regular edge
+        # For conviction trades: NO edge requirement - we bet YES because rounded forecast is IN bracket
+        # For regular trades: require minimum edge
         if is_conviction:
+            # Conviction trades execute regardless of edge
+            # The whole point is: rounded forecast is IN bracket + high confidence = bet YES
             effective_edge = signal.get("conviction_edge", signal["edge"])
-            # Conviction trades have 0% edge minimum, just need to not be negative
-            if effective_edge < 0:
-                continue
+            # Don't skip conviction trades based on edge!
         else:
             effective_edge = signal["edge"]
             if abs(effective_edge) < min_edge:
