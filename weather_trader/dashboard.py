@@ -3793,15 +3793,13 @@ def auto_trade_check(signals, bankroll, kelly_fraction, max_position, min_edge, 
             conviction_multiplier = filter_result.recommended_size_multiplier
 
         # Use risk manager to calculate position size
-        # For conviction trades, use adjusted probability and conviction edge
+        # For conviction trades, use FIXED sizing (not Kelly-based)
+        # Kelly doesn't work well for conviction trades since we're overriding edge logic
         if is_conviction:
-            adj_prob = signal.get("adjusted_prob", signal["our_prob"])
-            conv_edge = signal.get("conviction_edge", signal["edge"])
-            position_size = st.session_state.risk_manager.calculate_position_size(
-                edge=abs(conv_edge),
-                win_probability=adj_prob,
-                price=signal["market_prob"]  # Always YES for conviction trades
-            )
+            # Conviction trades: use max position size directly
+            # We're confident the rounded forecast is IN the bracket, so size up
+            max_size = bankroll * max_position / 100
+            position_size = max_size  # Use full max position for conviction
         else:
             position_size = st.session_state.risk_manager.calculate_position_size(
                 edge=abs(signal["edge"]),
@@ -3809,12 +3807,12 @@ def auto_trade_check(signals, bankroll, kelly_fraction, max_position, min_edge, 
                 price=signal["market_prob"] if signal["edge"] > 0 else (1 - signal["market_prob"])
             )
 
-        # Apply conviction-based sizing from smart filter
-        position_size = position_size * conviction_multiplier
+            # Apply conviction-based sizing from smart filter
+            position_size = position_size * conviction_multiplier
 
-        # Apply user's max position override
-        max_size = bankroll * max_position / 100
-        position_size = min(position_size, max_size)
+            # Apply user's max position override
+            max_size = bankroll * max_position / 100
+            position_size = min(position_size, max_size)
 
         if position_size < st.session_state.trading_config.min_position_size:
             continue
