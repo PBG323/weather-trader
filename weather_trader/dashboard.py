@@ -4591,18 +4591,62 @@ def main():
 
                     # Action button
                     # Show button for conviction trades OR non-PASS signals
-                    if row['signal'] != "PASS" or row.get('is_conviction'):
-                        if row.get('is_conviction'):
+                    if row['signal'] != "PASS" or row.get('is_conviction') or row.get('is_hedge'):
+                        if row.get('is_hedge'):
+                            button_label = f"{'🤖 ' if auto_trade else ''}HEDGE"
+                        elif row.get('is_conviction'):
                             button_label = f"{'🤖 ' if auto_trade else ''}CONVICTION YES"
                         else:
                             button_label = f"{'🤖 ' if auto_trade else ''}{row['signal']}"
-                        button_key = f"trade_{row['city']}_{row.get('condition_id', '')}"
+                        button_key = f"trade_{row['city']}_{row.get('condition_id', row.get('outcome', ''))}"
                         if cols[8].button(button_label, key=button_key):
-                            kelly = max(0, abs(row['edge']) / (1 - row['market_prob'])) if row['market_prob'] < 1 else 0
-                            position = min(bankroll * kelly * kelly_fraction, bankroll * max_position / 100)
-                            if position > 1:
-                                execute_trade(row, position, is_live)
-                                st.rerun()
+                            # Special handling for HEDGE signals - execute both legs
+                            if row.get('is_hedge'):
+                                hedge_details = row.get('hedge_details', {})
+                                if hedge_details:
+                                    lower = hedge_details.get('lower_bracket', {})
+                                    upper = hedge_details.get('upper_bracket', {})
+                                    position = bankroll * max_position / 100
+                                    half_position = position / 2
+
+                                    # Create signals for each leg
+                                    lower_signal = {
+                                        'city': row['city'],
+                                        'outcome': lower.get('outcome'),
+                                        'condition_id': lower.get('condition_id'),
+                                        'ticker': lower.get('ticker'),
+                                        'market_prob': lower.get('cost'),
+                                        'our_prob': 0.5,
+                                        'edge': 0.1,
+                                        'confidence': row.get('confidence', 0.7),
+                                        'target_date': row.get('target_date'),
+                                    }
+                                    upper_signal = {
+                                        'city': row['city'],
+                                        'outcome': upper.get('outcome'),
+                                        'condition_id': upper.get('condition_id'),
+                                        'ticker': upper.get('ticker'),
+                                        'market_prob': upper.get('cost'),
+                                        'our_prob': 0.5,
+                                        'edge': 0.1,
+                                        'confidence': row.get('confidence', 0.7),
+                                        'target_date': row.get('target_date'),
+                                    }
+
+                                    if half_position > 1:
+                                        execute_trade(lower_signal, half_position, is_live)
+                                        execute_trade(upper_signal, half_position, is_live)
+                                        add_alert(f"🔀 HEDGE executed: {row['city']} - both brackets", "success")
+                                    st.rerun()
+                            else:
+                                kelly = max(0, abs(row['edge']) / (1 - row['market_prob'])) if row['market_prob'] < 1 else 0
+                                position = min(bankroll * kelly * kelly_fraction, bankroll * max_position / 100)
+                                # For conviction trades, use max position
+                                if row.get('is_conviction'):
+                                    position = bankroll * max_position / 100
+                                if position > 1:
+                                    execute_trade(row, position, is_live)
+                                    st.rerun()
                     else:
                         cols[8].markdown("*No edge*")
 
