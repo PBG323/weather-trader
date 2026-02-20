@@ -2391,6 +2391,7 @@ def detect_hedge_opportunities(signals, max_combined_cost=0.85, boundary_thresho
         List of hedge opportunity dictionaries
     """
     hedges = []
+    hedge_debug_info = []  # Collect debug info for display
 
     # Group signals by city and date
     signal_groups = {}
@@ -2464,6 +2465,20 @@ def detect_hedge_opportunities(signals, max_combined_cost=0.85, boundary_thresho
         upper_cost = upper_bracket.get('market_prob', 1.0)
         combined_cost = lower_cost + upper_cost
 
+        # Track hedge candidate info for debugging
+        city = lower_bracket.get('city', '')
+        hedge_debug_info.append({
+            'city': city,
+            'forecast': forecast_mean,
+            'distance': distance_to_boundary,
+            'lower_bracket': lower_bracket.get('outcome'),
+            'upper_bracket': upper_bracket.get('outcome'),
+            'lower_cost': lower_cost,
+            'upper_cost': upper_cost,
+            'combined_cost': combined_cost,
+            'profitable': combined_cost < max_combined_cost,
+        })
+
         # Check if hedge is profitable
         if combined_cost < max_combined_cost:
             profit = 1.0 - combined_cost
@@ -2495,7 +2510,7 @@ def detect_hedge_opportunities(signals, max_combined_cost=0.85, boundary_thresho
             }
             hedges.append(hedge)
 
-    return hedges
+    return hedges, hedge_debug_info
 
 
 def calculate_signals(forecasts, markets, show_all_outcomes=False):
@@ -2835,7 +2850,17 @@ def calculate_signals(forecasts, markets, show_all_outcomes=False):
 
     # Detect hedge opportunities (forecast near .5 boundary, adjacent brackets cheap)
     # Use ALL signals for hedge detection, not just filtered best signals
-    hedges = detect_hedge_opportunities(all_signals_for_hedge, max_combined_cost=0.85, boundary_threshold=0.3)
+    hedges, hedge_debug = detect_hedge_opportunities(all_signals_for_hedge, max_combined_cost=0.85, boundary_threshold=0.3)
+
+    # Add alerts for hedge candidates that were too expensive
+    for info in hedge_debug:
+        if not info['profitable']:
+            add_alert(
+                f"🔀 Hedge candidate ({info['city']} fcst {info['forecast']:.1f}°F): "
+                f"{info['lower_bracket']} @ {info['lower_cost']:.0%} + {info['upper_bracket']} @ {info['upper_cost']:.0%} "
+                f"= {info['combined_cost']:.0%} (>{85}% - too expensive)",
+                "warning"
+            )
 
     # Add hedge info to signals and create alerts
     for hedge in hedges:
